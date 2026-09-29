@@ -168,9 +168,10 @@ template <>
 runtime::PrefillStepResult
 Program<Variant>::start_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt,
                                      RequestPlan<Variant>&& plan,
-                                     runtime::TransientRegion transient) {
+                                     runtime::TransientRegion transient,
+                                     const std::atomic_bool* cancelled) {
     return impl_->start_prefill_lane(lane, PreparedPromptAccess::take(std::move(prompt)),
-                                     std::move(plan), transient);
+                                     std::move(plan), transient, cancelled);
 }
 
 template <>
@@ -227,6 +228,11 @@ void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
 template <>
 GenerationTimings Program<Variant>::generation_timings_lane(std::uint32_t lane) const noexcept {
     return impl_->generation_timings_lane(lane);
+}
+
+template <>
+CpuVisionCacheStats Program<Variant>::cpu_vision_cache_stats_lane(std::uint32_t lane) const noexcept {
+    return impl_->cpu_vision_cache_stats_lane(lane);
 }
 
 template <>

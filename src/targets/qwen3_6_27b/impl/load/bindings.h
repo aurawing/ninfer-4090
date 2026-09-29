@@ -94,6 +94,7 @@ struct MtpPlan {
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
+    std::shared_ptr<qwen3_6::CpuVisionEncoder> cpu_vision;
 
     WeightPlan token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;

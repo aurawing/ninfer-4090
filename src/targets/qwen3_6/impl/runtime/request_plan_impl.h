@@ -137,7 +137,21 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
             if (end > base->summary.prompt_tokens) {
                 throw std::invalid_argument("vision item consumer span exceeds prompt");
             }
-            if (schedule::VisionContext::workspace_bytes(item) > work.capacity()) {
+            if (model.cpu_vision) {
+                constexpr auto patch_dim = static_cast<std::size_t>(VisionConfig::patch_dim);
+                if (item.patch_begin > prompt.patches.size() / patch_dim ||
+                    item.patch_count > prompt.patches.size() / patch_dim) {
+                    throw std::invalid_argument("CPU vision item patch range exceeds prepared payload");
+                }
+                const std::size_t offset = item.patch_begin * patch_dim;
+                const std::size_t count = item.patch_count * patch_dim;
+                if (offset > prompt.patches.size() || count > prompt.patches.size() - offset) {
+                    throw std::invalid_argument("CPU vision item patch range exceeds prepared payload");
+                }
+                model.cpu_vision->validate(CpuVisionInput{
+                    std::span<const float>(prompt.patches).subspan(offset, count), item.grid.temporal,
+                    item.grid.height, item.grid.width, item.modality == PromptModality::Video});
+            } else if (schedule::VisionContext::workspace_bytes(item) > work.capacity()) {
                 throw std::invalid_argument("vision item exceeds the Program workspace envelope");
             }
             previous_end = end;

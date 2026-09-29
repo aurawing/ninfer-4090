@@ -228,14 +228,15 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (model.features != plan.features || model.mtp.has_value() != plan.features.mtp() ||
         model.dflash.has_value() != plan.features.dflash() ||
         model.optimized_proposal.has_value() != plan.features.optimized_proposal() ||
-        model.vision.has_value() != plan.features.vision) {
+        model.vision.has_value() != plan.features.cuda_vision() ||
+        static_cast<bool>(model.cpu_vision) != plan.features.cpu_vision()) {
         throw std::invalid_argument(
             "Qwen3.6 loaded weights do not match the frozen startup features");
     }
     if (model.mtp.has_value() && model.dflash.has_value()) {
         throw std::invalid_argument("MTP and DFlash model views are mutually exclusive");
     }
-    if (model.dflash.has_value() && model.vision.has_value()) {
+    if (model.dflash.has_value() && model.features.vision) {
         throw std::invalid_argument("DFlash and Vision model views are mutually exclusive");
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
@@ -416,7 +417,8 @@ runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept
 runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lane,
                                                                PreparedPromptData&& prompt,
                                                                RequestPlan&& plan,
-                                                               runtime::TransientRegion transient) {
+                                                               runtime::TransientRegion transient,
+                                                               const std::atomic_bool* cancelled) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     SequenceState& sequence = sequences[lane];
     RequestControl& request = requests[lane];
@@ -785,6 +787,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.turn_checkpoint = {};
         }
         request.timings            = {};
+        request.cpu_vision_cache   = {};
         request.pending            = {};
         sequence.mtp_draft_count   = 0;
         sequence.tail_hidden_valid = base == prompt_tokens && sequence.tail_hidden_valid;
@@ -826,7 +829,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         auto& staged = *request.prefill;
         if (staged.vision_plan) {
             staged.vision = std::make_unique<schedule::VisionPrefillSession>(
-                device, model, work, staged.prompt, *staged.vision_plan, staged.transient);
+                device, model, work, staged.prompt, *staged.vision_plan, staged.transient,
+                [cancelled] { return cancelled && cancelled->load(std::memory_order_acquire); });
         }
         staged.elapsed_seconds = std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle      = Lifecycle::Prefilling;
@@ -1082,11 +1086,24 @@ GenerationTimings ProgramImplCore::generation_timings_lane(std::uint32_t lane) c
     return lane < max_concurrency ? requests[lane].timings : GenerationTimings{};
 }
 
+CpuVisionCacheStats ProgramImplCore::cpu_vision_cache_stats_lane(std::uint32_t lane) const noexcept {
+    if (lane >= max_concurrency) { return {}; }
+    const auto& request = requests[lane];
+    // Cancellation may complete the request before the staged prefill is resolved.
+    if (request.prefill && request.prefill->vision) {
+        return request.prefill->vision->cpu_vision_cache_stats();
+    }
+    return request.cpu_vision_cache;
+}
+
 SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) const noexcept {
     return lane < max_concurrency ? requests[lane].speculative_stats : SpeculativeStats{};
 }
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
+    if (request.prefill && request.prefill->vision) {
+        request.cpu_vision_cache = request.prefill->vision->cpu_vision_cache_stats();
+    }
     request.prefill.reset();
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
@@ -1917,6 +1934,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         }
         sequence.tail_hidden_valid      = true;
         request.timings.vision_seconds  = vision_seconds;
+        request.cpu_vision_cache = staged.vision ? staged.vision->cpu_vision_cache_stats()
+                                                 : CpuVisionCacheStats{};
         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
         if (turn_checkpoint_capture_frontier) {
             const std::uint32_t frontier = *turn_checkpoint_capture_frontier;

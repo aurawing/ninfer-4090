@@ -281,7 +281,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {5120});
 
     const artifact::TensorPlacement vision_placement =
-        features.vision ? artifact::TensorPlacement::Device
+        features.cuda_vision() ? artifact::TensorPlacement::Device
                         : artifact::TensorPlacement::ValidateOnly;
     out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
     out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
@@ -306,6 +306,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
 
     runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;
+    runtime.cpu_vision = std::move(plan.cpu_vision);
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;
     auto& gdn_layers      = runtime.gdn_layers;
@@ -396,7 +397,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                        NumericFormat::BF16, {5120});
     }
 
-    if (plan.features.vision) {
+    if (plan.features.cuda_vision()) {
         auto& vision  = runtime.vision.emplace();
         vision.common = qwen3_6::materialize_vision_common(
             backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);

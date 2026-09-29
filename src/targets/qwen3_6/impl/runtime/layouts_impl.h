@@ -532,7 +532,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
     }
 
-    if (plan.features.vision) {
+    if (plan.features.cuda_vision()) {
         const std::uint32_t frontend_limit =
             plan.features.vision_max_tokens > 0 ? plan.features.vision_max_tokens : 8192;
         constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;

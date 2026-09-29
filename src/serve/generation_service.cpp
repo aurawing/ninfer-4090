@@ -285,6 +285,11 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.kv_cache             = options_.kv_cache;
     engine_options.enable_vision        = options_.enable_vision;
     engine_options.vision_max_tokens    = options_.vision_max_tokens;
+    engine_options.vision_device         = options_.vision_device;
+    engine_options.vision_mmproj_path    = options_.vision_mmproj_path;
+    engine_options.vision_cpu_threads    = options_.vision_cpu_threads;
+    engine_options.vision_cpu_memory_mib = options_.vision_cpu_memory_mib;
+    engine_options.vision_cpu_cache_mib  = options_.vision_cpu_cache_mib;
     engine_options.use_cuda_graph       = options_.use_cuda_graph;
     engine_options.enable_prompt_cache  = options_.enable_prompt_cache;
     engine_options.prompt_cache_dir     = options_.prompt_cache_dir;
@@ -481,6 +486,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
+    outcome.metrics.cpu_vision_cache            = result.cpu_vision_cache;
     outcome.metrics.speculative_backend         = result.speculative.backend;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
     outcome.metrics.speculative_rounds          = result.speculative.rounds;

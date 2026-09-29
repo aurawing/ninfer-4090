@@ -8,12 +8,14 @@
 #include <array>
 #include <cstddef>
 #include <optional>
+#include <memory>
 
 namespace ninfer {
 
 class DeviceArena;
 
 namespace targets::qwen3_6 {
+class CpuVisionEncoder;
 
 template <class ProjectionPayload, class PostMixerPayload>
 struct FullAttentionWeights {
@@ -98,6 +100,7 @@ struct ModelView {
     std::optional<MtpLayer> mtp;
     std::optional<DFlashPayload> dflash;
     std::optional<VisionWeights> vision;
+    std::shared_ptr<CpuVisionEncoder> cpu_vision;
 };
 
 } // namespace targets::qwen3_6

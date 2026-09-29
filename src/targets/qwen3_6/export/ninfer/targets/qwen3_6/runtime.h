@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <memory>
 #include <span>
 
@@ -159,7 +160,8 @@ public:
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPrompt&& prompt,
                                                                 RequestPlan<Variant>&& plan,
-                                                                runtime::TransientRegion transient);
+                                                                runtime::TransientRegion transient,
+                                                                const std::atomic_bool* cancelled = nullptr);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
@@ -175,6 +177,7 @@ public:
     [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] CpuVisionCacheStats cpu_vision_cache_stats_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
     void snapshot_lane_to_disk(std::uint32_t lane, DiskStateCache& disk_cache);
     void snapshot_turn_checkpoint_to_disk(std::uint32_t lane, DiskStateCache& disk_cache);

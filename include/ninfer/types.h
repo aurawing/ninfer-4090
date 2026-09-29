@@ -71,6 +71,13 @@ struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
 
+enum class VisionDevice : std::uint8_t {
+    Cuda,
+    Cpu,
+};
+
+inline constexpr std::uint32_t kMaximumVisionCpuThreads = 512;
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device                         = 0;
@@ -84,6 +91,11 @@ struct EngineOptions {
     SpeculativeOptions speculative;
     bool enable_vision                 = false;
     std::uint32_t vision_max_tokens    = 8192;
+    VisionDevice vision_device         = VisionDevice::Cuda;
+    std::filesystem::path vision_mmproj_path; // CPU Vision requires an external mmproj GGUF.
+    std::uint32_t vision_cpu_threads    = 6;
+    std::uint32_t vision_cpu_memory_mib = 4096;
+    std::uint32_t vision_cpu_cache_mib  = 128; // Reserved within the host budget; 0 disables image caching.
     bool use_cuda_graph = true;
     bool enable_prompt_cache               = false;
     std::filesystem::path prompt_cache_dir = "";          // empty resolves to default user cache dir
@@ -380,6 +392,14 @@ enum class PrefixReusePath : std::uint8_t {
     RestoreDiskCheckpoint,
 };
 
+struct CpuVisionCacheStats {
+    // Completed CPU media items. Misses include disabled, oversized, and video bypasses.
+    // Failed/cancelled encodes produce no completed item; retained earlier items still count.
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+    std::uint64_t encode_calls = 0;
+};
+
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
@@ -391,6 +411,7 @@ struct GenerationResult {
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    CpuVisionCacheStats cpu_vision_cache;
 };
 
 struct ArenaMemorySummary {

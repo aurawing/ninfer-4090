@@ -5,6 +5,7 @@
 #include "core/disk_state_cache.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
+#include "runtime/contract/cancellation.h"
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
@@ -466,6 +467,7 @@ private:
             result.timings = instance_.program->generation_timings_lane(*request->lane);
             result.timings.prepare_seconds = request->prepare_seconds;
             result.speculative = instance_.program->speculative_stats_lane(*request->lane);
+            result.cpu_vision_cache = instance_.program->cpu_vision_cache_stats_lane(*request->lane);
             if (disk_cache_ && disk_cache_->enabled() && reason != FinishReason::Cancelled) {
                 instance_.program->snapshot_turn_checkpoint_to_disk(*request->lane, *disk_cache_);
                 instance_.program->snapshot_lane_to_disk(*request->lane, *disk_cache_);
@@ -694,9 +696,17 @@ private:
         if (request == nullptr || request->decode_ready) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
-        const PrefillStepResult step  = instance_.program->advance_prefill_lane(lane);
-        const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
-        resolve_prefill_step(request, step, cancel_at_boundary);
+        try {
+            const PrefillStepResult step = instance_.program->advance_prefill_lane(lane);
+            const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
+            resolve_prefill_step(request, step, cancel_at_boundary);
+        } catch (const RequestCancelled&) {
+            instance_.program->abort_lane(lane);
+            instance_.request_memory.deactivate();
+            prefill_lane_.reset();
+            complete_cancelled(request);
+            remove_completed_slot(lane);
+        }
         publish_runtime_stats();
     }
 
@@ -892,12 +902,22 @@ private:
             publish_runtime_stats();
             target_started                = true;
             const PrefillStepResult first = instance_.program->start_prefill_lane(
-                lane, std::move(request->prompt), std::move(selected_plan), transient);
+                lane, std::move(request->prompt), std::move(selected_plan), transient, &request->cancelled);
             if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
             }
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
             resolve_prefill_step(request, first, cancel_at_boundary);
+            publish_runtime_stats();
+        } catch (const RequestCancelled&) {
+            if (target_started) { instance_.program->abort_lane(lane); }
+            if (prefill_lane_ && *prefill_lane_ == lane) {
+                instance_.request_memory.deactivate();
+                prefill_lane_.reset();
+            }
+            slots_[lane].reset();
+            invalidate_lane_plans(lane);
+            complete_cancelled(request);
             publish_runtime_stats();
         } catch (...) {
             const std::exception_ptr error = std::current_exception();

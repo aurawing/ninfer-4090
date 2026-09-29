@@ -3,6 +3,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "artifact/reader.h"
+#include "targets/qwen3_6/impl/vision/cpu_vision_encoder.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 #include "targets/qwen3_6_27b/impl/variant.h"
 
@@ -95,9 +96,21 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
-    return LoadPlan(std::make_unique<LoadPlan::Impl>(
-        weights_profile,
-        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
+    const auto features = qwen3_6::startup_features(options);
+    auto plan = detail::bind_artifact(binder, weights_profile, features);
+    if (features.cpu_vision()) {
+        const auto total_bytes = static_cast<std::size_t>(features.vision_cpu_memory_mib) * 1024ULL * 1024ULL;
+        const auto cache_bytes = static_cast<std::size_t>(features.vision_cpu_cache_mib) * 1024ULL * 1024ULL;
+        const auto metadata_bytes = cache_bytes ? qwen3_6::cpu_vision_cache_metadata_bytes : 0;
+        if (cache_bytes >= total_bytes || metadata_bytes >= total_bytes - cache_bytes) {
+            throw std::invalid_argument("CPU vision host-memory budget cannot admit cache reservation");
+        }
+        auto encoder = qwen3_6::make_gguf_cpu_vision_encoder(
+            features.vision_mmproj_path.string(), features.vision_cpu_threads,
+            total_bytes - cache_bytes - metadata_bytes);
+        plan.bindings.cpu_vision = qwen3_6::make_cached_cpu_vision_encoder(std::move(encoder), cache_bytes);
+    }
+    return LoadPlan(std::make_unique<LoadPlan::Impl>(weights_profile, std::move(plan)));
 }
 
 std::unique_ptr<Package::LoadedModel>

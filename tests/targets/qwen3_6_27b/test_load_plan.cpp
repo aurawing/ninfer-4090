@@ -60,6 +60,26 @@ int verify_legacy_dflash2_compatibility(const std::filesystem::path& path, Weigh
         std::cerr << "legacy artifact unexpectedly bound DFlash2 on device: " << path << '\n';
         return 1;
     }
+    auto cpu_features = all_features();
+    cpu_features.vision_device = ninfer::VisionDevice::Cpu;
+    cpu_features.vision_mmproj_path = "external-mmproj.gguf";
+    ninfer::artifact::Binder cpu_binder(reader);
+    const auto cpu_plan = bind_artifact(cpu_binder, profile, cpu_features);
+    if (cpu_plan.materialization.device_capacity_bytes >= plan.materialization.device_capacity_bytes) {
+        std::cerr << "CPU vision did not reduce device weight capacity\n";
+        return 1;
+    }
+    for (const auto& item : cpu_plan.materialization.device_objects) {
+        if (ninfer::artifact::object_name(reader.objects().at(item.object.index)).starts_with("vision/")) {
+            std::cerr << "CPU mode placed vision weights on device\n";
+            return 1;
+        }
+    }
+    if (cpu_plan.bindings.features != cpu_features ||
+        cpu_plan.materialization.host_objects.size() != plan.materialization.host_objects.size()) {
+        std::cerr << "CPU mode changed frontend host bindings or frozen settings\n";
+        return 1;
+    }
     return 0;
 }
 

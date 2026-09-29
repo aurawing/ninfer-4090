@@ -32,7 +32,8 @@ float parse_float_in(const char* text, const char* label, float lo, float hi) {
 }
 
 std::uint64_t parse_u64(const char* text, const char* label) {
-    if (text == nullptr || *text == '\0' || *text == '-') {
+    if (text == nullptr || *text == '\0' ||
+        std::string_view(text).find_first_not_of("0123456789") != std::string_view::npos) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " +
                                     (text == nullptr ? "" : text));
     }
@@ -43,6 +44,21 @@ std::uint64_t parse_u64(const char* text, const char* label) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
     }
     return static_cast<std::uint64_t>(value);
+}
+
+std::uint32_t parse_positive_u32(const char* text, const char* label, bool allow_zero = false) {
+    const std::uint64_t value = parse_u64(text, label);
+    if ((!allow_zero && value == 0) || value > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
+    }
+    return static_cast<std::uint32_t>(value);
+}
+
+VisionDevice parse_vision_device(std::string_view text) {
+    if (text == "cuda") { return VisionDevice::Cuda; }
+    if (text == "cpu") { return VisionDevice::Cpu; }
+    throw std::invalid_argument("invalid vision-device: " + std::string(text) +
+                                " (expected cuda or cpu)");
 }
 
 KvCacheStorage parse_kv_dtype(const char* text) {
@@ -122,7 +138,13 @@ std::string serve_usage_text(const char* argv0) {
            "                              markedly faster rounds; verification still uses the full head, so\n"
            "                              generated text is unchanged (requires --spec)\n\n"
            "Vision & Multimodal:\n"
-           "  --vision                    Enable image/video vision encoder and load Vision GPU allocations\n"
+           "  --vision                    Enable image/video vision encoder (default device: cuda)\n"
+           "  --vision-device <cuda|cpu>  Enable Vision on CUDA or CPU (CPU requires --vision-mmproj)\n"
+           "  --vision-mmproj <PATH>      External BF16 mmproj GGUF; enables CPU Vision\n"
+           "  --vision-cpu-threads <N>    CPU Vision worker threads (1 to 512; default: 6)\n"
+           "  --vision-cpu-memory-mib <N> CPU Vision host memory budget in MiB (positive integer; default: 4096)\n"
+           "  --vision-cpu-cache-mib <N>  CPU image cache within host budget (default: 128; 0 disables)\n"
+           "                              CPU options require CPU Vision; cannot combine with explicit cuda\n"
            "  --vision-max-tokens <N>     Vision scratchpad token capacity (default: 8192)\n\n"
            "Reasoning & Generation Defaults:\n"
            "  --default-max-tokens <N>    Default maximum output tokens when omitted in client request (default: " + default_max_toks + ")\n"
@@ -155,6 +177,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
+    std::optional<VisionDevice> explicit_vision_device;
+    bool vision_cpu_tuning_explicit = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -241,6 +265,40 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             default_max_tokens_explicit = true;
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--vision-device") {
+            const VisionDevice device = parse_vision_device(require_value(arg.c_str()));
+            if (explicit_vision_device && *explicit_vision_device != device) {
+                throw std::invalid_argument("conflicting --vision-device values");
+            }
+            explicit_vision_device = device;
+            options.vision_device  = device;
+            options.enable_vision  = true;
+        } else if (arg == "--vision-mmproj") {
+            const std::string_view path = require_value(arg.c_str());
+            if (path.empty()) {
+                throw std::invalid_argument("--vision-mmproj must not be empty");
+            }
+            if (path.front() == '-') {
+                throw std::invalid_argument("--vision-mmproj needs a path before another option");
+            }
+            options.vision_mmproj_path = path;
+            options.enable_vision = true;
+        } else if (arg == "--vision-cpu-threads") {
+            options.vision_cpu_threads =
+                parse_positive_u32(require_value(arg.c_str()), "vision-cpu-threads");
+            if (options.vision_cpu_threads > kMaximumVisionCpuThreads) {
+                throw std::invalid_argument("--vision-cpu-threads must be in [1," +
+                                            std::to_string(kMaximumVisionCpuThreads) + "]");
+            }
+            vision_cpu_tuning_explicit = true;
+        } else if (arg == "--vision-cpu-memory-mib") {
+            options.vision_cpu_memory_mib =
+                parse_positive_u32(require_value(arg.c_str()), "vision-cpu-memory-mib");
+            vision_cpu_tuning_explicit = true;
+        } else if (arg == "--vision-cpu-cache-mib") {
+            options.vision_cpu_cache_mib =
+                parse_positive_u32(require_value(arg.c_str()), "vision-cpu-cache-mib", true);
+            vision_cpu_tuning_explicit = true;
         } else if (arg == "--vision-max-tokens" || arg == "--vision-limit") {
             const int val = parse_nonnegative_int(require_value(arg.c_str()), "vision-max-tokens");
             if (val <= 0) {
@@ -313,6 +371,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    if (!explicit_vision_device && !options.vision_mmproj_path.empty()) {
+        options.vision_device = VisionDevice::Cpu;
+    }
+    if (options.vision_device == VisionDevice::Cuda &&
+        (!options.vision_mmproj_path.empty() || vision_cpu_tuning_explicit)) {
+        throw std::invalid_argument("--vision-mmproj and CPU tuning require CPU Vision; "
+                                    "cannot combine with --vision-device cuda");
+    }
+    if (options.vision_device == VisionDevice::Cpu && options.vision_mmproj_path.empty()) {
+        throw std::invalid_argument("--vision-device cpu requires --vision-mmproj");
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");

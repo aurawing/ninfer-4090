@@ -9,6 +9,7 @@
 #include <ninfer/targets/qwen3_6/vision_control.h>
 #include "runtime/contract/transient_region.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
+#include "targets/qwen3_6/impl/vision/cpu_vision_encoder.h"
 
 #include <array>
 #include <cstddef>
@@ -93,11 +94,13 @@ class VisionPrefillSession {
 public:
     VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
                          WorkspaceArena& workspace, qwen3_6::PreparedPromptData& prompt,
-                         const VisionPrefillPlan& plan, runtime::TransientRegion transient);
+                         const VisionPrefillPlan& plan, runtime::TransientRegion transient,
+                         std::function<bool()> cancelled = {});
 
     [[nodiscard]] VisionChunk prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length);
     [[nodiscard]] bool release_consumed_media_payload() noexcept;
     [[nodiscard]] double elapsed_seconds() const;
+    [[nodiscard]] CpuVisionCacheStats cpu_vision_cache_stats() const noexcept { return cpu_cache_stats_; }
 
 private:
     DeviceContext& device_;
@@ -105,7 +108,11 @@ private:
     qwen3_6::PreparedPromptData& prompt_;
     const VisionPrefillPlan& plan_;
     runtime::TransientRegion transient_;
-    VisionContext context_;
+    std::optional<VisionContext> context_;
+    std::shared_ptr<CpuVisionEncoder> cpu_context_;
+    std::function<bool()> cancelled_;
+    double cpu_seconds_ = 0.0;
+    CpuVisionCacheStats cpu_cache_stats_;
     std::optional<std::uint32_t> active_item_;
     std::uint32_t final_item_ = 0;
     bool final_item_encoded_  = false;

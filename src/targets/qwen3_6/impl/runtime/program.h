@@ -18,6 +18,7 @@
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <cstdint>
+#include <atomic>
 #include <array>
 #include <memory>
 #include <optional>
@@ -172,6 +173,7 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     std::vector<std::uint32_t> initial_token_mask;
     GenerationTimings timings;
+    CpuVisionCacheStats cpu_vision_cache;
     SpeculativeStats speculative_stats;
 
     struct Prefill {
@@ -214,7 +216,8 @@ public:
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPromptData&& prompt,
                                                                 RequestPlan&& plan,
-                                                                runtime::TransientRegion transient);
+                                                                runtime::TransientRegion transient,
+                                                                const std::atomic_bool* cancelled = nullptr);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
@@ -230,6 +233,7 @@ public:
     [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] CpuVisionCacheStats cpu_vision_cache_stats_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
     void snapshot_lane_to_disk(std::uint32_t lane, DiskStateCache& disk_cache);
     void snapshot_turn_checkpoint_to_disk(std::uint32_t lane, DiskStateCache& disk_cache);
@@ -263,6 +267,10 @@ public:
         h = combine(h, static_cast<std::uint64_t>(speculative_backend));
         h = combine(h, static_cast<std::uint64_t>(draft_window));
         h = combine(h, static_cast<std::uint64_t>(proposal_head));
+        if (model.cpu_vision) {
+            h = combine(h, static_cast<std::uint64_t>(VisionDevice::Cpu));
+            h = combine(h, model.cpu_vision->identity_hash());
+        }
         return h;
     }
 
@@ -303,6 +311,7 @@ public:
 
         if (vision_enabled) {
             s += "_vision";
+            if (model.cpu_vision) { s += "cpu_" + std::to_string(model.cpu_vision->identity_hash()); }
         }
 
         if (capacity >= 1000 && (capacity % 1000 == 0)) {

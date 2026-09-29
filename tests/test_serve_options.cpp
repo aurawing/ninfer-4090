@@ -2,6 +2,7 @@
 #include "serve/translate.h"
 
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -23,16 +24,154 @@ ServeOptions parse(std::vector<std::string> arguments) {
     return parse_serve_options(static_cast<int>(argv.size()), argv.data());
 }
 
+bool rejects_vision_options(const std::vector<std::string>& flags) {
+    std::vector<std::string> arguments{"ninfer-serve", "model.ninfer"};
+    arguments.insert(arguments.end(), flags.begin(), flags.end());
+    try {
+        (void)parse(std::move(arguments));
+    } catch (const std::invalid_argument&) { return true; }
+    std::cerr << "accepted Vision flags:";
+    for (const std::string& flag : flags) { std::cerr << ' ' << flag; }
+    std::cerr << '\n';
+    return false;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(defaults.vision_cpu_cache_mib == 128, "server CPU cache default mismatch");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--vision-mmproj", "mmproj.gguf", "--vision-cpu-cache-mib", "0"}).vision_cpu_cache_mib == 0,
+                      "server CPU cache zero must disable caching");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--vision-cpu-cache-mib", "64", "--vision-mmproj", "mmproj.gguf"}).vision_cpu_cache_mib == 64,
+                      "server CPU cache parsing depends on argument order");
+    for (const std::string& value : {std::string("-1"), std::string("4294967296"), std::string("+1"), std::string(" 1"), std::string("1x"), std::string("")}) {
+        failures += check(rejects_vision_options({"--vision-mmproj", "mmproj.gguf", "--vision-cpu-cache-mib", value}), "invalid server CPU cache capacity accepted");
+    }
+    failures += check(rejects_vision_options({"--vision-device", "cuda", "--vision-cpu-cache-mib", "128"}) &&
+                          rejects_vision_options({"--vision-cpu-cache-mib", "0"}), "server CUDA accepted CPU cache tuning");
+    failures += check(serve_usage_text("ninfer-serve").find("--vision-cpu-cache-mib") != std::string::npos,
+                      "server help omits CPU cache option");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
+    failures += check(defaults.vision_device == ninfer::VisionDevice::Cuda &&
+                          defaults.vision_mmproj_path.empty() &&
+                          defaults.vision_cpu_threads == 6 &&
+                          defaults.vision_cpu_memory_mib == 4096,
+                      "default Vision device, projector, or CPU limits mismatch");
+
+    for (const std::vector<std::string>& flags :
+         std::vector<std::vector<std::string>>{{"--vision"},
+                                               {"--vision-max-tokens", "1024"},
+                                               {"--vision-limit", "1024"},
+                                               {"--vision-device", "cuda"},
+                                               {"--vision-device", "cuda", "--vision-device", "cuda"}}) {
+        std::vector<std::string> arguments{"ninfer-serve", "model.ninfer"};
+        arguments.insert(arguments.end(), flags.begin(), flags.end());
+        const ServeOptions vision_cuda = parse(std::move(arguments));
+        failures += check(vision_cuda.enable_vision &&
+                              vision_cuda.vision_device == ninfer::VisionDevice::Cuda &&
+                              vision_cuda.vision_mmproj_path.empty(),
+                          "existing Vision flags did not preserve the CUDA default");
+    }
+
+    const ServeOptions vision_shortcut =
+        parse({"ninfer-serve", "model.ninfer", "--vision-mmproj", "mmproj-BF16.gguf"});
+    failures += check(vision_shortcut.enable_vision &&
+                          vision_shortcut.vision_device == ninfer::VisionDevice::Cpu &&
+                          vision_shortcut.vision_mmproj_path == "mmproj-BF16.gguf",
+                      "--vision-mmproj did not enable CPU Vision");
+    for (const char* next_flag : {"--vision", "--vision-device", "--vision-max-tokens",
+                                  "--api-key", "-h"}) {
+        bool missing_path_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--vision-mmproj", next_flag});
+        } catch (const std::invalid_argument& error) {
+            const std::string message = error.what();
+            missing_path_rejected = message.find("--vision-mmproj") != std::string::npos &&
+                                    message.find("path") != std::string::npos;
+        }
+        failures += check(missing_path_rejected,
+                          "--vision-mmproj consumed the following option as its path");
+    }
+    for (const std::vector<std::string>& flags : std::vector<std::vector<std::string>>{
+             {"--vision-device", "cpu", "--vision-mmproj", "mmproj-BF16.gguf",
+              "--vision-cpu-threads", "8", "--vision-cpu-memory-mib", "2048", "--vision"},
+             {"--vision-cpu-memory-mib", "2048", "--vision-cpu-threads", "8", "--vision",
+              "--vision-mmproj", "mmproj-BF16.gguf", "--vision-device", "cpu"},
+             {"--vision-mmproj", "mmproj-BF16.gguf", "--vision-cpu-threads", "8",
+              "--vision-cpu-memory-mib", "2048", "--vision-max-tokens", "1024"},
+             {"--vision-max-tokens", "1024", "--vision-cpu-memory-mib", "2048",
+              "--vision-cpu-threads", "8", "--vision-mmproj", "mmproj-BF16.gguf"},
+             {"--vision-device", "cpu", "--vision-device", "cpu", "--vision-mmproj", "mmproj-BF16.gguf",
+              "--vision-cpu-threads", "8", "--vision-cpu-memory-mib", "2048"}}) {
+        std::vector<std::string> arguments{"ninfer-serve", "model.ninfer"};
+        arguments.insert(arguments.end(), flags.begin(), flags.end());
+        const ServeOptions vision_cpu = parse(std::move(arguments));
+        failures += check(vision_cpu.enable_vision &&
+                              vision_cpu.vision_device == ninfer::VisionDevice::Cpu &&
+                              vision_cpu.vision_mmproj_path == "mmproj-BF16.gguf" &&
+                              vision_cpu.vision_cpu_threads == 8 &&
+                              vision_cpu.vision_cpu_memory_mib == 2048,
+                          "CPU Vision options depend on argument order");
+    }
+    for (const std::vector<std::string>& flags : std::vector<std::vector<std::string>>{
+             {"--vision-device", "gpu"}, {"--vision-device", ""},
+             {"--vision-mmproj", ""}, {"--vision-device", "cpu"},
+             {"--vision-device", "cpu", "--vision-mmproj", "--vision"},
+             {"--vision-device", "cpu", "--vision"},
+             {"--vision-device", "cpu", "--vision-max-tokens", "1024"},
+             {"--vision-mmproj"}, {"--vision-device"},
+             {"--vision-cpu-threads"}, {"--vision-cpu-memory-mib"},
+             {"--vision-device", "cuda", "--vision-mmproj", "mmproj.gguf"},
+             {"--vision-mmproj", "mmproj.gguf", "--vision-device", "cuda"},
+             {"--vision-device", "cuda", "--vision-device", "cpu", "--vision-mmproj", "mmproj.gguf"},
+             {"--vision-device", "cpu", "--vision-device", "cuda", "--vision-mmproj", "mmproj.gguf"},
+             {"--vision-device", "cuda", "--vision-cpu-threads", "6"},
+             {"--vision-cpu-threads", "6", "--vision-device", "cuda"},
+             {"--vision-device", "cuda", "--vision-cpu-memory-mib", "4096"},
+             {"--vision-cpu-memory-mib", "4096", "--vision-device", "cuda"},
+             {"--vision-cpu-threads", "6"}, {"--vision-cpu-memory-mib", "4096"},
+             {"--spec", "dflash", "--draft-tokens", "3", "--vision-mmproj", "mmproj.gguf"}}) {
+        failures += check(rejects_vision_options(flags), "invalid CPU Vision combination was accepted");
+    }
+    for (const std::string& flag : {std::string("--vision-cpu-threads"),
+                                    std::string("--vision-cpu-memory-mib")}) {
+        for (const std::string& value : {std::string("0"), std::string("-1"),
+                                         std::string("4294967296"),
+                                         std::string("18446744073709551616"),
+                                         std::string(" -18446744073709551615"),
+                                         std::string("\t-18446744073709551615"),
+                                         std::string("+1"), std::string(" 1"),
+                                         std::string("1 "), std::string("1x"),
+                                         std::string("invalid"), std::string("")}) {
+            failures += check(rejects_vision_options({"--vision-mmproj", "mmproj.gguf", flag, value}),
+                              "invalid CPU Vision unsigned limit was accepted");
+        }
+    }
+    const ServeOptions decimal_limits =
+        parse({"ninfer-serve", "model.ninfer", "--vision-mmproj", "mmproj.gguf",
+               "--vision-cpu-threads", "001", "--vision-cpu-memory-mib", "0001"});
+    failures += check(decimal_limits.vision_cpu_threads == 1 && decimal_limits.vision_cpu_memory_mib == 1,
+                      "CPU Vision rejected decimal digits with leading zeros");
+    failures += check(rejects_vision_options({"--vision-mmproj", "mmproj.gguf",
+                                             "--vision-cpu-threads", "513"}),
+                      "CPU Vision thread count exceeded the GGML threadpool limit");
+    const ServeOptions vision_limits =
+        parse({"ninfer-serve", "model.ninfer", "--vision-mmproj", "mmproj.gguf",
+               "--vision-cpu-threads", "512", "--vision-cpu-memory-mib", "4294967295"});
+    failures += check(vision_limits.vision_cpu_threads == ninfer::kMaximumVisionCpuThreads &&
+                          vision_limits.vision_cpu_memory_mib == 4294967295U,
+                      "CPU Vision parser did not preserve the thread or memory limit");
+    for (const char* flag : {"--vision-device", "--vision-mmproj", "--vision-cpu-threads",
+                             "--vision-cpu-memory-mib"}) {
+        failures += check(serve_usage_text("ninfer-serve").find(flag) != std::string::npos,
+                          "serve help omits a CPU Vision option");
+    }
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.log_stats_interval_ms == 5000,

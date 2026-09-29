@@ -20,6 +20,7 @@ include(FetchContent)
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+option(NINFER_BUILD_CPU_VISION "Build the GGML CPU vision backend" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -33,6 +34,7 @@ if(MSVC)
     # MSVC Host C/C++
     $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>
     $<$<COMPILE_LANGUAGE:C,CXX>:/EHsc>
+    $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
     $<$<COMPILE_LANGUAGE:C,CXX>:/O2>
     $<$<COMPILE_LANGUAGE:C,CXX>:/Ob3>
     $<$<COMPILE_LANGUAGE:C,CXX>:/Oi>
@@ -42,6 +44,7 @@ if(MSVC)
     # NVCC Host Pass-through
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/O2>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Ob3>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Oi>
@@ -106,6 +109,7 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
+include(cmake/ggml_cpu_vision.cmake)
 if(WIN32)
   set(NINFER_CUDART_TARGET CUDA::cudart_static)
 else()

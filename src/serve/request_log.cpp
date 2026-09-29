@@ -438,6 +438,11 @@ std::string format_server_start_json(
           {"log_stats_interval_ms", options.log_stats_interval_ms},
           {"kv_cache", kv_cache_name(options.kv_cache)},
           {"vision", options.enable_vision},
+          {"vision_device", options.vision_device == VisionDevice::Cpu ? "cpu" : "cuda"},
+          {"vision_mmproj_path", options.vision_mmproj_path},
+          {"vision_cpu_threads", options.vision_cpu_threads},
+          {"vision_cpu_memory_mib", options.vision_cpu_memory_mib},
+          {"vision_cpu_cache_mib", options.vision_cpu_cache_mib},
           {"cuda_graph", options.use_cuda_graph},
           {"prefix_reuse", options.allow_prefix_reuse},
           {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
@@ -505,6 +510,9 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
         {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
     record["speculative"] = speculative_json(outcome.metrics);
+    record["cpu_vision_cache"] = Json{{"hits", outcome.metrics.cpu_vision_cache.hits},
+                                      {"misses", outcome.metrics.cpu_vision_cache.misses},
+                                      {"encode_calls", outcome.metrics.cpu_vision_cache.encode_calls}};
     return record.dump();
 }
 

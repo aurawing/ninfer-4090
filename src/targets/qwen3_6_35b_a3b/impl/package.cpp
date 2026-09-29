@@ -74,6 +74,9 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    if (options.vision_device == VisionDevice::Cpu) {
+        throw std::invalid_argument("GGUF CPU vision currently supports the 27B target only");
+    }
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile, detail::bind_artifact(binder, qwen3_6::startup_features(options))));
 }

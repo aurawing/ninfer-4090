@@ -283,17 +283,22 @@ int main(int argc, char** argv) {
         ninfer::product::LoadProgressRenderer load_progress(
             std::cerr, ninfer::product::stderr_load_progress_options());
         ninfer::EngineOptions engine_options;
-        engine_options.artifact_path  = cli.artifact_path;
-        engine_options.device         = cli.device;
-        engine_options.max_context    = cli.max_context;
-        engine_options.kv_capacity    = cli.kv_capacity;
-        engine_options.prefill_chunk  = cli.prefill_chunk;
-        engine_options.kv_cache       = cli.kv_cache;
-        engine_options.speculative    = cli.speculative;
-        engine_options.enable_vision      = cli.enable_vision;
+        engine_options.artifact_path          = cli.artifact_path;
+        engine_options.device                 = cli.device;
+        engine_options.max_context            = cli.max_context;
+        engine_options.kv_capacity            = cli.kv_capacity;
+        engine_options.prefill_chunk          = cli.prefill_chunk;
+        engine_options.kv_cache               = cli.kv_cache;
+        engine_options.speculative            = cli.speculative;
+        engine_options.enable_vision          = cli.enable_vision;
         engine_options.vision_max_tokens      = cli.vision_max_tokens;
+        engine_options.vision_device          = cli.vision_device;
+        engine_options.vision_mmproj_path     = cli.vision_mmproj_path;
+        engine_options.vision_cpu_threads     = cli.vision_cpu_threads;
+        engine_options.vision_cpu_memory_mib  = cli.vision_cpu_memory_mib;
+        engine_options.vision_cpu_cache_mib   = cli.vision_cpu_cache_mib;
         engine_options.use_cuda_graph         = cli.use_cuda_graph;
-        engine_options.wddm_evictable_budget  = cli.wddm_evictable_budget;
+        engine_options.wddm_evictable_budget   = cli.wddm_evictable_budget;
         engine_options.load_progress          = load_progress.callback();
 
         const auto load_started = Clock::now();

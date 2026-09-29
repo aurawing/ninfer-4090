@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
+#include "targets/qwen3_6/impl/frontend/digest.h"
 
 #include "core/device.h"
 #include "core/layout.h"
@@ -15,6 +16,8 @@
 #include "ninfer/ops/vision_pos_embed.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -321,9 +324,14 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
                                            WorkspaceArena& workspace,
                                            qwen3_6::PreparedPromptData& prompt,
                                            const VisionPrefillPlan& plan,
-                                           runtime::TransientRegion transient)
+                                           runtime::TransientRegion transient,
+                                           std::function<bool()> cancelled)
     : device_(device), workspace_(workspace), prompt_(prompt), plan_(plan), transient_(transient),
-      context_(device, model) {
+      cpu_context_(model.cpu_vision), cancelled_(std::move(cancelled)) {
+    if (model.features.cuda_vision()) { context_.emplace(device, model); }
+    if (static_cast<bool>(context_) == static_cast<bool>(cpu_context_)) {
+        throw std::invalid_argument("Vision prefill requires exactly one encoder backend");
+    }
     if (plan_.control == nullptr || plan_.control->items.empty() || plan_.uses.empty()) {
         throw std::invalid_argument("Vision prefill plan has no suffix item spans");
     }
@@ -397,14 +405,46 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
             patch_elements > prompt_.patches.size() - patch_offset) {
             throw std::invalid_argument("Vision item patch range exceeds prepared payload");
         }
-        timers_.emplace_back(device_);
-        timers_.back().start();
-        context_.encode(
-            VisionItemView{
-                std::span<const float>(prompt_.patches).subspan(patch_offset, patch_elements),
-                &control},
-            output, workspace_);
-        timers_.back().record_stop();
+        const auto patches = std::span<const float>(prompt_.patches).subspan(patch_offset, patch_elements);
+        if (cpu_context_) {
+            const auto started = std::chrono::steady_clock::now();
+            if (cancelled_ && cancelled_()) { throw CpuVisionCancelled(); }
+            CpuVisionInput input{patches, control.grid.temporal, control.grid.height,
+                                 control.grid.width, control.modality == PromptModality::Video};
+            if (cpu_context_->cache_capacity_bytes() != 0 && !input.video) {
+                input.processed_fingerprint = frontend_internal::sha256(
+                    std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(patches.data()),
+                                                  patches.size_bytes()));
+            }
+            const auto encoded = cpu_context_->encode_with_status(input, cancelled_);
+            cpu_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            const auto& embeddings = encoded.embeddings;
+            if (embeddings.size() != output_bytes / sizeof(std::uint16_t)) {
+                throw std::logic_error("CPU vision output shape does not match the prepared item");
+            }
+            if (cancelled_ && cancelled_()) { throw CpuVisionCancelled(); }
+            PinnedHostBuffer staging(output_bytes);
+            std::memcpy(staging.data(), embeddings.data(), output_bytes);
+            timers_.emplace_back(device_);
+            timers_.back().start();
+            // The cacheable pinned buffer remains alive until this stream has consumed it.
+            try {
+                CUDA_CHECK(cudaMemcpyAsync(output.data, staging.data(), output_bytes,
+                                           cudaMemcpyHostToDevice, device_.stream));
+                timers_.back().record_stop();
+                CUDA_CHECK(cudaStreamSynchronize(device_.stream));
+            } catch (...) {
+                (void)cudaStreamSynchronize(device_.stream);
+                throw;
+            }
+            if (encoded.cache_hit) { ++cpu_cache_stats_.hits; }
+            else { ++cpu_cache_stats_.misses; ++cpu_cache_stats_.encode_calls; }
+        } else {
+            timers_.emplace_back(device_);
+            timers_.back().start();
+            context_->encode(VisionItemView{patches, &control}, output, workspace_);
+            timers_.back().record_stop();
+        }
         workspace_.reset();
         active_item_        = active->item_index;
         final_item_encoded_ = active->item_index == final_item_;
@@ -422,7 +462,7 @@ bool VisionPrefillSession::release_consumed_media_payload() noexcept {
 double VisionPrefillSession::elapsed_seconds() const {
     double milliseconds = 0.0;
     for (const CudaEventTimer& timer : timers_) { milliseconds += timer.elapsed_ms(); }
-    return milliseconds / 1000.0;
+    return cpu_seconds_ + milliseconds / 1000.0;
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

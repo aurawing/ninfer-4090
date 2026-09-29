@@ -42,6 +42,11 @@ struct ServeOptions {
     SpeculativeOptions speculative;
     bool enable_vision                     = false;
     std::uint32_t vision_max_tokens        = 8192;
+    VisionDevice vision_device             = VisionDevice::Cuda;
+    std::string vision_mmproj_path;
+    std::uint32_t vision_cpu_threads        = 6;
+    std::uint32_t vision_cpu_memory_mib     = 4096;
+    std::uint32_t vision_cpu_cache_mib      = 128;
     bool use_cuda_graph                    = true;
     bool allow_prefix_reuse = true;
     bool enable_prompt_cache               = false;

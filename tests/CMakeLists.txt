@@ -63,6 +63,35 @@ function(ninfer_add_fused_linear_test name source common)
 endfunction()
 
 # Artifact framing and model-independent runtime contracts.
+ninfer_add_test(ninfer_concurrent_executor_cancel_test
+  SOURCES test_concurrent_executor_cancel.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_concurrent_executor_cancel_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+target_link_libraries(ninfer_concurrent_executor_cancel_test PRIVATE ${NINFER_CUDART_TARGET})
+set_tests_properties(ninfer_concurrent_executor_cancel_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_cpu_vision_bridge_test
+  SOURCES targets/qwen3_6/test_cpu_vision_bridge.cpp
+  LIBRARIES ninfer_cpu_vision)
+ninfer_add_test(ninfer_cpu_vision_cache_test
+  SOURCES tests_cpu_vision_cache.cpp
+  LIBRARIES ninfer_cpu_vision)
+ninfer_add_test(ninfer_startup_features_test
+  SOURCES targets/qwen3_6/test_startup_features.cpp
+  LIBRARIES ninfer_cpu_vision)
+target_include_directories(ninfer_startup_features_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_cli_options_test
+  SOURCES test_cli_options.cpp ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
+  LIBRARIES ninfer_cpu_vision)
+if(NINFER_BUILD_CPU_VISION)
+  ninfer_add_test(ninfer_ggml_cpu_vision_test
+    SOURCES targets/qwen3_6/test_ggml_cpu_vision.cpp
+    LIBRARIES ninfer_cpu_vision mtmd)
+  target_compile_definitions(ninfer_ggml_cpu_vision_test PRIVATE NINFER_TEST_GGML_CPU_VISION=1)
+  add_test(NAME ninfer_ggml_cpu_vision_real_test COMMAND ninfer_ggml_cpu_vision_test --gguf)
+  set_tests_properties(ninfer_ggml_cpu_vision_real_test PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 ninfer_add_test(ninfer_artifact_reader_test
   SOURCES test_ninfer_artifact_reader.cpp
   LIBRARIES ninfer_artifact)
@@ -134,6 +163,14 @@ target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_cpu_vision_session_test
+  SOURCES targets/qwen3_6_27b/test_cpu_vision_session.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_cpu_vision_session_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+target_link_libraries(ninfer_cpu_vision_session_test PRIVATE ${NINFER_CUDART_TARGET})
+set_tests_properties(ninfer_cpu_vision_session_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_real.cpp
   LIBRARIES ninfer_engine)

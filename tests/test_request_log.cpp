@@ -137,6 +137,30 @@ int main() {
                       "request log path missing");
     failures += check(server.at("engine").at("kv_cache") == "int8-group64", "KV type missing");
     failures += check(server.at("engine").at("vision") == false, "Vision state missing");
+    failures += check(server.at("engine").at("vision_device") == "cuda" &&
+                          server.at("engine").at("vision_mmproj_path") == "" &&
+                          server.at("engine").at("vision_cpu_threads") == 6 &&
+                          server.at("engine").at("vision_cpu_memory_mib") == 4096,
+                      "default Vision backend configuration missing");
+    ServeOptions cpu_vision_options         = options;
+    cpu_vision_options.enable_vision        = true;
+    cpu_vision_options.vision_device        = ninfer::VisionDevice::Cpu;
+    cpu_vision_options.vision_mmproj_path   = "/models/mmproj-BF16.gguf";
+    cpu_vision_options.vision_cpu_threads   = 8;
+    cpu_vision_options.vision_cpu_memory_mib = 2048;
+    const std::string cpu_vision_json =
+        format_server_start_json("serve-test", 1000, cpu_vision_options, sampling_defaults,
+                                 "deployment-alias", load, memory, environment, std::uint64_t{123456});
+    const Json cpu_vision_server = Json::parse(cpu_vision_json);
+    failures += check(cpu_vision_server.at("engine").at("vision") == true &&
+                          cpu_vision_server.at("engine").at("vision_device") == "cpu" &&
+                          cpu_vision_server.at("engine").at("vision_mmproj_path") ==
+                              "/models/mmproj-BF16.gguf" &&
+                          cpu_vision_server.at("engine").at("vision_cpu_threads") == 8 &&
+                          cpu_vision_server.at("engine").at("vision_cpu_memory_mib") == 2048,
+                      "CPU Vision backend configuration missing");
+    failures += check(cpu_vision_json.find("must-not-appear") == std::string::npos,
+                      "CPU Vision startup log leaked the API key");
     failures += check(server.at("engine").at("speculative_backend") == "mtp",
                       "speculative backend missing");
     failures +=
@@ -226,6 +250,7 @@ int main() {
     outcome.metrics.speculative_accepted_tokens = 720;
     outcome.metrics.speculative_fallback_steps  = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
+    outcome.metrics.cpu_vision_cache = {.hits = 2, .misses = 1, .encode_calls = 1};
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
     failures +=
@@ -235,6 +260,10 @@ int main() {
                       "computed prefill tokens missing");
     failures += check(done.at("result").at("prefix_reuse_path") == "restore_turn_checkpoint",
                       "prefix reuse path missing");
+    failures += check(done.at("cpu_vision_cache").at("hits") == 2 &&
+                          done.at("cpu_vision_cache").at("misses") == 1 &&
+                          done.at("cpu_vision_cache").at("encode_calls") == 1,
+                      "CPU vision cache counters missing");
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
                           outcome.metrics.decode_seconds,
                       "decode time lost precision");

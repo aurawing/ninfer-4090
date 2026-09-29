@@ -12,7 +12,8 @@ namespace ninfer::cli {
 namespace {
 
 std::uint64_t parse_u64(const char* text, std::string_view label) {
-    if (text == nullptr || *text == '\0' || *text == '-') {
+    if (text == nullptr || *text == '\0' ||
+        std::string_view(text).find_first_not_of("0123456789") != std::string_view::npos) {
         throw std::invalid_argument("invalid " + std::string(label) + ": " +
                                     (text == nullptr ? "" : text));
     }
@@ -74,6 +75,13 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
     throw std::invalid_argument("invalid reasoning-effort: " + std::string(text));
 }
 
+VisionDevice parse_vision_device(std::string_view text) {
+    if (text == "cuda") { return VisionDevice::Cuda; }
+    if (text == "cpu") { return VisionDevice::Cpu; }
+    throw std::invalid_argument("invalid vision-device: " + std::string(text) +
+                                " (expected cuda or cpu)");
+}
+
 } // namespace
 
 std::string usage_text(const char* argv0) {
@@ -114,7 +122,13 @@ std::string usage_text(const char* argv0) {
            "                              markedly faster rounds; verification still uses the full head, so\n"
            "                              generated text is unchanged (requires --spec)\n\n"
            "Vision & Multimodal:\n"
-           "  --vision                    Enable image/video vision encoder and load Vision GPU allocations\n"
+           "  --vision                    Enable image/video vision encoder (default device: cuda)\n"
+           "  --vision-device <cuda|cpu>  Enable Vision on CUDA or CPU (CPU requires --vision-mmproj)\n"
+           "  --vision-mmproj <PATH>      External BF16 mmproj GGUF; enables CPU Vision\n"
+           "  --vision-cpu-threads <N>    CPU Vision worker threads (1 to 512; default: 6)\n"
+           "  --vision-cpu-memory-mib <N> CPU Vision host memory budget in MiB (positive integer; default: 4096)\n"
+           "  --vision-cpu-cache-mib <N>  CPU image cache within host budget (default: 128; 0 disables)\n"
+           "                              CPU options require CPU Vision; cannot combine with explicit cuda\n"
            "  --vision-max-tokens <N>     Vision scratchpad token capacity (default: 8192)\n\n"
            "Reasoning & Output Control:\n"
            "  --no-thinking               Disable deep reasoning/thinking mode (applies non-thinking defaults)\n"
@@ -144,6 +158,8 @@ Options parse_options(int argc, char** argv) {
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
+    std::optional<VisionDevice> explicit_vision_device;
+    bool vision_cpu_tuning_explicit = false;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -185,6 +201,37 @@ Options parse_options(int argc, char** argv) {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--vision-device") {
+            const VisionDevice device = parse_vision_device(value(arg));
+            if (explicit_vision_device && *explicit_vision_device != device) {
+                throw std::invalid_argument("conflicting --vision-device values");
+            }
+            explicit_vision_device = device;
+            options.vision_device  = device;
+            options.enable_vision  = true;
+        } else if (arg == "--vision-mmproj") {
+            const std::string_view path = value(arg);
+            if (path.empty()) {
+                throw std::invalid_argument("--vision-mmproj must not be empty");
+            }
+            if (path.front() == '-') {
+                throw std::invalid_argument("--vision-mmproj needs a path before another option");
+            }
+            options.vision_mmproj_path = path;
+            options.enable_vision = true;
+        } else if (arg == "--vision-cpu-threads") {
+            options.vision_cpu_threads = parse_u32(value(arg), "vision-cpu-threads");
+            if (options.vision_cpu_threads > kMaximumVisionCpuThreads) {
+                throw std::invalid_argument("--vision-cpu-threads must be in [1," +
+                                            std::to_string(kMaximumVisionCpuThreads) + "]");
+            }
+            vision_cpu_tuning_explicit = true;
+        } else if (arg == "--vision-cpu-memory-mib") {
+            options.vision_cpu_memory_mib = parse_u32(value(arg), "vision-cpu-memory-mib");
+            vision_cpu_tuning_explicit   = true;
+        } else if (arg == "--vision-cpu-cache-mib") {
+            options.vision_cpu_cache_mib = parse_u32(value(arg), "vision-cpu-cache-mib", true);
+            vision_cpu_tuning_explicit = true;
         } else if (arg == "--vision-max-tokens" || arg == "--vision-limit") {
             options.vision_max_tokens = parse_u32(value(arg), "vision-max-tokens", false);
             options.enable_vision     = true;
@@ -236,6 +283,17 @@ Options parse_options(int argc, char** argv) {
 
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    if (!explicit_vision_device && !options.vision_mmproj_path.empty()) {
+        options.vision_device = VisionDevice::Cpu;
+    }
+    if (options.vision_device == VisionDevice::Cuda &&
+        (!options.vision_mmproj_path.empty() || vision_cpu_tuning_explicit)) {
+        throw std::invalid_argument("--vision-mmproj and CPU tuning require CPU Vision; "
+                                    "cannot combine with --vision-device cuda");
+    }
+    if (options.vision_device == VisionDevice::Cpu && options.vision_mmproj_path.empty()) {
+        throw std::invalid_argument("--vision-device cpu requires --vision-mmproj");
     }
 
     const bool has_prompt   = !options.prompt.empty();
