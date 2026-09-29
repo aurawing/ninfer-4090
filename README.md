@@ -4,6 +4,8 @@ NInfer-4090 is a specialized, high-performance C++20/CUDA inference engine for *
 
 The engine loads the official groupwise `.ninfer` artifact, serves OpenAI- and Anthropic-compatible HTTP APIs, and features native Ada Lovelace MMA tensor core execution, asynchronous double-buffered DMA memory staging, paged KV caching with 2-bit and 4-bit lattice/cylinder quantization, direct L1 block table lookups up to 1M tokens, D3D12 kernel residency management for Windows memory eviction, compatible-prefix reuse, CUDA Graphs, and ReplaySSM linear attention state transactions.
 
+This fork adds an optional **GGML CPU vision encoder** with an external BF16 mmproj GGUF, OpenMP/llamafile kernels, and a bounded image embedding cache. Text inference, KV caching, and MTP stay on the GPU. Build with `-DNINFER_BUILD_CPU_VISION=ON` and serve with `--vision-mmproj models/mmproj-BF16.gguf`. See the [CPU vision guide](docs/vision-cpu-gguf.md) for model compatibility, configuration, and measured limits.
+
 ---
 
 ### Standard Product Benchmark Matrix (`ninfer_bench`)
