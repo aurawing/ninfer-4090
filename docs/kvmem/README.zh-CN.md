@@ -184,7 +184,7 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
 
 退出标准：
 
-- **A，prefill 门禁**：262K rk4v4-e8 下，取 prefill 结束时最后一个位置的完整词表 logits。先独立运行 dense 两次，要求该向量逐位相同；若不同，停止并报告，不以不稳定的 dense 作对照。再比较 `tiered-exact` 与 dense：相对 L2 `||tiered-dense||₂/max(||dense||₂, 1e-12)` 不超过 **1e-3**，且 top-1 token ID 相同。
+- **A，同一次运行的影子注意力门禁**：新增仅用于测试、默认关闭的隐藏参数或环境变量；关闭时 dense 与 tiered 路径均不增加开销。开启时保留设备上的完整 dense KV，并把主机归档作为镜像。每个全注意力层对同一份 Q、同一份 KV 字节分别执行 dense 注意力和 `tiered-exact` 注意力；后者强制小视图，把视图外页视为未驻留，真正经过归档 → staging、部分注意力与 LSE 合并。逐层输出相对 L2 `||tiered-dense||₂/max(||dense||₂, 1e-12)` 不超过 **1e-3**，同时记录最大绝对误差；下游始终使用 dense 输出，保证各层输入相同。**32K（约 8K 视图）与 128K（约 32K 视图）必做**；262K `rk4v4-e8` 在完整 dense KV 加测试资源可放下时执行，否则记录实际显存缺口和原因。此门禁不再要求两次独立 dense 运行逐位相同。
 - **B，decode 门禁**：同一 262K 用例，MTP-3 分别运行 dense、`tiered-exact` 各 **3 次**，每次解码 64 个 token。在逐 token 的共同前缀上计算完整词表 logits 相对 L2，每步不超过 `max(1e-3, 2 × dense 三次两两比较所得的最大相对 L2)`；若出现分歧，记录首个分歧步、双方候选 ID 和对应运行的 logits，仅当该步 dense 的 top-1/top-2 差值不超过 dense 三次在该步观测到的最大差距波动时通过并列判据。每次 needle 都须答对，同时记录 MTP 接受率；分歧后不同生成轨迹的 logits 不作逐步误差比较。
 - int8 归档能完整跑完 262K，prefill 时间不超过 dense 的 1.15 倍；
 - 多轮复用正确；

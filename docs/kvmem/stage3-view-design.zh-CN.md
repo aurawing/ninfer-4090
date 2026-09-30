@@ -40,7 +40,15 @@
 - retained resume 和 turn checkpoint 只引用同一份独占 KV bundle。`restore` 先按 checkpoint 的精确 frontier 截断主机归档和设备视图，恢复对应的 GDN/MTP/hidden/position 状态，再把下一步必需的 sink、近期页及当前写入页换入，发布新块表和列表后才继续。前缀中未驻留的页仍有原始逻辑号；没有完整 continuation state 的任意短前缀仍是 miss。主机归档需保证 checkpoint 覆盖页的回写已完成；同页无效尾部不作为可读 key。
 - `snapshot` 记录精确 frontier、页状态/映射 generation 和完整 target continuation state；turn checkpoint 只保存一个，不复制整份 KV。阶段 3 的 kvmem/tiered 模式关闭现有磁盘状态缓存路径，避免其按连续 `page_ids()` 序号 restore/snapshot；dense 的磁盘路径不变。任何 trim/restore 必须使旧 staging 列表和旧传输事件失效。
 
-## 5. 后续实现位置与验证点
+## 5. 同一次运行的影子验证
+
+门禁 A 使用仅测试可开启的隐藏参数或环境变量，默认关闭。配置在加载期解析；关闭时不分配镜像/影子 workspace、不复制 KV、不执行额外算子或设备同步，dense 与 tiered 正常路径不增加开销。
+
+开启时设备保留完整 dense KV，主机归档为这些量化字节的镜像。每个全注意力层在 KV append 完成后固定同一份 Q、同一份 KV 字节及 frontier：先执行 dense 注意力，再执行 tiered-exact 的影子注意力。影子视图只把选定页标为 resident；其余页即使仍存在于 dense pool 也不得读取，必须从主机归档经 staging 送入，产生部分 `(O,m,l)` 并按固定顺序合并。对最终注意力输出逐层记录相对 L2 和最大绝对误差，相对 L2 上限为 1e-3。下游只消费 dense 输出，影子输出不得改变后续隐藏状态、KV 或 GDN 状态。
+
+32K 输入强制约 8K 视图、128K 输入强制约 32K 视图，使多数历史实际走流式路径；这两档必须执行。262K rk4v4-e8 需完整 dense KV、staging、影子输出和部分结果同时驻留，显存允许时执行，否则记录测得的预算缺口及原因。测试资源仍在加载期预算，不能以省略流式传输或共享 dense 输出冒充通过。门禁 A 删除独立 dense 两次逐位相同的前提；README 的门禁 B 保留三次运行的波动包络、共同前缀、needle 和 MTP 接受率要求。
+
+## 6. 后续实现位置与验证点
 
 下表是阶段 3 的修改清单，**本次不修改这些源码**。新逻辑按 core / ops / target 的仓库边界放置，避免 README 第 4 节列出的三值合并敏感位置。
 
