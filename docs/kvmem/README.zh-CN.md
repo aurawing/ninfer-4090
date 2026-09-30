@@ -155,15 +155,18 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
    - 就绪后 `cudaMemGetInfo` 报告的空闲显存。
 
    数据放在仓库之外，路径写进进度文件。
-3. 微基准，每项单独开进程：
-   - 装载模型后，最大能分配的锁页内存（二分查找）；
+3. 微基准，每项单独开进程，等 262K 配置的模型服务就绪后再测：
+   - 最大能分配的单块锁页内存（二分查找，记录相邻的成功/失败边界）和此时的可用物理内存；
    - 锁页与可分页内存的 H2D/D2H 带宽；
-   - 用 1–2 个线程做"可分页 → 锁页"memcpy 的吞吐；
+   - 用 1 个和 2 个线程分别做 64 MiB "可分页 → 锁页"memcpy 的吞吐；
+   - 64 MiB 块进入 4 × 64 MiB 锁页环、与异步 H2D 双缓冲重叠的端到端吞吐；
    - 典型负载下的可用物理内存。
 4. **核对 D3 的前提**：通读 prefill 和 decode 注意力内核，以及 frontier 相关代码，列出所有隐含"页号 × 64 = 位置"的地方。
 5. 退出标准：以上数据和核对结论写进 `progress.zh-CN.md`。
 
 ### 阶段 3：分层 + 精确（2.5–3.5 周）
+
+保留原始逻辑页号的访问列表、设备 staging、split-K 与状态恢复方案见 [阶段 3 视图设计](stage3-view-design.zh-CN.md)。
 
 建议按以下顺序推进，每一步都带测试：
 
@@ -178,7 +181,7 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
 
 退出标准：
 
-- 262K rk4v4-e8 下，`tiered-exact` 与 dense 的前 64 个贪心 token 一致，或者 logits 相对误差不超过 1e-3；
+- 262K rk4v4-e8 下，逐 token 比较 `tiered-exact` 与 dense 的前 64 个贪心 token，直到第一个分歧步。若无分歧则满足 token 判据；若有分歧，仅当该步 dense 的 top-1 与 top-2 logits 差值不超过 **1 个 BF16 ulp** 时，按并列敏感判据通过，否则失败。该步的 dense logits 必须来自**生成该 dense token 的同一次运行**，不能拿另一轮诊断数据代替。同时只在第一个分歧步之前的共同 token 前缀上逐步计算完整词表的相对 L2 范数 `||tiered-dense||₂/max(||dense||₂, 1e-12)`，每步阈值为 **1e-3**；分歧步及之后的不同生成轨迹不作逐步 logits 误差比较。BF16 ulp 取 dense top-1 附近相邻可表示 BF16 数的间距，比较前记录候选 ID、BF16 值和首个分歧步；
 - int8 归档能完整跑完 262K，prefill 时间不超过 dense 的 1.15 倍；
 - 多轮复用正确；
 - dense 模式的金标准不变。
