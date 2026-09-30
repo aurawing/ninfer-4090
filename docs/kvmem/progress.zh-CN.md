@@ -4,7 +4,7 @@
 
 ## 待用户决定的问题
 
-（暂无；D3 的后续方向已由用户在 2026-09-30 确认，见阶段 0′ 记录。）
+当前第 1、2 步没有待决定的 D1–D15 冲突。定位发现的 dense 量化 small-T 注意力同步 bug 尚未修复；后续若要修复须另获用户授权，见下文。D3 的后续方向已由用户在 2026-09-30 确认。
 
 ## 阶段 0′：基线
 
@@ -48,7 +48,7 @@
 
 ## 阶段 3：分层 + 精确
 
-- 状态：视图设计说明已写入 `stage3-view-design.zh-CN.md`；D4 归档模式、设备 staging、确定性约束与两层数值门禁已按用户 2026-09-30 决定修订。门禁 A 已进一步改为同一次运行的影子注意力比对；以下定位仅使用临时代码，归档与传输引擎实现尚未开始。
+- 状态：视图设计说明已写入 `stage3-view-design.zh-CN.md`；门禁 A 已改为同一次运行的影子注意力比对。dense 定位与门禁文档已在 `445dcfd0` 独立提交并 push；第 1 步归档组件与测试已完成，完整构建/CTest 结果见下文。内核、目标运行时接线和产品 CLI 尚未实现。
 - 量纲核对：补测文件 `followup-max-pin.json` 记载单块 `cudaHostAlloc` **15488 MiB 成功、15552 MiB 失败**。用户表述的「15.5 GiB」为近似说法；按二进制换算实际成功点是 **15.125 GiB**，文档统一写原始 MiB 与约 15.1 GiB。
 
 ### 阶段 3 前的 BF16 波动核对（2026-09-30；临时代码已撤回）
@@ -93,6 +93,16 @@ Compute Sanitizer 13.0.85 在同一个 `gqa_attention_decode_i8_tiled_kernel` �
 完整证据目录：`D:\deeplearning\NInfer\logs\kvmem-stage0-baseline`；文件 `gqa24-t4-v13-{racecheck,synccheck,initcheck}.log` 与对应 stdout。诊断在每个阶段读回并同步，会改变时序，所以不同哈希数量只是本次实测，不是日常请求发生概率。后续若要修 dense 正确性 bug，须另获用户授权；当前按用户指令继续阶段 3 第 1、2 步，不进入新注意力内核。
 
 临时源码和最小 CTest 改动撤回后完整构建退出 0；全量 CTest **96 项，92 通过、4 因其他模型制品缺失跳过、0 失败**，耗时 73.46 s（`dense-diagnosis-restore-build.log`、`ctest-dense-diagnosis-restored.log`）。现有完整套件没有覆盖上述新缩出的 T=4、base=508 用例，套件通过不否定 sanitizer 已证实的 bug。
+
+### 第 1 步：主机归档与回写（2026-09-30，基于 `445dcfd0`）
+
+- 新增 `src/core/kvmem/host_kv_archive.{h,cpp}`。归档布局由真实 `PagedKVPool::page_bytes()` 推导，按层 → plane → 原始逻辑页排列；每个 plane 的 OS 页对齐和所有容量运算有溢出检查。`max_context` 可以大于设备视图的物理容量，只要求逻辑页表容量覆盖它。既有 pool 增加一个只读 `plane_order()` getter，未修改 dense 内核或分派。
+- 加载期支持 auto/pinned/pageable 与实际路径日志。完整归档 + 4 GiB 的物理内存准入；auto 成功整块锁页且剩余物理内存 ≥4 GiB 才保留锁页，否则释放后回退；显式 pinned 失败退出。pageable 使用 Windows `VirtualAlloc` 只预留地址，写入时按 plane 提交，trim 时撤销完整 OS 页的提交。运行期不申请新的 CUDA 锁页缓冲。VirtualLock 的可选 CLI 接线仍属第 7 步。
+- PageMajor 的连续物理页合并调用既有 copy 接口；HeadMajor 按单页形成规范字节，避免既有 bulk copy 的「head → 一段页」打包次序改变归档的「逻辑页 → head」。归档按完整量化页字节搬运，不重新量化。每层 D2H 回写和恢复 H2D 有加载期创建的 CUDA 事件；完成后才发布主机可读 frontier，覆盖回写前与 trim 前等待已有读写。trim 增加 generation、保持精确 token frontier、保留部分尾页，尾部不作为有效 key；不允许 trim 增长或回写产生逻辑空洞。
+- 第 1 步的 copy 方法是整视图镜像的基础接口：pageable 尚直接调用既有 CUDA copy；第 2 步将增加显式四槽中转与独立传输线程。尚未在 NInfer 产品运行时启用 tiered 模式，完整视图的镜像由真实 PagedKVPool 测试验证；产品运行时和模式参数按既定第 4/7 步接入。
+- 新 CTest **`test_host_kv_transfer`**：三种请求模式 × PageMajor/HeadMajor，共 6 组；每组两层、每层四个不同 page-byte plane，归档容量 **417792 B**，8 个逻辑页。独立生成逐字节 pattern，碎片物理映射 `{5,2,3,7}` → `{1,6,4,0}` 的全部 plane/page 往返和覆盖回写一致；frontier **250 → 130 → 0 → 12**，保留第 2 页前 2 token 的 frontier 语义，越界/空洞/无效物理页被拒绝。pageable 初始提交量和 trim 到 0 后提交量均为 0，中间 trim 能实际减少提交量；auto 在本次小归档上选择 pinned。4 GiB 准入边界和失败 pin 的策略另有纯函数断言，不宣称在本测试人为制造了实际大块 pin 失败。
+- 新增延迟 H2D 的 trim 用例：先观察到失败 `trim must drain outstanding archive H2D reads`，再增加读取完成事件保护，6 组全部通过。初次测试构建在新接口未实现处失败；实现后基础及延迟用例均通过。外部数据为 `host-kv-red-build.log`、`host-kv-trim-red-build.log`、`stage3-step1-byte-test.log`。
+- 全量构建退出 **0**；全量 CTest **97 项：93 通过、4 因缺少其他模型制品跳过、0 失败**，耗时 **66.85 s**。新测试在完整套件中耗时 1.53 s（与其他测试并行）；另一次单独运行退出 0。记录：`stage3-step1-build.log`、`ctest-stage3-step1.log`。数值全部为实测或明确的测试配置，未提供未经测量的推理性能结论。
 
 ## 阶段 4：稀疏 decode
 

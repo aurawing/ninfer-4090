@@ -30,6 +30,7 @@ add_library(ninfer_core STATIC
   core/gdn_replay_records.cpp
   core/cyclic_kv_cache.cpp
   core/paged_kv_cache.cu
+  core/kvmem/host_kv_archive.cpp
   core/linear_attention_state.cpp
   core/layout.cpp
   core/tensor.cpp
