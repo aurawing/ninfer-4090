@@ -457,6 +457,8 @@ struct KvMemSequence {
 - **回写**：每个 prefill 分块结束、以及 decode 中每页写满时，异步 D2H 回写（主动换出），保证驱逐时页已处于 Both 状态。
 - **吞吐预期**：8–11 GB/s，阶段 0 实测。
 
+**D4 修订（2026-09-30）**：4090 在 262K 就绪后整块可锁页 15488 MiB（约 15.1 GiB），实测可分页归档经 4×64 MiB 中转环的端到端吞吐为 4.19 GiB/s、锁页直传为 9.83 GiB/s；因此新增默认 `--kvmem-host-archive auto`，加载期按 `max_context` 与 KV 类型计算归档大小，整块锁页且剩余可用物理内存不少于 4 GiB 时采用锁页归档并直接 H2D/回写，否则释放部分分配后退回可分页归档与加载期中转环，显式 `pinned` 失败则退出、显式 `pageable` 保留可分页路径，两种归档统一为「层 → plane → 逻辑页」布局且运行期不新申请锁页内存。
+
 #### 5.6.5 Mean-K 索引
 
 - **写入**：在 K 做完 RMSNorm、还没做 RoPE 的位置（与 `ops::rope` 相邻，也可以融合进 rope 内核），按页、层、kv 头累加 FP32 和。每个未写满的页占 64 KiB 累加器。页写满后转成 FP16，D2H 到主机索引，每页 32 KiB，折合每 token 512 B；262K 共 128 MiB，全部放在主机。
@@ -859,7 +861,7 @@ JGamboa 的转换文档记录过一次方向写反的 bug：结果看上去像�
 2. **调试周期快 10 倍。** 4090 上 262K 满窗 prefill 实测 215.7 s，平均约 1218 tok/s。4060 在 prefill 张量核移植完成前约 125 tok/s，262K 冷启动要 40 分钟以上。KVMem 的开发不再被阶段 5 的内核移植卡住。
 3. **门禁更强。** 4090 能跑 262K 的 dense 基线（rk4v4-e8 已实测跑通）。于是可以在 262K 上直接验证"同一 KV 精度下，tiered-exact 与 dense 输出一致"。4060 的 dense 最多约 49K，只能在短上下文上做这项对照。
 4. **4090 本身就需要 KVMem。** 目前 262K 只能用 rk4v4-e8，满窗时最低空闲显存约 300 MiB，int8 和 bf16 都放不下。项目最初"省显存换 KV 精度"的需求在 4090 上同样存在。
-5. **传输条件与 4060 接近。** i5-10400 属于 Comet Lake，CPU 直连的只有 PCIe 3.0 x16（理论 15.75 GB/s），与 4060 Laptop 的 PCIe 4.0 x8 相同。4090 常驻约 23 GB 显存，WDDM 锁页限额比 4060 更紧（ninfer-all 的实测表：已驻留 22.5 GiB 时，最多只能锁页 1.5 GiB）。所以在 4090 上调好的传输引擎和"可分页归档 + 小中转环"方案，到 4060 上只会更宽松。
+5. **传输条件与 4060 接近。** i5-10400 属于 Comet Lake，CPU 直连的只有 PCIe 3.0 x16（理论 15.75 GB/s），与 4060 Laptop 的 PCIe 4.0 x8 相同。旧文依据 ninfer-all 的已驻留 22.5 GiB 时最多锁页 1.5 GiB，推断「4090 的 WDDM 锁页限额更紧、4060 只会更宽松」；阶段 0′ 在本机 262K 配置就绪后实测整块可锁页 15488 MiB（约 15.1 GiB），推翻了该推断，4060 的锁页上限仍须独立实测，4090 同时验证锁页直传与可分页中转两条路径。
 
 如果 4090 也改跑三值 Bonsai，权重只有 5.52 GiB，dense 就能放下 bf16 262K（5.8.4 的 24G 档），也就不需要 KVMem。所以 4090 上 KVMem 的价值针对的是 groupwise-int 版。
 
@@ -937,7 +939,7 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
 
 | 检查 | 判据 |
 |---|---|
-| tiered-exact 对 dense，都用 rk4v4-e8，262K | 前 64 个贪心 token 一致，或 logits 相对误差 ≤ 1e-3（LSE 合并会改变求和顺序） |
+| tiered-exact 对 dense，都用 rk4v4-e8，262K | 按 [README](README.zh-CN.md) 阶段 3 的新版 A/B 两层门禁：prefill 完整 logits 稳定性与 top-1、三次 MTP-3 decode 的共同前缀误差及并列波动；以 README 为准 |
 | kvmem int8（视图 128K）对 dense rk4v4-e8，128K/262K | needle、多文件事实检索、工具回放的通过率不低于 dense，用来体现精度提升 |
 | kvmem int8（视图 32K）对 tiered-exact int8 | 同上，报告通过率。这组数据就是 4060 上的预期质量 |
 | MTP 窗口化 | 贪心输出与关闭 MTP 时相同；接受率下降 ≤ 5 个百分点 |
@@ -966,7 +968,7 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
 | `test_attention_partial_lse_merge` | 部分输出加合并，覆盖多种 tile 划分、T、掩码 | 与 FP64 全量注意力的相对 L2 ≤ 1/256 |
 | `test_host_kv_transfer` | 可分页 → 锁页 → 设备的往返、回写、并发 | 逐字节相等 |
 | `test_kvmem_scoring` | 全局 softmax 打分和 top-k，包括必选页和图像跨度 | 与 numpy 实现一致 |
-| e2e `tiered_exact_vs_dense` | 同一 KV 类型下 tiered-exact 与 dense 比较：4090 上用 rk4v4-e8 跑到 262K，4060 上 ctx ≤ 48K | 贪心 token 一致，或 logits 相对误差 ≤ 1e-3 |
+| e2e `tiered_exact_vs_dense` | 同一 KV 类型下 tiered-exact 与 dense 比较：4090 上用 rk4v4-e8 跑到 262K，4060 上 ctx ≤ 48K | 4090 按 README 阶段 3 的 A/B 两层门禁；4060 另测短上下文 |
 | `test_kvmem_mtp_window` | MTP pool 只保留 sink 加最近窗口；窗口边界、页回收、provisional 草稿位置 | 贪心输出与关闭 MTP 时逐 token 相同；pool 页数不超过窗口上限 |
 | `test_kvmem_resume_checkpoint` | 同会话追加；回滚到 turn checkpoint 时归档截断、GDN 恢复、视图重新规划 | 与冷启动全量 prefill 的 logits 相对误差 ≤ 1e-3；归档字节与截断点一致 |
 | `test_host_archive_admission` | 按 `max_context` 上限做主机内存准入；按需提交；可选的 `VirtualLock` | 内存不足时明确拒绝；提交量随 frontier 增长 |

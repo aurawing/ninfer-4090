@@ -66,7 +66,7 @@
 | D1 | 用 `--kv-mode dense\|tiered-exact\|kvmem` 选择模式，默认 `dense`。dense 路径的输出、显存、性能都不变 | 5.6.1、5.6.11 |
 | D2 | 只对 Main Text pool（16 个全注意力层）分层。GDN 始终处理完整序列，不做稀疏 | 5.6.9 |
 | D3 | 262K 以内不做 re-RoPE。K 已经在写入时做过 RoPE，掩码按缓存序号计算，所以量化页可以逐字节换入换出。**前提要先核对**：注意力内核和 frontier 逻辑都不能假设"第 i 页覆盖位置 64i 到 64i+63" | 5.6.2 |
-| D4 | 主机归档放在可分页内存里：`VirtualAlloc` 预留，按需提交，布局与设备页逐字节一致。运行期不申请锁页内存；中转环为 4 × 64 MiB，在加载期确定 | 5.6.4 |
+| D4 | `--kvmem-host-archive auto\|pinned\|pageable`，默认 `auto`。加载期按 `max_context` 和 KV 类型计算整份归档大小：若可整块锁页且锁页后可用物理内存仍不少于 4 GiB，选锁页归档，H2D/回写直接传输；否则 `auto` 释放已分配部分，退回可分页归档（`VirtualAlloc` 预留、按需提交）与加载期 4×64 MiB 锁页中转环，`pinned` 则报错退出；`pageable` 直接选后者。日志写明实际路径。两种归档均按「层 → plane → 逻辑页」布局，连续页在每个 plane 上只需一次传输；运行期不新申请锁页内存。此项依据 262K 就绪后整块可锁页 15488 MiB（约 15.1 GiB）、可分页环端到端 4.19 GiB/s 与锁页直传 9.83 GiB/s 的实测修订 | 5.6.4 |
 | D5 | 页的状态机为 DeviceOnly → Both → HostOnly，只有 Both 状态的页可以驱逐。每个 prefill 分块结束、以及 decode 中每页写满时，都异步回写 | 5.6.3、5.6.4 |
 | D6 | `tiered-exact`：部分注意力输出 `(O, m, l)`，对双缓冲的 tile 做在线 LSE 合并。合并的数学可以复用 decode 已有的 split-K 合并 | 5.6.7 |
 | D7 | `kvmem`：精确 prefill，每轮选一次块，然后稀疏 decode。不做 query replay（`--kvmem-prefill window` 属于阶段 5，现在直接拒绝） | 5.6.6 |
@@ -79,6 +79,8 @@
 | D14 | 归档精度等于 `--kv-dtype`，4090 上推荐 int8；bf16 只作为显式选项。启动时做主机内存准入：可用物理内存不少于"归档上限 + 4 GiB"，否则拒绝，并提示改用 int8 或 rk8v4。可选 `--kvmem-lock-archive`（`SetProcessWorkingSetSizeEx` 加 `VirtualLock`） | 5.10.2 |
 | D15 | 主机侧工作线程最多 2 个（CPU 只有 6 核）。CPU 视觉在 prefill 之前同步执行，与这些线程不重叠 | 5.10.3 |
 
+`--kvmem-lock-archive` 是 D14 原有的 `VirtualLock` 选项，仅适用于可分页归档；它不等同于 D4 中可直接异步传输的 CUDA 锁页归档，不能与 `--kvmem-host-archive pinned` 同时使用。设备 staging 在加载期按「一个全注意力层每个 prefill 分块的最大流式量 + 64 MiB」求容量（int8、128K 视图约 264 + 64 MiB），由 `build_workspace_plan()` 从视图显存预算中让出；前面几个 GDN 层计算时预取下一全注意力层，不在切层时整层等待。split 划分和 LSE 合并顺序只由访问列表与 frontier 决定，不由传输完成先后决定。
+
 新增 CLI 参数（设计值，实现时可以调整默认值，但要记录下来）：
 
 ```text
@@ -90,6 +92,7 @@
 --kvmem-gen-reserve 6144
 --kvmem-query-tokens 16
 --kvmem-mtp-window 32768
+--kvmem-host-archive auto|pinned|pageable
 --kvmem-lock-archive
 ```
 
@@ -171,7 +174,7 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
 建议按以下顺序推进，每一步都带测试：
 
 1. **主机归档与回写**：先让 `tiered-exact` 在视图覆盖全部上下文时运行，这时归档只是设备页的镜像，和设备页比对，要求逐字节相同。
-2. **传输引擎**：中转环、`kv_stage_stream`、事件同步；实测带宽。
+2. **传输引擎**：可分页归档的中转环、锁页归档的直传、`kv_stage_stream`、跨层预取与事件同步；按真实多 plane 布局分别实测两种路径的「归档 → 设备 staging」吞吐。
 3. **内核**：prefill 注意力的"部分输出"变体，输出 `(O, m, l)`；合并内核。先覆盖 bf16、int8、rk4v4-e8，再补其余精度。
 4. **接线 `tiered-exact`**：视图固定为 sink 加最近的 token，更早的页流式送入。decode 也走流式路径，只用于验证。按 32K（强制小视图）→ 128K → 262K 逐级验证。
 5. **MTP 窗口化**（D11）。
@@ -181,7 +184,8 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
 
 退出标准：
 
-- 262K rk4v4-e8 下，逐 token 比较 `tiered-exact` 与 dense 的前 64 个贪心 token，直到第一个分歧步。若无分歧则满足 token 判据；若有分歧，仅当该步 dense 的 top-1 与 top-2 logits 差值不超过 **1 个 BF16 ulp** 时，按并列敏感判据通过，否则失败。该步的 dense logits 必须来自**生成该 dense token 的同一次运行**，不能拿另一轮诊断数据代替。同时只在第一个分歧步之前的共同 token 前缀上逐步计算完整词表的相对 L2 范数 `||tiered-dense||₂/max(||dense||₂, 1e-12)`，每步阈值为 **1e-3**；分歧步及之后的不同生成轨迹不作逐步 logits 误差比较。BF16 ulp 取 dense top-1 附近相邻可表示 BF16 数的间距，比较前记录候选 ID、BF16 值和首个分歧步；
+- **A，prefill 门禁**：262K rk4v4-e8 下，取 prefill 结束时最后一个位置的完整词表 logits。先独立运行 dense 两次，要求该向量逐位相同；若不同，停止并报告，不以不稳定的 dense 作对照。再比较 `tiered-exact` 与 dense：相对 L2 `||tiered-dense||₂/max(||dense||₂, 1e-12)` 不超过 **1e-3**，且 top-1 token ID 相同。
+- **B，decode 门禁**：同一 262K 用例，MTP-3 分别运行 dense、`tiered-exact` 各 **3 次**，每次解码 64 个 token。在逐 token 的共同前缀上计算完整词表 logits 相对 L2，每步不超过 `max(1e-3, 2 × dense 三次两两比较所得的最大相对 L2)`；若出现分歧，记录首个分歧步、双方候选 ID 和对应运行的 logits，仅当该步 dense 的 top-1/top-2 差值不超过 dense 三次在该步观测到的最大差距波动时通过并列判据。每次 needle 都须答对，同时记录 MTP 接受率；分歧后不同生成轨迹的 logits 不作逐步误差比较。
 - int8 归档能完整跑完 262K，prefill 时间不超过 dense 的 1.15 倍；
 - 多轮复用正确；
 - dense 模式的金标准不变。

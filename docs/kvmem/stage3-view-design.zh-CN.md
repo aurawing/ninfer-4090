@@ -11,7 +11,7 @@
 - 原有宽度为 `ceil(max_context/64)` 的块表仍按原始逻辑页号索引：驻留页写入其物理 ID，未驻留页写 `-1`。现有 KV append 只写已驻留的当前页，必须在发布执行前验证它有合法 ID。dense 模式仍由 `PagedKVAllocation::publish_mapping()` 发布原有连续块表，原有 dense 内核不改。
 - 新注意力变体读取紧凑、按逻辑页号递增的 `{int32 logical_page, int32 physical_page}` 访问列表；列表只含本次确实可读的页。resident pass 和每个 streamed pass 各有自己的列表，彼此不重复；`tiered-exact` 在一次注意力计算内覆盖 `[0,F)` 的每个有效 key 恰好一次。缺页、重复页、超出 frontier 或未完成 H2D 都是执行错误，不能静默跳过。阶段 4 的稀疏模式才允许按选块计划省略 HostOnly 页。
 
-新内核由 `logical_page * 64 + offset` 得到 key 的绝对缓存位置，而不由列表下标推导位置。例如 `{logical_page=1000, physical_page=7}` 的第 3 个 key 始终位于 `64003`，与它在访问列表中的次序无关。列表中的 `physical_page` 是新变体的统一寻址 ID：小于 resident pool 物理页数时指向当前层原有 K/V/scale plane；其余 ID 指向当前层两个设备 staging 槽中的页，按 `physical_page - resident_pool_pages` 求槽内偏移。dense 块表永不发布 staging ID。每次发布列表、块表和 frontier 都在同一个 GPU execution boundary 完成，运行中的 kernel 不见半更新状态。
+新内核由 `logical_page * 64 + offset` 得到 key 的绝对缓存位置，而不由列表下标推导位置。例如 `{logical_page=1000, physical_page=7}` 的第 3 个 key 始终位于 `64003`，与它在访问列表中的次序无关。列表中的 `physical_page` 是新变体的统一寻址 ID：小于 resident pool 物理页数时指向当前层原有 K/V/scale plane；其余 ID 指向设备 staging 的页，按 `physical_page - resident_pool_pages` 求槽内偏移。dense 块表永不发布 staging ID。每次发布列表、块表和 frontier 都在同一个 GPU execution boundary 完成，运行中的 kernel 不见半更新状态。
 
 当前 `PagedKVAllocation::page_ids()` 以向量下标表示连续逻辑页，不能直接代表有空洞的 tiered 视图。tiered 模式应新增独立的视图/归档 owner，并从 Main pool 取得与归还驻留物理页；不得把紧凑 `page_ids()` 冒充原始页序号。MTP 仍用独立 pool，Main 的换页不改变其逻辑 frontier 或物理容量；GDN 保持完整序列状态。
 
@@ -21,15 +21,17 @@
 
 对列表项 `(logical_page, physical_page)` 和页内偏移 `j`，只有 `logical_page*64+j < F` 且 `logical_page*64+j <= q_abs` 时才读 K/V 并参与 softmax。末页的无效尾部、未来 key 和 staging 槽的填充位全被掩掉。原有 dense prefill 和 decode kernel、其 `block_table[position>>6]` 路径及 split 策略保持原样；新变体分别处理 BF16、INT8 与 `rk4v4-e8` 的 plane/scale 布局。
 
-每个 resident/streamed pass 输出未归一化的 FP32 三元组 `(O,m,l)`，其中 `O=Σexp(score-m)V`、`l=Σexp(score-m)`。跨 pass 使用在线 LSE 合并：`m'=max(m,m_t)`，`l'=l·exp(m-m')+l_t·exp(m_t-m')`，`O'=O·exp(m-m')+O_t·exp(m_t-m')`，最后才算 `O/l` 并转成输出 BF16。可复用现有 `gqa_attention_decode.cuh` 的合并数学，但其 partial accumulator 当前是 BF16，不能把该存储格式直接作为阶段 3 的 FP32 精确中间结果。新 reducer 显式接收本 pass 的有效 split 数；不得再由 `last_pos+1` 推断。
+每个 resident/streamed pass 输出未归一化的 FP32 三元组 `(O,m,l)`，其中 `O=Σexp(score-m)V`、`l=Σexp(score-m)`。跨 pass 使用在线 LSE 合并：`m'=max(m,m_t)`，`l'=l·exp(m-m')+l_t·exp(m_t-m')`，`O'=O·exp(m-m')+O_t·exp(m_t-m')`，最后才算 `O/l` 并转成输出 BF16。可复用现有 `gqa_attention_decode.cuh` 的合并数学，但其 partial accumulator 当前是 BF16，不能把该存储格式直接作为阶段 3 的 FP32 精确中间结果。新 reducer 显式接收本 pass 的有效 split 数；不得再由 `last_pos+1` 推断。split 划分与 LSE 合并顺序必须仅由按原始逻辑页号排序的访问列表及 frontier 决定；传输完成先后只决定数据何时可读，不得改变 split 边界、pass 编号或合并顺序。
 
 ## 3. 分层传输与设备 staging
 
-主机归档使用可分页内存，保留每个 K/V/scale plane 的设备页字节布局。加载期固定分配 **4×64 MiB 锁页中转环**和**2×64 MiB 设备 staging 槽**；运行期不新申请锁页内存。设备槽是当前全注意力层的临时 K/V/scale plane，不是跨全部 16 层复制一套页池。层按顺序执行时复用这两个槽，避免把 64 MiB 乘以层数。每槽可装的页数由该层所有 plane 的 `page_bytes()` 之和计算；启动预算采用各层最大 per-page 字节数，尾槽按有效页数生成访问列表。host archive → 锁页槽仅逐字节 `memcpy`/分 plane 打包，不重新量化；`kv_stage_stream` 按 plane 对设备槽发异步 H2D。
+归档通过 `--kvmem-host-archive auto|pinned|pageable` 在加载期选定。`auto` 由 `max_context`、KV 类型求完整归档大小；整块锁页成功且锁页后可用物理内存仍不少于 4 GiB 时走锁页直传，否则释放已分配部分，走 `VirtualAlloc` 预留/按需提交的可分页归档和加载期 **4×64 MiB 锁页中转环**。显式 `pinned` 不能满足条件就报错，`pageable` 直接走中转环；日志记录选择和原因。两种模式的布局都为「层 → plane → 逻辑页」，K/V/scale 各 plane 内的连续逻辑页保持设备字节布局，可以一次传输；不重新量化。锁页模式 H2D 与 D2H 回写直接使用归档，可分页模式经中转环；运行期不新申请锁页内存。
 
-四个主机槽轮转，两个设备槽交替：CPU 填下一主机槽可与上一槽 H2D 重叠；H2D 完成事件使注意力 stream 可读；该槽对应的注意力消费完成事件又保护设备槽和主机槽不被过早覆盖。一个 streamed tile 的 `{logical_page, physical_page}` 列表只在其 H2D 完成后发布。GPU Graph 所需指针和 staging 容量在加载期固定；先用 tiered 专用 eager 路径验证，dense Graph 路径不变。满窗精确 decode 在阶段 3 也遍历全部页以验证数值，阶段 4 再用稀疏视图减少传输。
+设备 staging 在加载期按「一个全注意力层在单个 prefill 分块中最大的流式数据量 + 一个 64 MiB tile」确定容量；int8、128K 视图时约为 264 MiB + 64 MiB。容量由 `build_workspace_plan()` 与驻留视图一起求解，先从视图预算中让出 staging 所需显存；可提供加载期容量覆盖参数，但必须检查能容纳计算所得的最小需求，运行期不扩容。staging 是跨层复用的临时多 plane 区，不为 16 层各复制一套。在前面几个 GDN 层计算时，`kv_stage_stream` 预取下一全注意力层的页；层切换不做整层的主机等待，仅在具体页被消费前由执行流等待对应 H2D 事件。若 GDN 计算不能完全遮住传输，执行流只等待尚缺的那部分。
 
-阶段 0′ 的独立 64 MiB 微基准测得 1/2 线程 `memcpy` 约 5.98/6.00 GiB/s，合成的“4 槽锁页环 + 双设备槽 + 异步 H2D”端到端约 4.19/3.86 GiB/s；它尚未计入实际多 plane 打包、逐层调度和 LSE kernel，不能直接当作模型吞吐预测。D15 限制主机工作线程最多 2 个；首版以 1 个拷贝线程为默认，性能阶段再用真实路径复测。
+可分页模式的四个主机槽轮转：CPU 填下一槽可与上一槽 H2D 重叠，槽的复用受 H2D 完成事件保护；锁页模式跳过主机槽。设备 staging 中的每段以 H2D 完成事件标记可读，以注意力消费完成事件保护复用。跨层预取可提前填充未被当前层使用的段，但不能覆盖仍在消费的段；访问列表只在依赖的 H2D 完成后交给新注意力变体。逻辑顺序按访问列表固定，不能由哪个 H2D 先完成决定。GPU Graph 所需指针和 staging 容量在加载期固定；先用 tiered 专用 eager 路径验证，dense Graph 路径不变。满窗精确 decode 在阶段 3 也遍历全部页以验证数值，阶段 4 再用稀疏视图减少传输。
+
+阶段 0′ 的独立 64 MiB 微基准测得 1/2 线程 `memcpy` 约 5.98/6.00 GiB/s，合成的可分页环流水线端到端约 4.19/3.86 GiB/s，锁页直传约 9.83 GiB/s；262K 配置就绪后整块可锁页 15488 MiB（约 15.1 GiB）。这些数字尚未计入真实多 plane 布局、逐层预取和 LSE kernel，不能直接当作模型吞吐预测。阶段 3 第 2 步要在两种模式下测真实「归档 → 设备 staging」吞吐。D15 限制主机工作线程最多 2 个；可分页路径首版以 1 个拷贝线程为默认。
 
 ## 4. frontier、trim、restore 与 checkpoint
 
@@ -44,14 +46,14 @@
 
 | 位置 | 函数或新职责 |
 |---|---|
-| `src/core/kvmem/`（新增） | `HostArchive` 管理按原始逻辑页号索引的可分页归档和回写状态；`TransferRing` 管理 4 个锁页槽、2 个设备槽及 CUDA 事件；`ViewTable` 生成逻辑块表、resident/streamed 访问列表与 key 前缀和。 |
+| `src/core/kvmem/`（新增） | `HostArchive` 管理按原始逻辑页号索引的锁页/可分页归档和回写状态；`TransferRing` 管理可分页模式的 4 个锁页槽、锁页直传、按预算确定的设备 staging、跨层预取及 CUDA 事件；`ViewTable` 生成逻辑块表、resident/streamed 访问列表与 key 前缀和。 |
 | `src/core/paged_kv_cache.{h,cu}` | 为 tiered owner 提供受容量约束的物理页取得/归还与 per-plane page bytes/copy 接口；保留 `PagedKVAllocation::publish_mapping()` 的 dense 语义，不把其连续 `page_ids()` 改成稀疏下标。 |
 | `include/ninfer/ops/gqa_attention.h`、`src/ops/wrapper/gqa_attention.cpp`、`src/ops/launcher/gqa_attention.h` | 增加显式 tiered access-list、staging plane、有效 key 数和输出 `(O,m,l)` 的新 API/参数检查；`gqa_attention()` / `gqa_attention_cached()` 的 dense 分派不变。 |
 | `src/ops/launcher/gqa_attention_prefill.cu`、`gqa_attention_decode.cu`；`src/ops/kernel/` 新增 tiered prefill/decode 与 FP32 LSE 合并文件 | 新 launcher 按实际 key 数决定 split；新 kernel 以逻辑页求绝对位置、以物理 ID 选 resident/stage plane，并对末页及因果条件掩码；不修改现有 dense kernel body。 |
-| `src/targets/qwen3_6/impl/runtime/layouts_impl.h`、`src/targets/qwen3_6/impl/state/decoder_state.cpp`、`src/runtime/engine/kv_capacity.cpp` | `build_workspace_plan()` / `build_sequence_candidate()` 和 `plan_decoder_state()` 把视图、两设备槽、访问列表、FP32 部分输出及主机归档准入纳入启动预算；Main/MTP pool 仍分开。 |
+| `src/targets/qwen3_6/impl/runtime/layouts_impl.h`、`src/targets/qwen3_6/impl/state/decoder_state.cpp`、`src/runtime/engine/kv_capacity.cpp` | `build_workspace_plan()` / `build_sequence_candidate()` 和 `plan_decoder_state()` 把视图、动态算出的设备 staging、访问列表、FP32 部分输出及主机归档准入纳入启动预算；staging 显存从视图预算中让出，Main/MTP pool 仍分开。 |
 | `src/targets/qwen3_6/impl/runtime/program.h`、`program_impl.h` | `SequenceKVBundle` / `SequenceState` 持有 tiered owner；`start_prefill_lane()`、`advance_prefill()`、`decode_ordinary_batch()`、`decode_mtp_batch()` 在执行边界发布视图；`materialize_sequence_kv()` / `trim_sequence_kv()`、turn-checkpoint capture 与 restore 路径同步归档、frontier 和 generation；tiered 模式拒绝磁盘 snapshot/restore。 |
-| `src/targets/qwen3_6/impl/runtime/text_context_impl.h`、`text_prefill_impl.h` | `TextContext::attn_mix()`、`run_layers()` 与 prefill chunk 调度选择新 Main 注意力路径；MTP/GDN 维持独立状态。每层使用相同两个设备槽，切层前等待上一层消费事件。 |
+| `src/targets/qwen3_6/impl/runtime/text_context_impl.h`、`text_prefill_impl.h` | `TextContext::attn_mix()`、`run_layers()` 与 prefill chunk 调度选择新 Main 注意力路径；MTP/GDN 维持独立状态。前面几个 GDN 层计算时预取下一全注意力层的页，按段消费事件复用 staging，具体页读取前等待 H2D 事件。 |
 | `include/ninfer/types.h`、`apps/cli/options.cpp`、`src/serve/serve_options.cpp` | 接入 README 已定义的模式和准入参数；默认 `dense`，`tiered-exact` / `kvmem` 仅 C=1。 |
 | `tests/ops/test_gqa_attention.cpp` 与新增 `test_host_kv_transfer`、`test_attention_partial_lse_merge`、`test_kvmem_view_table`、`test_kvmem_resume_checkpoint` | FP64 全量注意力 oracle 覆盖远距离逻辑页、空洞、末页/因果掩码和 split 边界；逐字节 transfer 往返、事件复用、trim/restore；32K→128K→262K 与阶段 0′ dense 金标准比对，并跑全量 CTest。 |
 
-进入实现前的约束：所有列表与 staging 容量在启动时确定；容量不足或确切所需页缺失时清晰报错；新模式的数值门禁按 README 第 5 节的并列敏感判据执行。dense 路径的输出、显存、性能基线不变。
+进入实现前的约束：所有列表与 staging 容量在启动时确定；容量不足或确切所需页缺失时清晰报错；split 和 LSE 顺序不能受异步传输完成顺序影响；新模式的数值门禁按 README 第 5 节的 prefill 与 decode 两层判据执行。dense 路径的输出、显存、性能基线不变。
