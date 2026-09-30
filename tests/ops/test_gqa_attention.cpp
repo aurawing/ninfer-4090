@@ -2,6 +2,7 @@
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/gqa_attention.h"
 #include "ops/op_tester.h"
+#include "partial_attention_reference.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1378,6 +1379,11 @@ int main() {
     failures += verify_workspace_capacity_contract();
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     failures += run_batch_cases();
+    for(auto format:{attention_reference::Format::Bf16,attention_reference::Format::Int8,
+                     attention_reference::Format::Rk4v4E8}){
+        failures+=partial_attention_reference::run(format,4,7,false,0,true);
+        failures+=partial_attention_reference::run(format,16,7,true,1);
+    }
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " gqa_attention public-contract correctness\n";
     return failures == 0 ? 0 : 1;

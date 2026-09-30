@@ -284,6 +284,9 @@ ninfer_add_op_test(ninfer_gqa_attention_test
 ninfer_add_op_test(ninfer_gqa_small_t_sync_test
   SOURCES ops/test_gqa_small_t_sync.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(test_attention_partial_lse_merge
+  SOURCES ops/test_attention_partial_lse_merge.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_bidirectional_gqa_attention_test
   SOURCES ops/test_bidirectional_gqa_attention.cpp
   LIBRARIES ninfer_ops)

@@ -98,14 +98,18 @@ inline std::vector<std::uint16_t> queries(int tokens) {
 inline std::vector<double> oracle(const EncodedCache& cache,
                                   const std::vector<std::uint16_t>& q,
                                   const std::vector<std::int32_t>& positions,
-                                  const std::vector<int>& accessed_keys = {}) {
+                                  const std::vector<int>& accessed_keys = {},
+                                  const std::vector<int>& key_positions = {}) {
+    if (!key_positions.empty() && key_positions.size() != static_cast<std::size_t>(cache.keys)) {
+        throw std::invalid_argument("attention oracle key-position size");
+    }
     std::vector<double> output(q.size(), 0), scores(cache.keys);
     for (std::size_t token = 0; token < positions.size(); ++token) {
         for (int h = 0; h < q_heads; ++h) {
             const auto qr = head_dim * (h + q_heads * token);
             double maximum = -std::numeric_limits<double>::infinity();
             for (int key = 0; key < cache.keys; ++key) {
-                if (key > positions[token] || (!accessed_keys.empty() &&
+                if ((key_positions.empty() ? key : key_positions[key]) > positions[token] || (!accessed_keys.empty() &&
                     !std::binary_search(accessed_keys.begin(), accessed_keys.end(), key))) {
                     scores[key] = -std::numeric_limits<double>::infinity(); continue;
                 }

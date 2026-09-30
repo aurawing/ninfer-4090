@@ -10,6 +10,8 @@ function(ninfer_add_op_bench name)
   target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 endfunction()
 
+ninfer_add_op_bench(ninfer_attention_partial_bench SOURCES attention_partial_bench.cpp)
+
 add_executable(ninfer_host_kv_transfer_bench host_kv_transfer_bench.cpp)
 target_include_directories(ninfer_host_kv_transfer_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)

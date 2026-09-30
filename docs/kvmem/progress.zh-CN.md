@@ -4,7 +4,7 @@
 
 ## 待用户决定的问题
 
-当前没有待决定的 D1–D15 冲突。dense 量化 small-T 注意力同步 bug 已按用户授权在独立分支修复并合并到 `feat/kvmem`；Q5 残差原子累加顺序波动按用户决定保留。后续传输修正及阶段 3 第 3 步继续执行；第 3 步完成后等审阅，不接入运行时。D3 的后续方向已由用户在 2026-09-30 确认。
+当前没有待决定的 D1–D15 冲突。dense 量化 small-T 注意力同步 bug 已按用户授权在独立分支修复并合并到 `feat/kvmem`；Q5 残差原子累加顺序波动按用户决定保留。传输修正及阶段 3 第 3 步已完成并验证；停在第 3 步审阅点，不接入运行时。prefill 性能与 partial workspace 容量的实测限制见第 3 步记录。D3 的后续方向已由用户在 2026-09-30 确认。
 
 ## 阶段 0′：基线
 
@@ -182,7 +182,7 @@ foreach ($check in @('racecheck', 'synccheck', 'initcheck')) {
 
 **512-token、保留 checkpoint 分块的双运行。** 不带视觉、关闭 MTP，`--no-cuda-graph --greedy --no-thinking --kv-dtype rk4v4-e8 --prefill-chunk 1024 --max-context 32768 --kv-capacity 32768 --max-new 1`。使用旧矩阵同一份固定 `prompt-512.json`；两次实测均为 512 token，真实边界 **`[0,508), [508,512)`**，没有禁用 checkpoint。最后位置导出 248320 个 BF16 原值，有效 248077 项。两次**仍不逐位相同**：有效项 **246134/248077** 不同，计入物理词表尾部共 **246377/248320** 不同，有效向量相对 L2 **0.1248612403**，top-1 均为 **ID 16**。这是剩余模型波动的实测，不能因注意力独立重复测试稳定就宣称整个 dense 模型稳定，也不能仅凭两次输出把全部差异定量归因于 Q5；本轮按决定不再修 dense 的其他代码。原始二进制、哈希、真实分块、完整命令及双运行结果在 `checkpoint-512/summary.json` 和 `.logits/.chunks/.stdout.txt/.stderr.txt`。
 
-**每步 logits 诊断重录也已完成。** 九例各 64 步的 top-8 与完整 BF16 target logits 均保存在新目录 `diagnostic/`（`*.top8.json`、`*.target-logits.bf16.bin`、`*.accept.bin`）；**9/9** 的诊断输出 token 与该次未插桩基线完全一致，每步 top-1 与诊断实际生成 ID 一致，六例 needle 也均答对。与旧数据相同，这些 `logits_fp32` 是 BF16 原值转成 FP32 表示，不是舍入前的 FP32。诊断禁用 CUDA Graph、增加读回同步，耗时不作为性能数据，也不能从本次一致推断 Q5 已确定性。脚本、SHA-256、命令和摘要在外部目录；所有临时 target 读回/分块钩子均已撤回，未改 Q5 或其他 dense 内核。传输修正与新部分注意力尚未完成。
+**每步 logits 诊断重录也已完成。** 九例各 64 步的 top-8 与完整 BF16 target logits 均保存在新目录 `diagnostic/`（`*.top8.json`、`*.target-logits.bf16.bin`、`*.accept.bin`）；**9/9** 的诊断输出 token 与该次未插桩基线完全一致，每步 top-1 与诊断实际生成 ID 一致，六例 needle 也均答对。与旧数据相同，这些 `logits_fp32` 是 BF16 原值转成 FP32 表示，不是舍入前的 FP32。诊断禁用 CUDA Graph、增加读回同步，耗时不作为性能数据，也不能从本次一致推断 Q5 已确定性。脚本、SHA-256、命令和摘要在外部目录；所有临时 target 读回/分块钩子均已撤回，未改 Q5 或其他 dense 内核。该次基线提交时传输修正与新部分注意力尚未完成，后续结果见下面各步。
 
 ### 第 2 步审阅修正：回写与预取独立推进（2026-10-01，基于 `1fff2bb6`）
 
@@ -199,6 +199,66 @@ foreach ($check in @('racecheck', 'synccheck', 'initcheck')) {
 | pageable / HeadMajor | 0.1283 | 0.1509 | 62.4526 |
 
 源池及生产流必须活到 completion future 完成，源 KV 字节在此之前不改动，已写入 API 注释。原有归档往返、异步回写、事件多次复用、live range 与旧 generation 拒绝、trim 语义保留。证据在 `D:\deeplearning\NInfer\logs\kvmem-stage3-attention` 的 `transfer-sync-{red,green}-{build,test}.log`；完整构建退出 **0**（`transfer-sync-full-build.log`）。构建完成后全量 CTest **99 项：95 通过、4 缺少其他模型制品跳过、0 失败，62.87 s**（`ctest-transfer-sync.log`）。没有修改 dense 内核/分派或接入 tiered 运行时。
+
+### 第 3 步：部分注意力与固定顺序 LSE（2026-10-01，基于 `fdfe3217`）
+
+**实现范围。** 新增独立 `gqa_attention_partial.{h,cpp,cu}` API/launcher、BF16 与量化 prefill/small-T 内核、LSE merge/finalize；原 dense API、分派、内核和 Q5 均不改。覆盖 C=1、24Q/4KV、BF16 / INT8-G64 / rk4v4-e8。每次只读明确发布的 `{logical_page, physical_page}` 列表，物理 ID 分别指向 resident 与 staging plane，位置始终由原始逻辑页号求出。`attention_access_prefix()` 在执行边界验证排序、frontier、物理容量；设备 split 按实际可见 key 前缀等分，与传输到达顺序无关。空列表、空 split、因果掩码全部为空时输出 `O=0,m=-inf,l=0`。
+
+- `O` 为未归一化 FP32 分子，`m` 为自然对数域的最大 score，`l` 为 FP32 分母；每个 split 独占输出。固定升序合并、不用原子操作，支持多个 pass 的 FP32 状态继续合并，最后才 BF16 finalize。rk4v4-e8 在 FP32 部分结果上做 V 的 H64 逆旋转。
+- Q 的量化由一个 warp 独占完整 `(row,group)`，含 padding；scale 和概率有独立共享存储，不复用旧竞争写法。量化写入和首次读取之间有 CTA barrier。BF16 Q/K 的共享存储在 fragment 读取完成后有 CTA barrier 才复用。两种 small-T tile 支持尾块，prefill 为 10 token / 60 GQA 行的 tile；支持范围和 CUDA grid 上限写在新 API 注释里。
+- 输入 prefix 必须原样来自 host helper：每项是整页，只有 frontier 的末页可能少于 64 key。因此 `ordinal/64` 可以 O(1) 查**列表条目**，再读条目的原始逻辑页号求绝对位置；不把紧凑列表序号当成位置。仍由 prefix 和 query frontier 算有效 key 数及 split；不接受任意截短的中间页。
+
+**独立数值验证。** 新 CTest `test_attention_partial_lse_merge` 有三种格式各 12 个注意力用例，共 **36 例**；原 `ninfer_gqa_attention_test` 另加六个部分注意力 oracle 用例。FP64 oracle 从真实 BF16/量化缓存字节解码，不调用 GPU attention/encoder 求参考。覆盖第 **3000 页（192000）**、页间空洞、打散的物理映射、不同 K/V/page/head/group/offset scale、末页 13 key、跨 32/64-key tile 与 split、300 split 中的空 split、T=1/2/4/9 decode、T=16/17 prefill、混合/全驻留/全 staging、空列表和全未来页。输出先 NaN poison，检查所有部分状态已写且有限（仅中性 m 为 -inf），检查缓存字节未改变；同一输入与划分各跑两次，**部分 O/m/l 与最终 BF16 输出逐位一致**。独立 LSE FP64 用例另覆盖 ±75 的最大值、NaN 中性载荷、全部中性行、两级合并、别名拒绝及坏列表校验。
+
+| 格式 | 对理想 FP64 oracle 的最大相对 L2（含 BF16 finalize） | 三个 streamed pass 对一次计算的最大相对 L2（归一化 FP32） |
+|---|---:|---:|
+| BF16 | 0.00166783337 | 2.32558334e-6 |
+| INT8 | 0.00187258759 | 4.34224891e-5 |
+| rk4v4-e8 | 0.00169578193 | 3.45517982e-5 |
+
+注意力 oracle 判据在首次测试前固定为相对 L2 `1/256`、gross `1.1e-3 + 3.9e-3×max|ref|`；多 pass 对一次计算的判据独立为相对 L2 **1e-3**、gross `1e-4 + 1e-3×max|ref|`。初版 BF16 PV 概率暂存造成 decode 多 pass 相对差 **0.00157320683**，未通过后没有放宽判据：新 BF16 PV 额外保留概率的 BF16 低位残差，做第二次 MMA；quantized prefill 仍用 native FP16 PV。改后差异通过，属于新算子的精度改善，**不是改 Q5 或 dense**。初版失败日志 `partial-expanded-test.log` 保留。算子 oracle、跨 pass 的误差与 README 的整模型门禁 A/B 口径不同；影子验证和模型三次包络测量须在第 4 步接线后执行，本轮不宣称已通过。
+
+**264 MiB 计算微基准。** `ninfer_attention_partial_bench` 使用真实 PageMajor INT8 K/V/FP16-scale 四 plane，**131072 key、276824064 B**，全部位于 staging，resident pool 为空；dense 使用同一份字节、同一份 Q、同一缓存位置和 key 数。不计 H2D、归档、模型层或 GDN；CUDA event、eager、5 次预热/20 次计时，RTX 4090 同时驱动桌面。手动扫描 split=32/64/128/256，完整曲线见外部 `partial-direct-page-bench.log`；下表每个 T 取本轮测得的最低 total，选择不依赖传输完成顺序：
+
+| T / 路径 | split | dense ms | partial kernel ms | 独立 merge+finalize ms | 新路径整体 ms | 新/dense |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 / decode | 64 | 0.328894 | 0.311808 | 0.0315216 | 0.327571 | 0.995977 |
+| 4 / decode | 32 | 0.342589 | 0.384816 | 0.0198576 | 0.394635 | 1.15192 |
+| 64 / prefill | 32 | 7.19003 | 2.38846 | 0.0273856 | 2.47229 | 0.343851 |
+| 1024 / prefill | 32 | 21.7745 | 35.9727 | 1.00157 | 36.8224 | 1.69108 |
+
+单独计时与整体计时是不同批次，受时钟和 eager 下发影响，不能要求三个数严格相加。T=64 的 dense grid 仅 24 CTA，split 增加并行度；T=1024 下新路径**仍慢 69.1%**，不能用小 T 的结果代表正常 prefill。原逐 key 二分查列表的版本测得 47.9529 vs dense 24.9162 ms（1.92457 倍）；O(1) 查条目后的相对差改善，但两批 GPU 时钟/桌面状态不同，不能将绝对时间全部归因于代码优化。量化 PV 的共享加载、同步和大量 FP32 partial 写出仍是后续优化候选，尚未用 profiler 定量归因。
+
+**接线前需审阅的资源与性能限制。** T=1024、32 split 时 partial O/m/l 为 **774 MiB**，单份 merge O/m/l 再需 **24.1875 MiB**，不含 Q/output、staging 和驻留 KV；256 split 的 O 单 plane 达 **6 GiB**。第 4 步必须在加载期预算、按预算选择固定的 query 子块和 split，不能直接把微基准参数放进真实 24 GiB 模型运行时。当前仍是功能验证版本；prefill 性能/partial 容量是明确的审阅项，不涉及 D1–D15 改动，也没有以这些数字预测整模型速度。
+
+**最终验证及证据。** `partial-direct-page-test.log` / `partial-numerical-summary.json` 保存最终数值；compute-sanitizer **13.0.85** 对最终 36 例与 merge 测试跑 `racecheck`、`synccheck`、`initcheck`，全部退出 **0**：racecheck **0 hazards / 0 errors / 0 warnings**，另两项各 **0 errors**。新 bench 独立构建退出 **0**；恢复原 `NINFER_BUILD_BENCHMARKS=OFF` 的 product 配置后，完整构建退出 **0**（`partial-full-build.log`）。构建结束才执行全量 CTest：**100 项，96 通过、4 缺少其他模型制品跳过、0 失败，62.56 s**（`ctest-partial.log`）；新 CTest 为 1.46 s。全部检查完成后按授权单独提交第 3 步并推送 `feat/kvmem`；到此停下等审阅，不实现视图状态机或运行时接线。所有初版失败、构建、微基准和 sanitizer 日志留在仓库外 `D:\deeplearning\NInfer\logs\kvmem-stage3-attention`，未提交临时代码、模型或数据。
+
+复现命令（repo 下，先加载 VsDevCmd 的 x64 环境；使用 CMake 3.31.10）：
+
+```powershell
+$cmake = 'D:\VSCodeProjects\ninfer-4090-research\toolchain\python-packages\cmake\data\bin\cmake.exe'
+$ctest = 'D:\VSCodeProjects\ninfer-4090-research\toolchain\python-packages\cmake\data\bin\ctest.exe'
+$data = 'D:\deeplearning\NInfer\logs\kvmem-stage3-attention'
+$env:PATH = 'D:\deeplearning\NInfer\runtime\ninfer-rtx4090-windows-x64-vision-modes-v3;' + $env:PATH
+$env:NINFER_OP_REPORT_STATS = '1'
+& $cmake -S . -B build-vision-integration -DNINFER_BUILD_BENCHMARKS=ON
+& $cmake --build build-vision-integration --target test_attention_partial_lse_merge ninfer_gqa_attention_test ninfer_attention_partial_bench --parallel 4
+& '.\build-vision-integration\tests\test_attention_partial_lse_merge.exe'
+& '.\build-vision-integration\bench\ninfer_attention_partial_bench.exe' *> "$data\partial-direct-page-bench.log"
+$san = 'D:\deeplearning\NInfer\logs\kvmem-stage0-baseline\sanitizer-tools\cuda_sanitizer_api-windows-x86_64-13.0.85-archive\compute-sanitizer\compute-sanitizer.exe'
+foreach ($check in @('racecheck', 'synccheck', 'initcheck')) {
+    & $san --tool $check --error-exitcode 99 --log-file "$data\partial-direct-page-$check.log" `
+        '.\build-vision-integration\tests\test_attention_partial_lse_merge.exe' `
+        *> "$data\partial-direct-page-$check.stdout.txt"
+    if ($LASTEXITCODE -ne 0) { throw "$check failed: $LASTEXITCODE" }
+}
+# 单独构建/测量新 bench 后恢复原 product 配置；先构建结束，再跑测试。
+& $cmake -S . -B build-vision-integration -DNINFER_BUILD_BENCHMARKS=OFF
+& $cmake --build build-vision-integration --parallel 4
+$env:NINFER_QWEN3_8_27B_WEIGHTS = 'D:\deeplearning\NInfer\models\qwen3_8_27b.ninfer'
+$env:NINFER_TEST_VISION_GGUF = 'D:\deeplearning\kvmem-v0.16.0-rc3-windows-x86_64-cuda13.2.86\models\Qwen3.8-27B\Qwen3.8-27B\mmproj-BF16.gguf'
+& $ctest --test-dir build-vision-integration --output-on-failure -j 4
+```
 
 ## 阶段 4：稀疏 decode
 
