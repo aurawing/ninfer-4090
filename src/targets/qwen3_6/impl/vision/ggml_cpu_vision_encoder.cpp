@@ -16,7 +16,10 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <exception>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace ninfer::targets::qwen3_6 {
 namespace {
@@ -231,20 +234,39 @@ std::size_t preflight(const std::string& path, std::size_t budget) {
     return bytes;
 }
 
-class GgufCpuVisionEncoder final : public CpuVisionEncoder {
+class GgufVisionEncoder final : public CpuVisionEncoder {
 public:
-    GgufCpuVisionEncoder(const std::string& path, std::uint32_t threads, std::size_t budget)
-        : threads_(threads), budget_(budget) {
+    GgufVisionEncoder(const std::string& path, std::uint32_t threads, std::size_t budget,
+                      bool cuda)
+        : threads_(threads), budget_(budget), cuda_(cuda) {
         if (threads < 1 || threads > 512) {
             throw std::invalid_argument("CPU vision thread count must be in [1,512]");
         }
-        const auto expected_weights = preflight(path, budget);
-        admit(add(add(expected_weights, host_metadata_allowance), mul(threads_, worker_stack_allowance)), budget_);
+        const auto expected_weights = preflight(path, cuda_ ? std::numeric_limits<std::size_t>::max() : budget);
+        if (!cuda_) {
+            admit(add(add(expected_weights, host_metadata_allowance),
+                      mul(threads_, worker_stack_allowance)), budget_);
+        }
         const auto before = content_hash(path);
         clip_context_params params{};
-        params.use_gpu = false;
-        params.ninfer_cpu_math = true;
+        params.use_gpu = cuda_;
+        params.ninfer_cpu_math = !cuda_;
         params.device = nullptr;
+        if (cuda_) {
+#ifdef NINFER_GGML_CUDA_VISION
+            device_ = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            if (!device_) { throw std::runtime_error("GGML CUDA vision has no GPU device"); }
+            std::size_t free_bytes = 0, total_bytes = 0;
+            ggml_backend_dev_memory(device_, &free_bytes, &total_bytes);
+            constexpr std::size_t minimum_compute_reserve = 512ULL * 1024 * 1024;
+            if (free_bytes < add(expected_weights, minimum_compute_reserve)) {
+                throw std::runtime_error("GGML CUDA vision has insufficient free VRAM for weights and compute reserve");
+            }
+            params.device = device_;
+#else
+            throw std::runtime_error("GGML CUDA vision backend was not built");
+#endif
+        }
         params.flash_attn_type = CLIP_FLASH_ATTN_TYPE_ENABLED;
         params.warmup = false;
         params.no_alloc = false;
@@ -259,14 +281,40 @@ public:
             throw std::runtime_error("Failed to load compatible CPU vision GGUF");
         }
         weights_ = clip_ninfer_cpu_weight_bytes(context_.get());
-        if (weights_ > add(expected_weights, 4096)) {
+        if (!cuda_ && weights_ > add(expected_weights, 4096)) {
             throw std::runtime_error("CPU vision loaded weight allocation exceeds preflight");
         }
-        admit(add(add(weights_, host_metadata_allowance), mul(threads_, worker_stack_allowance)), budget_);
-        identity_ = content_hash(path);
-        if (identity_ != before) {
+        if (!cuda_) {
+            admit(add(add(weights_, host_metadata_allowance),
+                      mul(threads_, worker_stack_allowance)), budget_);
+        } else {
+            const auto usage = clip_get_mem_usage(context_.get());
+            if (!usage.contains(device_) || usage.at(device_) < expected_weights) {
+                throw std::runtime_error("GGML CUDA vision weights were not allocated on the GPU");
+            }
+        }
+        const auto after = content_hash(path);
+        if (after != before) {
             throw std::runtime_error("CPU vision GGUF changed while its weights were loading");
         }
+        identity_ = after ^ (cuda_ ? 0xa19c601f3df58e03ULL : 0ULL);
+    }
+
+    GgufVisionEncoder(Clip vision, Clip audio, Clip audio_gen,
+                      std::uint32_t threads, std::size_t budget,
+                      std::size_t expected_weights, std::uint64_t identity)
+        : threads_(threads), budget_(budget), identity_(identity) {
+        context_ = std::move(vision);
+        if (!context_ || audio || audio_gen || clip_n_mmproj_embd(context_.get()) != 5120 ||
+            clip_model_n_temporal_merge(context_.get()) != 2) {
+            throw std::runtime_error("Failed to load compatible embedded CPU Vision weights");
+        }
+        weights_ = clip_ninfer_cpu_weight_bytes(context_.get());
+        if (weights_ > add(expected_weights, 4096)) {
+            throw std::runtime_error("embedded CPU Vision weight allocation exceeds preflight");
+        }
+        admit(add(add(weights_, host_metadata_allowance),
+                  mul(threads_, worker_stack_allowance)), budget_);
     }
 
     void validate(const CpuVisionInput& input) const override {
@@ -283,8 +331,10 @@ public:
         check_cancelled();
         measure_and_admit(input, shape);
         check_cancelled();
-        clip_ninfer_cpu_reserve(context_.get(), shape.frame_width, shape.frame_height,
-            static_cast<int>(shape.frames_per_group));
+        if (!cuda_) {
+            clip_ninfer_cpu_reserve(context_.get(), shape.frame_width, shape.frame_height,
+                static_cast<int>(shape.frames_per_group));
+        }
         struct AbortState {
             const std::function<bool()>& callback;
             std::atomic<bool> requested{false};
@@ -300,11 +350,12 @@ public:
             }
             return state.requested.load();
         };
-        clip_ninfer_cpu_set_abort(context_.get(), abort_fn, &abort);
+        if (!cuda_) { clip_ninfer_cpu_set_abort(context_.get(), abort_fn, &abort); }
         struct ResetAbort {
             clip_ctx* context;
-            ~ResetAbort() { clip_ninfer_cpu_set_abort(context, nullptr, nullptr); }
-        } reset{context_.get()};
+            bool enabled;
+            ~ResetAbort() { if (enabled) { clip_ninfer_cpu_set_abort(context, nullptr, nullptr); } }
+        } reset{context_.get(), !cuda_};
         std::vector<std::uint16_t> result(mul(shape.merged_tokens, 5120));
         const auto per_group = mul(static_cast<std::size_t>(input.height) * input.width / 4, 5120);
         const auto group_patch_elements = mul(mul(static_cast<std::size_t>(input.height), input.width), 1536);
@@ -312,7 +363,7 @@ public:
             check_cancelled();
             const CpuVisionInput group_input{input.patches.subspan(
                 mul(group, group_patch_elements), group_patch_elements), 1, input.height, input.width, input.video};
-            auto frames = unpack_cpu_vision_group(group_input, 0);
+            auto frames = unpack_validated_cpu_vision_group(group_input, shape, 0);
             clip_image_f32_batch batch;
             batch.entries.reserve(frames.size());
             for (auto& frame : frames) {
@@ -366,7 +417,8 @@ private:
         // clip also creates 4-axis MRoPE position indices; CHW and index construction do not
         // overlap but conservatively count both, with graph/scheduler/thread metadata allowance.
         external = add(external, mul(static_cast<std::size_t>(input.height) * input.width, 4 * sizeof(std::int32_t)));
-        admit(add(add(weights_, host_metadata_allowance), external), budget_);
+        admit(add(add(cuda_ ? 0 : weights_, host_metadata_allowance), external), budget_);
+        if (cuda_) { return; }
         const auto plan = clip_ninfer_cpu_measure(context_.get(), shape.frame_width, shape.frame_height,
             static_cast<int>(shape.frames_per_group), static_cast<int>(threads_));
         auto total = add(weights_, external);
@@ -386,6 +438,8 @@ private:
     std::size_t budget_;
     std::size_t weights_ = 0;
     std::uint64_t identity_ = 0;
+    bool cuda_ = false;
+    ggml_backend_dev_t device_ = nullptr;
     mutable std::mutex mutex_;
 };
 
@@ -395,7 +449,133 @@ bool cpu_vision_backend_available() noexcept { return true; }
 
 std::shared_ptr<CpuVisionEncoder> make_gguf_cpu_vision_encoder(const std::string& path,
     std::uint32_t threads, std::size_t memory_budget_bytes) {
-    return std::make_shared<GgufCpuVisionEncoder>(path, threads, memory_budget_bytes);
+    return std::make_shared<GgufVisionEncoder>(path, threads, memory_budget_bytes, false);
+}
+
+std::shared_ptr<CpuVisionEncoder> make_gguf_cuda_vision_encoder(const std::string& path,
+    std::size_t host_memory_budget_bytes) {
+    return std::make_shared<GgufVisionEncoder>(path, 6, host_memory_budget_bytes, true);
+}
+
+std::shared_ptr<CpuVisionEncoder> make_embedded_cpu_vision_encoder(
+    std::span<const EmbeddedVisionTensor> tensors, std::uint32_t threads,
+    std::size_t memory_budget_bytes, std::uint64_t content_hash_value) {
+    if (threads < 1 || threads > 512 || tensors.size() != 334) {
+        throw std::invalid_argument("embedded CPU Vision requires 334 tensors and threads in [1,512]");
+    }
+    Gguf metadata(gguf_init_empty());
+    Ggml descriptions(ggml_init({(tensors.size() + 1) * ggml_tensor_overhead(), nullptr, true}));
+    if (!metadata || !descriptions) { throw std::runtime_error("cannot allocate embedded Vision GGUF metadata"); }
+    gguf_set_val_str(metadata.get(), "general.architecture", "clip");
+    gguf_set_val_str(metadata.get(), "general.name", "NInfer embedded Qwen3 Vision");
+    gguf_set_val_str(metadata.get(), "clip.projector_type", "qwen3vl_merger");
+    gguf_set_val_bool(metadata.get(), "clip.has_vision_encoder", true);
+    gguf_set_val_bool(metadata.get(), "clip.use_gelu", true);
+    for (const auto& [key_name, value] : std::array<std::pair<const char*, std::uint32_t>, 8>{
+             {{"clip.vision.block_count", 27}, {"clip.vision.embedding_length", 1152},
+              {"clip.vision.feed_forward_length", 4304},
+              {"clip.vision.attention.head_count", 16},
+              {"clip.vision.projection_dim", 5120}, {"clip.vision.patch_size", 16},
+              {"clip.vision.spatial_merge_size", 2}, {"clip.vision.image_size", 768}}}) {
+        gguf_set_val_u32(metadata.get(), key_name, value);
+    }
+    gguf_set_val_f32(metadata.get(), "clip.vision.attention.layer_norm_epsilon", 1e-6F);
+    const std::array<float, 3> normalization{0.5F, 0.5F, 0.5F};
+    gguf_set_arr_data(metadata.get(), "clip.vision.image_mean", GGUF_TYPE_FLOAT32,
+                      normalization.data(), normalization.size());
+    gguf_set_arr_data(metadata.get(), "clip.vision.image_std", GGUF_TYPE_FLOAT32,
+                      normalization.data(), normalization.size());
+    const std::array<std::int8_t, 27> no_deepstack{};
+    gguf_set_arr_data(metadata.get(), "clip.vision.is_deepstack_layers", GGUF_TYPE_BOOL,
+                      no_deepstack.data(), no_deepstack.size());
+
+    std::unordered_map<std::string_view, std::size_t> names;
+    names.reserve(tensors.size());
+    for (std::size_t index = 0; index < tensors.size(); ++index) {
+        const auto& source = tensors[index];
+        if (source.name.empty() || !names.emplace(source.name, index).second ||
+            source.rank < 1 || source.rank > 4 || !source.fill) {
+            throw std::invalid_argument("embedded Vision GGUF has duplicate or invalid tensor descriptors");
+        }
+        for (std::size_t axis = 0; axis < source.rank; ++axis) {
+            if (source.dimensions[axis] <= 0) {
+                throw std::invalid_argument("embedded Vision GGUF tensor axis is invalid");
+            }
+        }
+        const auto type = source.dtype == EmbeddedVisionDtype::BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+        auto* tensor = ggml_new_tensor(descriptions.get(), type,
+                                       static_cast<int>(source.rank), source.dimensions.data());
+        if (!tensor) { throw std::runtime_error("embedded Vision GGUF tensor metadata allocation failed"); }
+        ggml_set_name(tensor, source.name.c_str());
+        gguf_add_tensor(metadata.get(), tensor);
+    }
+    const auto expected_weights = ggml_backend_alloc_ctx_tensors_from_buft_size(
+        descriptions.get(), ggml_backend_cpu_buffer_type());
+    admit(add(add(expected_weights, host_metadata_allowance),
+              mul(threads, worker_stack_allowance)), memory_budget_bytes);
+    std::vector<std::uint8_t> bytes(gguf_get_meta_size(metadata.get()));
+    if (bytes.size() > 1024 * 1024) {
+        throw std::invalid_argument("embedded Vision GGUF metadata exceeds 1 MiB");
+    }
+    gguf_get_meta_data(metadata.get(), bytes.data());
+
+    struct FillState {
+        std::span<const EmbeddedVisionTensor> tensors;
+        const std::unordered_map<std::string_view, std::size_t>& names;
+        std::vector<bool> filled;
+        std::exception_ptr error;
+    } state{tensors, names, std::vector<bool>(tensors.size()), nullptr};
+    const auto fill = +[](void* raw, const char* name, ggml_type type,
+                          const std::int64_t* dimensions, int rank, void* destination,
+                          std::size_t count) noexcept -> bool {
+        auto& state = *static_cast<FillState*>(raw);
+        try {
+            const auto it = state.names.find(name);
+            if (it == state.names.end() || state.filled[it->second]) {
+                throw std::invalid_argument("embedded Vision GGML requested an unknown or duplicate tensor");
+            }
+            const auto& spec = state.tensors[it->second];
+            const auto expected_type = spec.dtype == EmbeddedVisionDtype::BF16
+                ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+            if (type != expected_type || rank != static_cast<int>(spec.rank)) {
+                throw std::invalid_argument("embedded Vision GGML requested a mismatched tensor dtype or rank");
+            }
+            for (int axis = 0; axis < rank; ++axis) {
+                if (dimensions[axis] != spec.dimensions[axis]) {
+                    throw std::invalid_argument("embedded Vision GGML requested a mismatched tensor shape");
+                }
+            }
+            spec.fill({static_cast<std::byte*>(destination), count});
+            state.filled[it->second] = true;
+            return true;
+        } catch (...) {
+            state.error = std::current_exception();
+            return false;
+        }
+    };
+    clip_context_params params{};
+    params.use_gpu = false;
+    params.ninfer_cpu_math = true;
+    params.device = nullptr;
+    params.flash_attn_type = CLIP_FLASH_ATTN_TYPE_ENABLED;
+    params.warmup = false;
+    params.no_alloc = false;
+    params.image_min_tokens = 1;
+    params.image_max_tokens = std::numeric_limits<int>::max() / 1024;
+    const auto loaded = clip_ninfer_init_from_metadata(bytes.data(), bytes.size(), fill, &state, params);
+    Clip vision(loaded.ctx_v), audio(loaded.ctx_a), audio_gen(loaded.ctx_gen_a);
+    if (state.error) { std::rethrow_exception(state.error); }
+    if (std::find(state.filled.begin(), state.filled.end(), false) != state.filled.end()) {
+        throw std::runtime_error("embedded Vision GGML did not consume every weight tensor");
+    }
+    std::uint64_t identity = content_hash_value;
+    for (const char ch : numerical_identity) {
+        identity = (identity ^ static_cast<unsigned char>(ch)) * 1099511628211ULL;
+    }
+    return std::make_shared<GgufVisionEncoder>(
+        std::move(vision), std::move(audio), std::move(audio_gen),
+        threads, memory_budget_bytes,
+                                                expected_weights, identity);
 }
 
 } // namespace ninfer::targets::qwen3_6

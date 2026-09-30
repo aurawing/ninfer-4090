@@ -16,7 +16,7 @@ std::size_t multiply(std::size_t a, std::size_t b) {
 
 } // namespace
 
-CpuVisionShape validate_cpu_vision_input(const CpuVisionInput& input) {
+CpuVisionShape cpu_vision_shape(const CpuVisionInput& input) {
     if (input.temporal <= 0 || input.height <= 0 || input.width <= 0 ||
         input.height % 2 || input.width % 2 || (!input.video && input.temporal != 1)) {
         throw std::invalid_argument("CPU vision requires positive temporal groups and even spatial grids");
@@ -36,7 +36,13 @@ CpuVisionShape validate_cpu_vision_input(const CpuVisionInput& input) {
         input.patches.size() != elements) {
         throw std::invalid_argument("CPU vision patch count disagrees with the grid");
     }
-    for (std::size_t patch = 0; patch < tokens; ++patch) {
+    return {tokens, tokens / 4, elements, static_cast<std::int32_t>(width),
+            static_cast<std::int32_t>(height), input.video ? 2U : 1U};
+}
+
+CpuVisionShape validate_cpu_vision_input(const CpuVisionInput& input) {
+    const auto shape = cpu_vision_shape(input);
+    for (std::size_t patch = 0; patch < shape.patch_tokens; ++patch) {
         for (std::size_t c = 0; c < 3; ++c) {
             for (std::size_t t = 0; t < 2; ++t) {
                 for (std::size_t p = 0; p < 256; ++p) {
@@ -51,13 +57,17 @@ CpuVisionShape validate_cpu_vision_input(const CpuVisionInput& input) {
             }
         }
     }
-    return {tokens, tokens / 4, elements, static_cast<std::int32_t>(width),
-            static_cast<std::int32_t>(height), input.video ? 2U : 1U};
+    return shape;
 }
 
 std::vector<CpuVisionRgbFrame> unpack_cpu_vision_group(const CpuVisionInput& input,
                                                       std::uint32_t group) {
     const auto shape = validate_cpu_vision_input(input);
+    return unpack_validated_cpu_vision_group(input, shape, group);
+}
+
+std::vector<CpuVisionRgbFrame> unpack_validated_cpu_vision_group(
+    const CpuVisionInput& input, const CpuVisionShape& shape, std::uint32_t group) {
     if (group >= static_cast<std::uint32_t>(input.temporal)) {
         throw std::invalid_argument("CPU vision temporal group is out of range");
     }

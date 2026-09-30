@@ -2,6 +2,7 @@
 #include "serve/translate.h"
 
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -22,6 +23,11 @@ ServeOptions parse(std::vector<std::string> arguments) {
     argv.reserve(arguments.size());
     for (std::string& argument : arguments) { argv.push_back(argument.data()); }
     return parse_serve_options(static_cast<int>(argv.size()), argv.data());
+}
+
+std::optional<ServeOptions> accepts(std::vector<std::string> arguments) {
+    try { return parse(std::move(arguments)); }
+    catch (const std::invalid_argument&) { return std::nullopt; }
 }
 
 bool rejects_vision_options(const std::vector<std::string>& flags) {
@@ -85,6 +91,34 @@ int main() {
                           vision_shortcut.vision_device == ninfer::VisionDevice::Cpu &&
                           vision_shortcut.vision_mmproj_path == "mmproj-BF16.gguf",
                       "--vision-mmproj did not enable CPU Vision");
+    const auto embedded_cpu =
+        accepts({"ninfer-serve", "model.ninfer", "--vision-device", "cpu"});
+    failures += check(embedded_cpu && embedded_cpu->enable_vision &&
+                          embedded_cpu->vision_device == ninfer::VisionDevice::Cpu &&
+                          embedded_cpu->vision_mmproj_path.empty(),
+                      "server rejected embedded CPU Vision without external mmproj");
+    const auto embedded_cpu_tuned =
+        accepts({"ninfer-serve", "model.ninfer", "--vision-cpu-threads", "8",
+                 "--vision-device", "cpu"});
+    failures += check(embedded_cpu_tuned && embedded_cpu_tuned->enable_vision &&
+                          embedded_cpu_tuned->vision_device == ninfer::VisionDevice::Cpu &&
+                          embedded_cpu_tuned->vision_cpu_threads == 8 &&
+                          embedded_cpu_tuned->vision_mmproj_path.empty(),
+                      "server rejected pathless CPU Vision tuning");
+    const auto external_gpu =
+        accepts({"ninfer-serve", "model.ninfer", "--vision-device", "cuda",
+                 "--vision-mmproj", "mmproj-BF16.gguf"});
+    failures += check(external_gpu && external_gpu->enable_vision &&
+                          external_gpu->vision_device == ninfer::VisionDevice::Cuda &&
+                          external_gpu->vision_mmproj_path == "mmproj-BF16.gguf",
+                      "server rejected external GGUF on explicitly selected GPU");
+    const auto external_gpu_reversed =
+        accepts({"ninfer-serve", "model.ninfer", "--vision-mmproj", "mmproj-BF16.gguf",
+                 "--vision-device", "cuda"});
+    failures += check(external_gpu_reversed && external_gpu_reversed->enable_vision &&
+                          external_gpu_reversed->vision_device == ninfer::VisionDevice::Cuda &&
+                          external_gpu_reversed->vision_mmproj_path == "mmproj-BF16.gguf",
+                      "server external GGUF GPU selection depends on option order");
     for (const char* next_flag : {"--vision", "--vision-device", "--vision-max-tokens",
                                   "--api-key", "-h"}) {
         bool missing_path_rejected = false;
@@ -121,14 +155,10 @@ int main() {
     }
     for (const std::vector<std::string>& flags : std::vector<std::vector<std::string>>{
              {"--vision-device", "gpu"}, {"--vision-device", ""},
-             {"--vision-mmproj", ""}, {"--vision-device", "cpu"},
+             {"--vision-mmproj", ""},
              {"--vision-device", "cpu", "--vision-mmproj", "--vision"},
-             {"--vision-device", "cpu", "--vision"},
-             {"--vision-device", "cpu", "--vision-max-tokens", "1024"},
              {"--vision-mmproj"}, {"--vision-device"},
              {"--vision-cpu-threads"}, {"--vision-cpu-memory-mib"},
-             {"--vision-device", "cuda", "--vision-mmproj", "mmproj.gguf"},
-             {"--vision-mmproj", "mmproj.gguf", "--vision-device", "cuda"},
              {"--vision-device", "cuda", "--vision-device", "cpu", "--vision-mmproj", "mmproj.gguf"},
              {"--vision-device", "cpu", "--vision-device", "cuda", "--vision-mmproj", "mmproj.gguf"},
              {"--vision-device", "cuda", "--vision-cpu-threads", "6"},

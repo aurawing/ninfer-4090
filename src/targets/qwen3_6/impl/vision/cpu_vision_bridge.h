@@ -35,8 +35,13 @@ struct CpuVisionRgbFrame {
     std::vector<float> rgb;
 };
 
+// Geometry-only check for callers that already rely on an encoder to validate patch values.
+CpuVisionShape cpu_vision_shape(const CpuVisionInput& input);
 CpuVisionShape validate_cpu_vision_input(const CpuVisionInput& input);
 std::vector<CpuVisionRgbFrame> unpack_cpu_vision_group(const CpuVisionInput& input,
                                                       std::uint32_t group);
+// Call only with a shape returned by validate_cpu_vision_input for this input.
+std::vector<CpuVisionRgbFrame> unpack_validated_cpu_vision_group(
+    const CpuVisionInput& input, const CpuVisionShape& shape, std::uint32_t group);
 
 } // namespace ninfer::targets::qwen3_6

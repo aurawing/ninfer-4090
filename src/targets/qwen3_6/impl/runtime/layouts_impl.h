@@ -655,7 +655,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
         if (impl->speculative_backend == SpeculativeBackend::None) {
-            impl->graph_allowance_bytes = checked_mul(64ULL * kMiB, impl->max_concurrency,
+            // GGML CUDA brings a second CUDA backend into the process. Its initialized modules
+            // increased the observed one-lane ordinary graph preparation from ~6 to ~75 MiB
+            // on the RTX 4090; reserve that memory during admission, before capture starts.
+            const std::size_t per_batch_allowance =
+                impl->features.ggml_cuda_vision() ? 128ULL * kMiB : 64ULL * kMiB;
+            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const std::size_t per_batch_allowance =

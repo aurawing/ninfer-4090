@@ -222,6 +222,20 @@ void bind_dflash2_stub(artifact::Binder& binder) {
     (void)bind("dflash2/candidate_selector/successor_codebook", NumericFormat::BF16, {248320, 256});
 }
 
+std::optional<VisionBindingPlan> bind_optional_vision(
+    artifact::Binder& binder, artifact::TensorPlacement placement) {
+    if (!binder.has_object("vision/patch_embedding")) { return std::nullopt; }
+    VisionBindingPlan out;
+    out.backbone = qwen3_6::bind_vision_backbone(binder, placement);
+    out.merger_input = qwen3_6::bind_vision_merger_input(binder, placement);
+    out.merger_fc2 = artifact::bind_tensor(
+        binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {5120, 4608}, placement);
+    out.merger_fc2_bias = artifact::bind_tensor(
+        binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, placement);
+    out.merger_norm = qwen3_6::bind_vision_merger_norm(binder, placement);
+    return out;
+}
+
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features) {
     ArtifactLoadPlan load_plan;
@@ -283,13 +297,13 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     const artifact::TensorPlacement vision_placement =
         features.cuda_vision() ? artifact::TensorPlacement::Device
                         : artifact::TensorPlacement::ValidateOnly;
-    out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
-    out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
-    out.vision_merger_fc2   = artifact::bind_tensor(
-        binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {5120, 4608}, vision_placement);
-    out.vision_merger_fc2_bias = artifact::bind_tensor(
-        binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
-    out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
+    out.vision = bind_optional_vision(binder, vision_placement);
+    if (features.cuda_vision() && !out.vision) {
+        throw artifact::ArtifactError("native CUDA Vision requires embedded vision weights");
+    }
+    if (features.cpu_vision() && features.vision_mmproj_path.empty() && !out.vision) {
+        throw artifact::ArtifactError("CPU Vision requires embedded weights or --vision-mmproj");
+    }
 
     const bool artifact_has_dflash2 = binder.has_object("dflash2/feature_projection");
     if (artifact_has_dflash2) {
@@ -398,12 +412,14 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     }
 
     if (plan.features.cuda_vision()) {
+        if (!plan.vision) { throw std::logic_error("native CUDA Vision bindings are missing"); }
+        const auto& source = *plan.vision;
         auto& vision  = runtime.vision.emplace();
         vision.common = qwen3_6::materialize_vision_common(
-            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
-        vision.merger_fc2      = artifact::materialized_weight(backing, plan.vision_merger_fc2,
+            backing, source.backbone, source.merger_input, source.merger_norm);
+        vision.merger_fc2      = artifact::materialized_weight(backing, source.merger_fc2,
                                                                NumericFormat::W8G32_F16S, 5120, 4608);
-        vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
+        vision.merger_fc2_bias = artifact::materialized_tensor(backing, source.merger_fc2_bias,
                                                                NumericFormat::BF16, {5120});
     }
 }

@@ -1,10 +1,18 @@
 #include <ninfer/targets/qwen3_6/startup_features.h>
 
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 
 using namespace ninfer;
 using namespace ninfer::targets::qwen3_6;
+
+namespace {
+std::optional<StartupFeatures> accepts_features(const EngineOptions& options) {
+    try { return startup_features(options); }
+    catch (const std::invalid_argument&) { return std::nullopt; }
+}
+} // namespace
 
 int main() {
     try {
@@ -31,6 +39,22 @@ int main() {
         auto changed = cpu;
         changed.vision_mmproj_path = "different.gguf";
         if (changed == cpu) { throw std::runtime_error("weight source must participate in equality"); }
+        auto embedded = options;
+        embedded.vision_mmproj_path.clear();
+        const auto embedded_cpu = accepts_features(embedded);
+        if (!embedded_cpu || !embedded_cpu->cpu_vision() || embedded_cpu->cuda_vision() ||
+            !embedded_cpu->vision_mmproj_path.empty()) {
+            throw std::runtime_error("embedded CPU Vision must not require external mmproj");
+        }
+        auto external_gpu = EngineOptions{};
+        external_gpu.enable_vision = true;
+        external_gpu.vision_mmproj_path = "models/mmproj-BF16.gguf";
+        const auto ggml_cuda = accepts_features(external_gpu);
+        if (!ggml_cuda || ggml_cuda->vision_device != VisionDevice::Cuda ||
+            ggml_cuda->vision_mmproj_path != external_gpu.vision_mmproj_path ||
+            !ggml_cuda->vision) {
+            throw std::runtime_error("external GPU Vision source was rejected or changed");
+        }
         const auto rejects = [](const EngineOptions& invalid) {
             try { (void)startup_features(invalid); }
             catch (const std::invalid_argument&) { return; }
@@ -52,7 +76,9 @@ int main() {
         rejects(gpu_cache);
         invalid = options;
         invalid.vision_mmproj_path.clear();
-        rejects(invalid);
+        if (!startup_features(invalid).cpu_vision()) {
+            throw std::runtime_error("pathless embedded CPU Vision was rejected");
+        }
         invalid = options;
         invalid.vision_cpu_threads = kMaximumVisionCpuThreads + 1;
         rejects(invalid);

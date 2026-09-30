@@ -139,8 +139,8 @@ std::string serve_usage_text(const char* argv0) {
            "                              generated text is unchanged (requires --spec)\n\n"
            "Vision & Multimodal:\n"
            "  --vision                    Enable image/video vision encoder (default device: cuda)\n"
-           "  --vision-device <cuda|cpu>  Enable Vision on CUDA or CPU (CPU requires --vision-mmproj)\n"
-           "  --vision-mmproj <PATH>      External BF16 mmproj GGUF; enables CPU Vision\n"
+           "  --vision-device <cuda|cpu>  Run Vision on CUDA or CPU (CPU uses embedded weights by default)\n"
+           "  --vision-mmproj <PATH>      External BF16 mmproj GGUF (defaults to CPU without --vision-device)\n"
            "  --vision-cpu-threads <N>    CPU Vision worker threads (1 to 512; default: 6)\n"
            "  --vision-cpu-memory-mib <N> CPU Vision host memory budget in MiB (positive integer; default: 4096)\n"
            "  --vision-cpu-cache-mib <N>  CPU image cache within host budget (default: 128; 0 disables)\n"
@@ -375,13 +375,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (!explicit_vision_device && !options.vision_mmproj_path.empty()) {
         options.vision_device = VisionDevice::Cpu;
     }
-    if (options.vision_device == VisionDevice::Cuda &&
-        (!options.vision_mmproj_path.empty() || vision_cpu_tuning_explicit)) {
-        throw std::invalid_argument("--vision-mmproj and CPU tuning require CPU Vision; "
-                                    "cannot combine with --vision-device cuda");
-    }
-    if (options.vision_device == VisionDevice::Cpu && options.vision_mmproj_path.empty()) {
-        throw std::invalid_argument("--vision-device cpu requires --vision-mmproj");
+    if (options.vision_device == VisionDevice::Cuda && vision_cpu_tuning_explicit) {
+        throw std::invalid_argument("CPU vision tuning requires --vision-device cpu");
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");

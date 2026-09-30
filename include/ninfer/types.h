@@ -92,7 +92,7 @@ struct EngineOptions {
     bool enable_vision                 = false;
     std::uint32_t vision_max_tokens    = 8192;
     VisionDevice vision_device         = VisionDevice::Cuda;
-    std::filesystem::path vision_mmproj_path; // CPU Vision requires an external mmproj GGUF.
+    std::filesystem::path vision_mmproj_path; // Explicit external GGUF overrides embedded Vision weights.
     std::uint32_t vision_cpu_threads    = 6;
     std::uint32_t vision_cpu_memory_mib = 4096;
     std::uint32_t vision_cpu_cache_mib  = 128; // Reserved within the host budget; 0 disables image caching.

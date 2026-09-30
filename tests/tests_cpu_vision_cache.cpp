@@ -77,7 +77,9 @@ void check_reuse_and_keys() {
             cached->cache_capacity_bytes() == one_embedding_bytes * 8, "decorator metadata changed");
     Input first(1);
     const auto initial = cached->encode_with_status(first.view);
+    require(inner->validations == 1, "cache miss validated the whole image more than once");
     const auto repeated = cached->encode_with_status(first.view);
+    require(inner->validations == 2, "cache hit skipped or repeated backend validation");
     require(!initial.cache_hit && repeated.cache_hit && initial.embeddings == repeated.embeddings &&
             inner->calls == 1, "identical processed image did not reuse exact BF16 embeddings");
     auto owned_copy = repeated.embeddings;

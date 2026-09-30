@@ -19,10 +19,16 @@ struct StartupFeatures {
     bool operator==(const StartupFeatures&) const = default;
 
     [[nodiscard]] bool cuda_vision() const noexcept {
-        return vision && vision_device == VisionDevice::Cuda;
+        return vision && vision_device == VisionDevice::Cuda && vision_mmproj_path.empty();
     }
     [[nodiscard]] bool cpu_vision() const noexcept {
         return vision && vision_device == VisionDevice::Cpu;
+    }
+    [[nodiscard]] bool ggml_cuda_vision() const noexcept {
+        return vision && vision_device == VisionDevice::Cuda && !vision_mmproj_path.empty();
+    }
+    [[nodiscard]] bool ggml_vision() const noexcept {
+        return cpu_vision() || ggml_cuda_vision();
     }
 
     [[nodiscard]] bool speculative_enabled() const noexcept {
@@ -41,14 +47,14 @@ struct StartupFeatures {
 [[nodiscard]] inline StartupFeatures startup_features(const EngineOptions& options) {
     switch (options.vision_device) {
     case VisionDevice::Cuda:
-        if (!options.vision_mmproj_path.empty() || options.vision_cpu_threads != 6 ||
-            options.vision_cpu_memory_mib != 4096 || options.vision_cpu_cache_mib != 128) {
-            throw std::invalid_argument("CPU vision settings require vision_device=cpu");
+        if (options.vision_cpu_threads != 6 || options.vision_cpu_memory_mib != 4096 ||
+            options.vision_cpu_cache_mib != 128) {
+            throw std::invalid_argument("CPU vision tuning requires vision_device=cpu");
         }
         break;
     case VisionDevice::Cpu:
-        if (!options.enable_vision || options.vision_mmproj_path.empty()) {
-            throw std::invalid_argument("CPU vision requires enable_vision and vision_mmproj_path");
+        if (!options.enable_vision) {
+            throw std::invalid_argument("CPU vision requires enable_vision");
         }
         if (options.vision_cpu_threads == 0 ||
             options.vision_cpu_threads > kMaximumVisionCpuThreads || options.vision_cpu_memory_mib == 0) {

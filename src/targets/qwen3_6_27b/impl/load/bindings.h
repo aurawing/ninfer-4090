@@ -13,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <utility>
 #include <variant>
 
@@ -91,6 +92,17 @@ struct MtpPlan {
     artifact::ObjectHandle final_norm;
 };
 
+struct VisionBindingPlan {
+    qwen3_6::VisionBackbonePlan backbone;
+    qwen3_6::VisionMergerInputPlan merger_input;
+    artifact::ObjectHandle merger_fc2;
+    artifact::ObjectHandle merger_fc2_bias;
+    qwen3_6::VisionMergerNormPlan merger_norm;
+};
+
+std::optional<VisionBindingPlan> bind_optional_vision(
+    artifact::Binder& binder, artifact::TensorPlacement placement);
+
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
@@ -104,11 +116,7 @@ struct BindingPlan {
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
 
-    qwen3_6::VisionBackbonePlan vision_backbone;
-    qwen3_6::VisionMergerInputPlan vision_merger_input;
-    artifact::ObjectHandle vision_merger_fc2;
-    artifact::ObjectHandle vision_merger_fc2_bias;
-    qwen3_6::VisionMergerNormPlan vision_merger_norm;
+    std::optional<VisionBindingPlan> vision;
 };
 
 struct ArtifactLoadPlan {

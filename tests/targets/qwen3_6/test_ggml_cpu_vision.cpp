@@ -342,6 +342,44 @@ int real_gguf() {
     std::cout << "Real BF16 GGUF rectangular-image encoding passed; weights=" << encoder->weight_bytes() << " bytes\n";
     return 0;
 }
+
+int real_gguf_cuda() {
+#ifndef NINFER_GGML_CUDA_VISION
+    std::cout << "SKIP: GGML CUDA vision was not built\n";
+    return 77;
+#else
+    const char* path = std::getenv("NINFER_TEST_VISION_GGUF");
+    if (!path || !*path) {
+        std::cout << "SKIP: NINFER_TEST_VISION_GGUF is not set\n";
+        return 77;
+    }
+    auto encoder = make_gguf_cuda_vision_encoder(path, std::size_t(4) << 30);
+    require(encoder->weight_bytes() >= 931126208, "GGML CUDA weights were not loaded");
+    constexpr int gh = 2, gw = 4;
+    std::vector<float> patches(gh * gw * 1536);
+    for (int patch = 0; patch < gh * gw; ++patch) {
+        for (int channel = 0; channel < 3; ++channel) {
+            for (int pixel = 0; pixel < 256; ++pixel) {
+                const float value = static_cast<float>(
+                    std::sin(double(patch * 768 + channel * 256 + pixel) * 0.005));
+                for (int time = 0; time < 2; ++time) {
+                    patches[patch * 1536 + (channel * 2 + time) * 256 + pixel] = value;
+                }
+            }
+        }
+    }
+    const CpuVisionInput input{patches, 1, gh, gw, false};
+    encoder->validate(input);
+    const auto output = encoder->encode(input);
+    require(output.size() == gh * gw / 4 * 5120, "GGML CUDA output shape differs");
+    for (const auto value : output) {
+        require((value & 0x7f80U) != 0x7f80U, "GGML CUDA output contains nonfinite BF16");
+    }
+    require(output == encoder->encode(input), "GGML CUDA repeated encode differs");
+    std::cout << "GGML CUDA GGUF image encoding passed; weights=" << encoder->weight_bytes() << " bytes\n";
+    return 0;
+#endif
+}
 #endif
 } // namespace
 
@@ -351,6 +389,7 @@ int main(int argc, char** argv) {
 #ifdef NINFER_TEST_GGML_CPU_VISION
         require(cpu_vision_backend_available(), "CPU backend build is not available");
         if (mode == "--gguf") { return real_gguf(); }
+        if (mode == "--gguf-cuda") { return real_gguf_cuda(); }
         require(mode == "--numerics", "unknown test mode");
         require(ggml_cpu_has_llamafile(), "CPU vision build omitted llamafile kernels");
         auto* registry = ggml_backend_cpu_reg();

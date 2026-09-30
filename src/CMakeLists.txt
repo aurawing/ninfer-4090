@@ -49,6 +49,7 @@ endif()
 add_library(ninfer_artifact STATIC
   artifact/reader.cpp
   artifact/storage_layouts.cpp
+  artifact/vision_row_decode.cpp
   artifact/binder.cpp
   artifact/materializer.cpp
   artifact/typed_binding.cpp)

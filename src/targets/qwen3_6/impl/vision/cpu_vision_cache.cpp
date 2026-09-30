@@ -56,8 +56,6 @@ public:
         // under the same lock so concurrent identical images execute the encoder only once.
         std::lock_guard lock(mutex_);
         check_cancelled(cancelled);
-        inner_->validate(input); // Includes host-memory admission even on a hit.
-        const auto shape = validate_cpu_vision_input(input);
         const bool eligible = capacity_ != 0 && !input.video && input.processed_fingerprint;
         const CacheKey key{input.processed_fingerprint.value_or(std::array<std::uint8_t, 32>{}),
                            inner_->identity_hash(), input.temporal, input.height, input.width,
@@ -66,6 +64,9 @@ public:
             const auto found = std::find_if(entries_.begin(), entries_.end(),
                 [&](const CacheEntry& entry) { return entry.key == key; });
             if (found != entries_.end()) {
+                // A hit still needs current host-memory admission and full input validation.
+                // On a miss, encode() performs both, avoiding a second patch scan.
+                inner_->validate(input);
                 std::vector<std::uint16_t> result(found->embeddings.get(),
                                                   found->embeddings.get() + found->elements);
                 check_cancelled(cancelled);
@@ -77,6 +78,7 @@ public:
         check_cancelled(cancelled);
         auto result = inner_->encode(input, cancelled);
         check_cancelled(cancelled);
+        const auto shape = cpu_vision_shape(input);
         if (result.size() / output_hidden != shape.merged_tokens ||
             result.size() % output_hidden != 0) {
             throw std::runtime_error("CPU vision output shape does not match the input grid");

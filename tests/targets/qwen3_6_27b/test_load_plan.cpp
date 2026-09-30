@@ -1,5 +1,6 @@
 #include "artifact/binder.h"
 #include "artifact/reader.h"
+#include "artifact_fixture.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 #include "targets/qwen3_6_27b/impl/variant.h"
 
@@ -79,6 +80,66 @@ int verify_legacy_dflash2_compatibility(const std::filesystem::path& path, Weigh
         cpu_plan.materialization.host_objects.size() != plan.materialization.host_objects.size()) {
         std::cerr << "CPU mode changed frontend host bindings or frozen settings\n";
         return 1;
+    }
+    auto embedded_cpu_features = cpu_features;
+    embedded_cpu_features.vision_mmproj_path.clear();
+    ninfer::artifact::Binder embedded_cpu_binder(reader);
+    const auto embedded_cpu_plan = bind_artifact(embedded_cpu_binder, profile, embedded_cpu_features);
+    if (!embedded_cpu_plan.bindings.vision ||
+        embedded_cpu_plan.materialization.device_capacity_bytes !=
+            cpu_plan.materialization.device_capacity_bytes) {
+        std::cerr << "embedded CPU Vision did not retain validated host-readable bindings\n";
+        return 1;
+    }
+    auto external_gpu_features = all_features();
+    external_gpu_features.vision_mmproj_path = "external-mmproj.gguf";
+    ninfer::artifact::Binder external_gpu_binder(reader);
+    const auto external_gpu_plan = bind_artifact(external_gpu_binder, profile, external_gpu_features);
+    if (external_gpu_plan.materialization.device_capacity_bytes !=
+            cpu_plan.materialization.device_capacity_bytes) {
+        std::cerr << "external GGML CUDA Vision still allocated embedded vision weights\n";
+        return 1;
+    }
+    return 0;
+}
+
+int verify_optional_vision_inventory() {
+    using Json = nlohmann::json;
+    const auto directory = [](bool partial) {
+        Json objects = Json::array({{{"name", "frontend"},
+                                     {"kind", "resource"},
+                                     {"encoding", "raw-bytes-v1"},
+                                     {"offset", 0},
+                                     {"bytes", 1}}});
+        if (partial) {
+            objects.push_back({{"name", "vision/merger/fc2_bias"},
+                               {"kind", "tensor"},
+                               {"shape", {1}},
+                               {"format", "BF16"},
+                               {"layout", "contiguous-le-v1"},
+                               {"offset", 256},
+                               {"bytes", 2}});
+        }
+        return Json{{"identity", {{"model_id", "fixture"}, {"weights_id", "fixture"}}},
+                    {"objects", std::move(objects)}};
+    };
+    for (const bool partial : {false, true}) {
+        auto fixture = ninfer::test::artifact_fixture::write_fixture(directory(partial), "vision-inventory");
+        ninfer::artifact::Reader reader(fixture.path);
+        ninfer::artifact::Binder binder(reader);
+        binder.validate_only(binder.require_resource(
+            "frontend", ninfer::artifact::ResourceEncoding::RawBytesV1));
+        if (bind_optional_vision(binder, ninfer::artifact::TensorPlacement::ValidateOnly)) {
+            std::cerr << "partial or absent Vision inventory was treated as complete\n";
+            return 1;
+        }
+        bool finish_rejected = false;
+        try { (void)binder.finish(); }
+        catch (const ninfer::artifact::ArtifactError&) { finish_rejected = true; }
+        if (finish_rejected != partial) {
+            std::cerr << "optional Vision inventory did not distinguish absent from partial\n";
+            return 1;
+        }
     }
     return 0;
 }
@@ -167,11 +228,37 @@ int verify_profile_mismatch_rejection() {
     return 1;
 }
 
+int verify_ggml_cuda_graph_reservation() {
+    ninfer::DeviceContext device(0);
+    ninfer::EngineOptions options;
+    options.max_context    = 128;
+    options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(128);
+    options.prefill_chunk  = 128;
+    options.enable_vision  = true;
+    options.use_cuda_graph = true;
+    const auto reservation = [&] {
+        auto planner = Package::make_sequence_planner(device, options, WeightsProfile::GroupwiseInt);
+        const auto pages = planner.capacity_curve().minimum_main_page_groups;
+        return std::move(planner).finalize(pages).device_reservation_bytes();
+    };
+    const std::size_t native_bytes = reservation();
+    options.vision_mmproj_path = "external-vision.gguf";
+    const std::size_t ggml_cuda_bytes = reservation();
+    if (ggml_cuda_bytes != native_bytes + 64ULL * 1024ULL * 1024ULL) {
+        std::cerr << "GGML CUDA Vision did not reserve its additional CUDA Graph allowance\n";
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (const int result = verify_optional_vision_inventory(); result != 0) { return result; }
+    if (argc == 2 && std::string_view(argv[1]) == "--vision-inventory") { return 0; }
     if (const int result = verify_rejection(); result != 0) { return result; }
     if (const int result = verify_profile_mismatch_rejection(); result != 0) { return result; }
+    if (const int result = verify_ggml_cuda_graph_reservation(); result != 0) { return result; }
 
     const std::filesystem::path groupwise =
         artifact_path("NINFER_QWEN3_6_27B_WEIGHTS", "qwen3_6_27b.ninfer");

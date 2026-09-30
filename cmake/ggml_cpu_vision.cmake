@@ -1,6 +1,10 @@
 include_guard(GLOBAL)
 
 option(NINFER_BUILD_CPU_VISION "Build the pinned GGML CPU vision backend" OFF)
+option(NINFER_BUILD_GGML_CUDA_VISION "Build GGML CUDA for external vision GGUF" OFF)
+if(NINFER_BUILD_GGML_CUDA_VISION AND NOT NINFER_BUILD_CPU_VISION)
+    message(FATAL_ERROR "NINFER_BUILD_GGML_CUDA_VISION requires NINFER_BUILD_CPU_VISION=ON")
+endif()
 set(NINFER_GGML_SOURCE_DIR "" CACHE PATH "Complete source tree of pinned llama.cpp (copied before private patching)")
 if(NOT DEFINED NINFER_SOURCE_ROOT)
     get_filename_component(NINFER_SOURCE_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
@@ -75,6 +79,10 @@ function(ninfer_add_cpu_vision)
             GGML_AMX_TILE GGML_AMX_INT8 GGML_AMX_BF16)
         set(${_flag} OFF)
     endforeach()
+    if(NINFER_BUILD_GGML_CUDA_VISION)
+        set(GGML_CUDA ON)
+        target_compile_definitions(ninfer_cpu_vision PUBLIC NINFER_GGML_CUDA_VISION=1)
+    endif()
     foreach(_flag IN ITEMS LLAMA_BUILD_COMMON LLAMA_BUILD_TOOLS LLAMA_BUILD_SERVER LLAMA_BUILD_APP
             LLAMA_BUILD_TESTS LLAMA_BUILD_EXAMPLES LLAMA_BUILD_UI LLAMA_SUBPROCESS MTMD_VIDEO
             LLAMA_TOOLS_INSTALL LLAMA_CURL GGML_BUILD_TESTS GGML_BUILD_EXAMPLES)

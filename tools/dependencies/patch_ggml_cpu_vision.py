@@ -17,6 +17,7 @@ PINNED_FILES = {
     "ggml/src/ggml-cpu/ggml-cpu.cpp": "b620923a8966395ba9c5f2ee4acb35b8d42ea77a58943d7eb733a917c4c1cafb",
     "ggml/src/ggml-cpu/vec.h": "926330bae1c5d003bd654035426e31381fafcdca23ffcc23201d219dbb97cbeb",
 }
+LEGACY_CPU_PATCH_HASH = "25a39c5535bce11568e271b9b69baf772604cfcd237b2c663c86c83d9110877a"
 
 
 def sha(path):
@@ -39,15 +40,17 @@ def patch(root):
     script_hash = sha(Path(__file__))
     if stamp.exists():
         previous = json.loads(stamp.read_text(encoding="utf-8"))
-        if previous["script"] != script_hash:
-            raise RuntimeError("NInfer dependency patch changed; recreate the private dependency copy")
         for name, expected in previous["files"].items():
             if sha(root / name) != expected:
                 raise RuntimeError(f"patched dependency was modified: {name}")
-        return
-    for name, expected in PINNED_FILES.items():
-        if sha(root / name) != expected:
-            raise RuntimeError(f"dependency is not the exact pinned original: {name}")
+        if previous["script"] == script_hash:
+            return
+        if previous["script"] != LEGACY_CPU_PATCH_HASH:
+            raise RuntimeError("unknown NInfer dependency patch; recreate the private dependency copy")
+    else:
+        for name, expected in PINNED_FILES.items():
+            if sha(root / name) != expected:
+                raise RuntimeError(f"dependency is not the exact pinned original: {name}")
     clip = root / "tools/mtmd/clip.cpp"
     header = root / "tools/mtmd/clip.h"
     graph = root / "tools/mtmd/clip-graph.h"
@@ -257,6 +260,107 @@ void clip_ninfer_cpu_reserve(clip_ctx * ctx, int width, int height, int frames) 
     cpu_source = root / "ggml/src/ggml-cpu/ggml-cpu.cpp"
     replace(cpu_header, "    GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback", "    GGML_BACKEND_API size_t ggml_backend_cpu_ninfer_work_size(ggml_backend_t backend_cpu);\n    GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback")
     replace(cpu_source, "static enum ggml_status ggml_backend_cpu_graph_compute(", "size_t ggml_backend_cpu_ninfer_work_size(ggml_backend_t backend) {\n    return ((ggml_backend_cpu_context *) backend->context)->work_size;\n}\n\nstatic enum ggml_status ggml_backend_cpu_graph_compute(")
+    # Memory-only GGUF metadata plus one synchronous, checked fill per final CPU tensor.
+    # The standard file loader retains its existing path and behaviour.
+    memory_api = '''
+using clip_ninfer_tensor_fill = bool (*)(void * user, const char * name, enum ggml_type type,
+    const int64_t * dimensions, int rank, void * destination, size_t bytes);
+struct clip_init_result clip_ninfer_init_from_metadata(const uint8_t * metadata, size_t metadata_bytes,
+    clip_ninfer_tensor_fill fill, void * user, struct clip_context_params params);
+'''
+    replace(header, "struct clip_cap clip_get_cap(const char * fname);",
+        "struct clip_cap clip_get_cap(const char * fname);\n" + memory_api)
+    replace(clip, "    std::string fname;\n\n    size_t model_size",
+        "    std::string fname;\n    clip_ninfer_tensor_fill ninfer_fill = nullptr;\n    void * ninfer_fill_user = nullptr;\n\n    size_t model_size")
+    replace(clip, '''            void * progress_user_data = nullptr)
+        : fname(fname),
+          progress_callback(progress_cb),
+          progress_callback_user_data(progress_user_data) {''', '''            void * progress_user_data = nullptr,
+            const uint8_t * memory_metadata = nullptr,
+            size_t memory_metadata_bytes = 0,
+            clip_ninfer_tensor_fill memory_fill = nullptr,
+            void * memory_fill_user = nullptr)
+        : fname(fname),
+          ninfer_fill(memory_fill),
+          ninfer_fill_user(memory_fill_user),
+          progress_callback(progress_cb),
+          progress_callback_user_data(progress_user_data) {''')
+    replace(clip, "        ctx_gguf = gguf_context_ptr(gguf_init_from_file(fname, params));", '''        if (memory_metadata) {
+            if (!memory_fill || memory_metadata_bytes < 24 || memory_metadata_bytes > 1024 * 1024) {
+                throw std::runtime_error("invalid NInfer memory GGUF metadata or fill callback");
+            }
+            struct memory_source { const uint8_t * data; size_t size; } source{memory_metadata, memory_metadata_bytes};
+            const auto read = +[](void * raw, void * output, uint64_t offset, size_t bytes) -> size_t {
+                const auto & source = *static_cast<memory_source *>(raw);
+                if (offset > source.size || bytes > source.size - offset) { return 0; }
+                std::memcpy(output, source.data + offset, bytes);
+                return bytes;
+            };
+            ctx_gguf = gguf_context_ptr(gguf_init_from_callback(
+                read, &source, 64 * 1024, memory_metadata_bytes, params));
+        } else {
+            ctx_gguf = gguf_context_ptr(gguf_init_from_file(fname, params));
+        }''')
+    replace(clip, '''        auto fin = open_ifstream_binary(fname);
+        if (!fin) {''', '''        std::ifstream fin;
+        if (!ninfer_fill) { fin = open_ifstream_binary(fname); }
+        if (!fin && !ninfer_fill) {''')
+    replace(clip, '''            fin.seekg(it->second, std::ios::beg);
+            fin.read(reinterpret_cast<char*>(result.data()), n_bytes);''', '''            if (ninfer_fill) {
+                throw std::runtime_error("memory Vision loader does not support file-backed scalar vectors");
+            }
+            fin.seekg(it->second, std::ios::beg);
+            fin.read(reinterpret_cast<char*>(result.data()), n_bytes);''')
+    replace(clip, '''                    const size_t offset = it_off->second;
+                    fin.seekg(offset, std::ios::beg);
+                    if (!fin) {
+                        throw std::runtime_error(string_format("%s: failed to seek for tensor %s\\n", __func__, t->name));
+                    }
+                    size_t num_bytes = ggml_nbytes(cur);
+                    if (ggml_backend_buft_is_host(buft)) {''', '''                    const size_t offset = it_off->second;
+                    size_t num_bytes = ggml_nbytes(cur);
+                    if (ninfer_fill) {
+                        if (!ggml_backend_buft_is_host(buft) || !cur->data ||
+                            !ninfer_fill(ninfer_fill_user, t->name, cur->type, cur->ne,
+                                         ggml_n_dims(cur), cur->data, num_bytes)) {
+                            throw std::runtime_error(string_format("NInfer memory Vision tensor fill failed: %s", t->name));
+                        }
+                    } else {
+                    fin.seekg(offset, std::ios::beg);
+                    if (!fin) {
+                        throw std::runtime_error(string_format("%s: failed to seek for tensor %s\\n", __func__, t->name));
+                    }
+                    if (ggml_backend_buft_is_host(buft)) {''')
+    replace(clip, '''                    if (!fin) { throw std::runtime_error("short read while loading vision weights"); }
+                    data_loaded += num_bytes;''', '''                    if (!fin) { throw std::runtime_error("short read while loading vision weights"); }
+                    }
+                    data_loaded += num_bytes;''')
+    replace(clip, "struct clip_init_result clip_init(const char * fname, struct clip_context_params ctx_params) {", '''template <typename Factory>
+static struct clip_init_result clip_ninfer_init_impl(const char * label,
+        struct clip_context_params ctx_params, Factory factory) {''')
+    replace(clip, '''        clip_model_loader loader(fname,
+            /* skip_tensors */ false,
+            ctx_params.progress_callback,
+            ctx_params.progress_callback_user_data);''', '''        clip_model_loader loader = factory();''')
+    replace(clip, '''        LOG_ERR("%s: failed to load model '%s': %s\\n", __func__, fname, e.what());''', '''        LOG_ERR("%s: failed to load model '%s': %s\\n", __func__, label, e.what());''')
+    wrappers = '''struct clip_init_result clip_init(const char * fname, struct clip_context_params params) {
+    return clip_ninfer_init_impl(fname, params, [&] {
+        return clip_model_loader(fname, false, params.progress_callback,
+                                 params.progress_callback_user_data);
+    });
+}
+
+struct clip_init_result clip_ninfer_init_from_metadata(const uint8_t * metadata,
+        size_t metadata_bytes, clip_ninfer_tensor_fill fill, void * user,
+        struct clip_context_params params) {
+    return clip_ninfer_init_impl("<NInfer embedded Vision>", params, [&] {
+        return clip_model_loader("<NInfer embedded Vision>", false, params.progress_callback,
+            params.progress_callback_user_data, metadata, metadata_bytes, fill, user);
+    });
+}
+
+'''
+    replace(clip, "struct clip_cap clip_get_cap(const char * fname) {", wrappers + "struct clip_cap clip_get_cap(const char * fname) {")
     stamp.write_text(json.dumps({"script": script_hash,
         "files": {name: sha(root / name) for name in PINNED_FILES}}, indent=2), encoding="utf-8")
 

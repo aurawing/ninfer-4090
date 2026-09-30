@@ -229,7 +229,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         model.dflash.has_value() != plan.features.dflash() ||
         model.optimized_proposal.has_value() != plan.features.optimized_proposal() ||
         model.vision.has_value() != plan.features.cuda_vision() ||
-        static_cast<bool>(model.cpu_vision) != plan.features.cpu_vision()) {
+        static_cast<bool>(model.cpu_vision) != plan.features.ggml_vision()) {
         throw std::invalid_argument(
             "Qwen3.6 loaded weights do not match the frozen startup features");
     }

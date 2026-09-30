@@ -91,9 +91,14 @@ if(NINFER_BUILD_CPU_VISION)
   target_compile_definitions(ninfer_ggml_cpu_vision_test PRIVATE NINFER_TEST_GGML_CPU_VISION=1)
   add_test(NAME ninfer_ggml_cpu_vision_real_test COMMAND ninfer_ggml_cpu_vision_test --gguf)
   set_tests_properties(ninfer_ggml_cpu_vision_real_test PROPERTIES SKIP_RETURN_CODE 77)
+  add_test(NAME ninfer_ggml_cuda_vision_real_test COMMAND ninfer_ggml_cpu_vision_test --gguf-cuda)
+  set_tests_properties(ninfer_ggml_cuda_vision_real_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 ninfer_add_test(ninfer_artifact_reader_test
   SOURCES test_ninfer_artifact_reader.cpp
+  LIBRARIES ninfer_artifact)
+ninfer_add_test(ninfer_vision_row_decode_test
+  SOURCES artifact/test_vision_row_decode.cpp
   LIBRARIES ninfer_artifact)
 ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES test_artifact_materialization.cpp
@@ -163,6 +168,18 @@ target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_qwen3_6_27b_vision_inventory_test
+  COMMAND ninfer_qwen3_6_27b_load_plan_test --vision-inventory)
+if(NINFER_BUILD_CPU_VISION)
+  ninfer_add_test(ninfer_qwen3_6_27b_embedded_vision_test
+    SOURCES targets/qwen3_6_27b/test_embedded_vision.cpp
+    LIBRARIES ninfer_engine)
+  target_include_directories(ninfer_qwen3_6_27b_embedded_vision_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+  target_link_libraries(ninfer_qwen3_6_27b_embedded_vision_test PRIVATE ${NINFER_CUDART_TARGET})
+  set_tests_properties(ninfer_qwen3_6_27b_embedded_vision_test PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 ninfer_add_test(ninfer_cpu_vision_session_test
   SOURCES targets/qwen3_6_27b/test_cpu_vision_session.cpp
   LIBRARIES ninfer_engine)
