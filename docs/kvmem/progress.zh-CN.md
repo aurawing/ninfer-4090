@@ -4,7 +4,7 @@
 
 ## 待用户决定的问题
 
-当前第 1、2 步没有待决定的 D1–D15 冲突。定位发现的 dense 量化 small-T 注意力同步 bug 尚未修复；后续若要修复须另获用户授权，见下文。D3 的后续方向已由用户在 2026-09-30 确认。
+当前没有待决定的 D1–D15 冲突。dense 量化 small-T 注意力同步 bug 已按用户授权在独立分支修复并合并到 `feat/kvmem`；Q5 残差原子累加顺序波动按用户决定保留。后续传输修正及阶段 3 第 3 步继续执行；第 3 步完成后等审阅，不接入运行时。D3 的后续方向已由用户在 2026-09-30 确认。
 
 ## 阶段 0′：基线
 
@@ -127,6 +127,63 @@ Compute Sanitizer 13.0.85 在同一个 `gqa_attention_decode_i8_tiled_kernel` �
 
 最终完整构建退出 **0**；**构建结束后**运行全量 CTest，**98 项：94 通过、4 缺少其他模型制品跳过、0 失败**，耗时 **63.30 s**（`stage3-step2-build.log`、`ctest-stage3-step2.log`）。一次误提前启动测试造成 Windows 正在运行的 exe 被锁、链接 LNK1104 与测试 BAD_COMMAND；保留 `stage3-step2-build-interrupted.log` / `ctest-stage3-step2-premature.log`，不把那轮作为验证结果。无新增 dense 内核/分派修改；第 2 步提交后停下等待审阅，不实现第 3 步。
 
+### small-T INT8 同步修复（2026-10-01）
+
+用户授权仅在 `gqa_attention_decode_i8.cuh` 加两处 CTA barrier；Q5 残差原子累加的合法求和顺序波动暂不修改。修复分支从 `221290ba` 切出，提交 **`81869152`** 已 push 到 `fix/i8-small-t-attn-sync`；以 **`b68009f7`** 合并并 push 到 `feat/kvmem`。没有合并其他分支。完整源码核对、测试判据和可复现命令见 `docs/maintainer/i8-small-t-attn-sync.md`。
+
+- ordinary INT8、packed/rotated K/V、E8 lattice/root 都经同一个量化 small-T kernel，两个 barrier 对所有非空 CTA 无条件执行。审查 BF16 small-T、INT8/BF16 prefill 的清零、异步复制和 shared 复用，没有找到相同的缺 barrier 写法；这是源码审查，不是所有配置都经过 sanitizer 的结论，未修改其他 dense 内核或分派。
+- 新 CTest `ninfer_gqa_small_t_sync_test`：Qwen27B 24Q/4KV、T=1/2/4、keys=512/8199（后者跨 8198 split 策略边界）、INT8/rk4v4-e8，共 12 组。独立 FP64 dot/softmax/V oracle，并对原始 BF16 输出逐位比较连续 **64** 次。未修复版 rk4v4-e8 8199-key 的三种 T 在第二次调用出现差异；修复后全部通过。固定数值门槛未放宽；实测相对 L2：INT8 **0.00279735–0.00285466**，rk4v4-e8 **0.00301066–0.00319963**。
+- Compute-sanitizer **13.0.85**：原版完整形状矩阵 racecheck 返回 **99**、**64 displayed hazards / 64 errors**；修复后 racecheck、synccheck、initcheck 三进程均返回 **0**，racecheck **0 hazard / 0 error / 0 warning**，后两项 **0 error**，同进程 FP64/重复检查均通过。instrumentation 为每组 2 次；正常 CTest 的 64 次仍必做。
+- 修复分支完整构建返回 0；全量 CTest **97 项：93 通过、4 缺少其他模型制品跳过、0 失败，62.58 s**。日志与测量全部在仓库外新目录 **`D:\deeplearning\NInfer\logs\kvmem-stage3-attention`**，旧阶段 0′ 数据保留。
+
+修复前后各独立进程一次，固定原 stage-0 synthetic JSON、rk4v4-e8、64 greedy token、默认 CUDA Graph、不带 vision；MTP 使用 `--spec mtp --draft-tokens 3 --lm-head-draft`，其余配置相同：
+
+| 上下文 / 模式 | 修复前 tok/s | 修复后 tok/s | 差值 |
+|---|---:|---:|---:|
+| 32768 decode | 48.54 | 48.61 | +0.144% |
+| 32768 MTP-3 | 154.19 | 153.87 | -0.208% |
+| 131072 decode | 44.02 | 44.00 | -0.045% |
+| 131072 MTP-3 | 137.63 | 137.55 | -0.058% |
+| 262144 decode | 39.17 | 39.16 | -0.026% |
+| 262144 MTP-3 | 120.05 | 112.71 | -6.114% |
+
+262K MTP 的 64 token ID 相同，但接受率从 **100%（47/47）降为 93.88%（46/49）**，验证轮数 **16→17**。以 CLI 的 63 decode token 和速度折算，每轮约 **32.80→32.88 ms（+0.25%）**；多一轮解释了几乎全部速度差，单样本不能分离剩余 Q5 波动与修复后的注意力值变化。32K/128K 接受率前后均 100%。Windows 桌面挂在 4090 上，无人为额外负载，测前占用原系列 **1558 MiB**、修复后 **1156 MiB**。此为单次回归核对，不能当作统计性能估计。
+
+证据：`sync-before-regression.log`、`sync-before-racecheck.{log,stdout.txt}`、`sync-after-regression.log`、`sync-after-{racecheck,synccheck,initcheck}.{log,stdout.txt}`、`sync-full-build.log`、`ctest-sync-fix.log`、`before/`、`after/`、`performance-comparison.json`。JSON 保存完整命令、提交号、exe/kernel/prompt SHA-256 和 GPU 前后状态。临时未修复 exe 也保存在外部。sanitizer 复现命令（从 repo 执行，runtime DLL 目录加入 PATH）：
+
+```powershell
+$san = 'D:\deeplearning\NInfer\logs\kvmem-stage0-baseline\sanitizer-tools\cuda_sanitizer_api-windows-x86_64-13.0.85-archive\compute-sanitizer\compute-sanitizer.exe'
+$data = 'D:\deeplearning\NInfer\logs\kvmem-stage3-attention'
+$env:NINFER_OP_REPORT_STATS = '1'
+foreach ($check in @('racecheck', 'synccheck', 'initcheck')) {
+    & $san --tool $check --error-exitcode 99 `
+        --log-file "$data\sync-after-$check.log" `
+        '.\build-vision-integration\tests\ninfer_gqa_small_t_sync_test.exe' `
+        --sanitizer *> "$data\sync-after-$check.stdout.txt"
+    if ($LASTEXITCODE -ne 0) { throw "$check failed: $LASTEXITCODE" }
+}
+```
+
+**合并后的九组未插桩 dense 金标准（`b68009f7`）。** 原 JSON SHA-256 和全部参数保持一致，各自独立进程，均无前缀复用、生成 64 token；九例的全部 token ID 均与旧 `78989fc0` 基线相同，**0 个用例发生变化**，六例 needle 全部答对，MTP 接受率全部 100%。旧文件不覆盖，新记录在上述外部目录的 `baseline/`。
+
+| 用例 | 文本 prefill | 就绪后 cudaMemGetInfo 空闲 | MTP tok/s | token 变化 |
+|---|---:|---:|---:|---:|
+| synthetic-32k | 14.428 s | 4.50 GiB | 154.07 | 0 |
+| needle-32k-10 | 14.464 s | 4.50 GiB | 154.10 | 0 |
+| needle-32k-90 | 14.476 s | 4.50 GiB | 153.94 | 0 |
+| synthetic-128k | 77.491 s | 2.81 GiB | 137.60 | 0 |
+| needle-128k-10 | 78.049 s | 2.81 GiB | 137.60 | 0 |
+| needle-128k-90 | 78.479 s | 2.81 GiB | 137.39 | 0 |
+| synthetic-262k | 211.808 s | 560.72 MiB | 120.20 | 0 |
+| needle-262k-10 | 212.959 s | 560.72 MiB | 120.19 | 0 |
+| needle-262k-90 | 213.269 s | 553.67 MiB | 119.69 | 0 |
+
+32K/128K/262K 的真实输入仍为 32704/131008/262080。RTX 4090 同时驱动桌面；测前占用约 1127–1137 MiB，未主动增加负载。CPU 视觉参数开启，但提示词全部为纯文本。修复内核在这轮 262K 合成用例获得 100% 接受率和 120.20 tok/s，先前另一轮 93.88%/112.71 tok/s 不构成稳定性能下降的证据。单次采样不保证未来所有 token 逐位一致，Q5 顺序波动仍保留。
+
+**512-token、保留 checkpoint 分块的双运行。** 不带视觉、关闭 MTP，`--no-cuda-graph --greedy --no-thinking --kv-dtype rk4v4-e8 --prefill-chunk 1024 --max-context 32768 --kv-capacity 32768 --max-new 1`。使用旧矩阵同一份固定 `prompt-512.json`；两次实测均为 512 token，真实边界 **`[0,508), [508,512)`**，没有禁用 checkpoint。最后位置导出 248320 个 BF16 原值，有效 248077 项。两次**仍不逐位相同**：有效项 **246134/248077** 不同，计入物理词表尾部共 **246377/248320** 不同，有效向量相对 L2 **0.1248612403**，top-1 均为 **ID 16**。这是剩余模型波动的实测，不能因注意力独立重复测试稳定就宣称整个 dense 模型稳定，也不能仅凭两次输出把全部差异定量归因于 Q5；本轮按决定不再修 dense 的其他代码。原始二进制、哈希、真实分块、完整命令及双运行结果在 `checkpoint-512/summary.json` 和 `.logits/.chunks/.stdout.txt/.stderr.txt`。
+
+**每步 logits 诊断重录也已完成。** 九例各 64 步的 top-8 与完整 BF16 target logits 均保存在新目录 `diagnostic/`（`*.top8.json`、`*.target-logits.bf16.bin`、`*.accept.bin`）；**9/9** 的诊断输出 token 与该次未插桩基线完全一致，每步 top-1 与诊断实际生成 ID 一致，六例 needle 也均答对。与旧数据相同，这些 `logits_fp32` 是 BF16 原值转成 FP32 表示，不是舍入前的 FP32。诊断禁用 CUDA Graph、增加读回同步，耗时不作为性能数据，也不能从本次一致推断 Q5 已确定性。脚本、SHA-256、命令和摘要在外部目录；所有临时 target 读回/分块钩子均已撤回，未改 Q5 或其他 dense 内核。传输修正与新部分注意力尚未完成。
+
 ## 阶段 4：稀疏 decode
 
 - 状态：未开始
@@ -137,3 +194,4 @@ Compute Sanitizer 13.0.85 在同一个 `gqa_attention_decode_i8_tiled_kernel` �
 |---|---|---|---|---|
 | 2026-09-30 | D3 前提 | 后续分层视图保留原始逻辑页号，不直接以紧凑视图槽号代替位置；阶段 0′ 不实现 | `paged_kv_address.cuh:16` 和 prefill/decode 内核按 `position >> 6` 查块表并以原始 key 位置做掩码，详见上文静态核对 | 是，用户明确选择“保留原始页号” |
 | 2026-09-30 | D4 | 默认 `auto`：加载期整块 CUDA 锁页且剩余物理内存 ≥4 GiB 则归档直传，否则释放部分分配后退回可分页归档与 4×64 MiB 中转环；显式 `pinned` 失败即退出，`pageable` 保留旧路径。两者统一「层 → plane → 逻辑页」布局 | 262K 就绪后整块可锁页 15488 MiB；锁页 H2D 9.83 GiB/s，可分页经环端到端 4.19 GiB/s。旧「4090 WDDM 锁页限额更紧」的推断不成立，4060 仍须实测 | 是，用户明确同意修订 |
+| 2026-10-01 | D1，用户授权例外 | 仅修复已知的 dense 量化 small-T 注意力共享内存竞争，独立修复分支合入后重录九组金标准，旧数据保留；Q5 和 dense 分派不改 | 原版 racecheck 64 hazards，修复后 0；12 组各 64 次逐位一致且 FP64 oracle 通过，详见修复记录 | 是，本轮用户明确要求现在修复，并限定文件与两处 barrier |

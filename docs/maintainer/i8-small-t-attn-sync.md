@@ -20,8 +20,8 @@ Existing dense dispatch and other kernels stay unchanged.
 - [x] Run regression and compute-sanitizer 13.0.85 racecheck, synccheck,
   initcheck; preserve commands/results outside the checkout.
 - [x] Measure the same six dense workloads after repair; full build and CTest.
-- [ ] Commit `fix(ops): ...`, push this branch, merge into feat/kvmem and push.
-- [ ] On feat/kvmem preserve old baseline and rerun its nine dense cases;
+- [x] Commit `fix(ops): ...`, push this branch, merge into feat/kvmem and push.
+- [x] On feat/kvmem preserve old baseline and rerun its nine dense cases;
   temporarily export last-position prefill logits for a 512-token checkpoint
   case, MTP off twice. Revert all diagnostic code before further commits.
 
