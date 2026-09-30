@@ -4,11 +4,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <span>
 #include <vector>
 
 namespace ninfer::kvmem {
+class HostKVTransferEngine;
 
 enum class HostArchiveMode { Auto, Pinned, Pageable };
 inline constexpr std::uint64_t kHostArchivePhysicalHeadroom = std::uint64_t{4} << 30;
@@ -66,6 +68,13 @@ public:
     void trim(std::uint32_t exact_frontier);
 
 private:
+    friend class HostKVTransferEngine;
+    void attach_transfer_owner(void* owner);
+    void detach_transfer_owner(void* owner) noexcept;
+    void trim_owned(std::uint32_t frontier);
+    std::vector<std::span<std::byte>> prepare_async_writeback(
+        std::size_t layer, std::uint32_t first, std::uint32_t count, std::uint32_t frontier,
+        std::shared_future<void> completion);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

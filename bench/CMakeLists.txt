@@ -10,6 +10,11 @@ function(ninfer_add_op_bench name)
   target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 endfunction()
 
+add_executable(ninfer_host_kv_transfer_bench host_kv_transfer_bench.cpp)
+target_include_directories(ninfer_host_kv_transfer_bench PRIVATE
+  ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(ninfer_host_kv_transfer_bench PRIVATE ninfer_core)
+
 ninfer_add_op_bench(ninfer_silu_mul_bench SOURCES ops/silu_mul_bench.cu)
 ninfer_add_op_bench(ninfer_residual_add_bench SOURCES ops/residual_add_bench.cu)
 ninfer_add_op_bench(ninfer_sigmoid_mul_bench SOURCES ops/sigmoid_mul_bench.cu)

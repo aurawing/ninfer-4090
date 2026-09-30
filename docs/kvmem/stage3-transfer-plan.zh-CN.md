@@ -12,10 +12,10 @@
 
 ## 第 2 步：HostKVTransferEngine
 
-- [ ] 先写 `tests/core/test_host_kv_transfer_engine.cpp`，覆盖四槽复用、锁页直传、跨层预取、生产/消费事件、generation 失效以及多 plane 字节校验。
-- [ ] 新增 `src/core/kvmem/host_kv_transfer.{h,cpp}`：加载期分配 pageable 模式 4×64 MiB 缓冲，固定非阻塞 stage stream、固定事件；pinned 跳过中转槽。staging 使用调用方 workspace 的 DeviceSpan，容量按最大流式层 + 64 MiB 求解，后续由 build_workspace_plan 纳入视图预算。
-- [ ] 预取任务显式传原始逻辑页范围与层/plane、设备偏移；消费者在自己的 CUDA stream 等 ready 事件，release 事件保护复用。下一层可以提前入队；完成顺序不改变逻辑访问顺序。trim 先 drain 引擎，再截断归档并使旧 ticket 失效。
-- [ ] 回写路径 pageable 经固定环、pinned 直接归档；主机复制最多一个工作线程，满足 D15 两线程上限。不得运行期申请锁页内存。
-- [ ] 加可手动运行的真实 INT8 K/V/scale plane 微基准；数据放仓库外，分别测直接锁页和 pageable 环的完整层传输、最后同步及逐字节校验。
-- [ ] 全量 CTest、progress、独立提交并 push；到此停下，不做第 3 步内核。
+- [x] 先写 `tests/core/test_host_kv_transfer_engine.cpp`，覆盖四槽复用、锁页直传、跨层预取、生产/消费事件、generation 失效以及多 plane 字节校验。
+- [x] 新增 `src/core/kvmem/host_kv_transfer.{h,cpp}`：加载期分配 pageable 模式 4×64 MiB 缓冲，固定非阻塞 stage stream、固定事件；pinned 跳过中转槽。staging 使用调用方 workspace 的 DeviceSpan，容量按最大流式层 + 64 MiB 求解，后续由 build_workspace_plan 纳入视图预算。
+- [x] 预取任务显式传原始逻辑页范围与层/plane、设备偏移；消费者在自己的 CUDA stream 等 ready 事件，release 事件保护复用。下一层可以提前入队；完成顺序不改变逻辑访问顺序。trim 先 drain 引擎，再截断归档并使旧 ticket 失效。
+- [x] 回写路径 pageable 经固定环、pinned 直接归档；主机复制最多一个工作线程，满足 D15 两线程上限。不得运行期申请锁页内存。
+- [x] 加可手动运行的真实 INT8 K/V/scale plane 微基准；数据放仓库外，分别测直接锁页和 pageable 环的完整层传输、最后同步及逐字节校验。
+- [x] 全量 CTest、progress；作为第 2 步独立提交并 push，到此停下，不做第 3 步内核。
 

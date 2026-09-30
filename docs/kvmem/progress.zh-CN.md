@@ -48,7 +48,7 @@
 
 ## 阶段 3：分层 + 精确
 
-- 状态：视图设计说明已写入 `stage3-view-design.zh-CN.md`；门禁 A 已改为同一次运行的影子注意力比对。dense 定位与门禁文档已在 `445dcfd0` 独立提交并 push；第 1 步归档组件与测试已完成，完整构建/CTest 结果见下文。内核、目标运行时接线和产品 CLI 尚未实现。
+- 状态：视图设计说明已写入 `stage3-view-design.zh-CN.md`；门禁 A 已改为同一次运行的影子注意力比对。dense 定位与门禁文档已在 `445dcfd0` 独立提交并 push；第 1 步归档组件在 `7eb5655a` 独立提交并 push，第 2 步传输引擎和测量已完成，完整构建/CTest 结果见下文。停在第 2 步审阅点；内核、视图状态机、目标运行时接线和产品 CLI 尚未实现。
 - 量纲核对：补测文件 `followup-max-pin.json` 记载单块 `cudaHostAlloc` **15488 MiB 成功、15552 MiB 失败**。用户表述的「15.5 GiB」为近似说法；按二进制换算实际成功点是 **15.125 GiB**，文档统一写原始 MiB 与约 15.1 GiB。
 
 ### 阶段 3 前的 BF16 波动核对（2026-09-30；临时代码已撤回）
@@ -103,6 +103,29 @@ Compute Sanitizer 13.0.85 在同一个 `gqa_attention_decode_i8_tiled_kernel` �
 - 新 CTest **`test_host_kv_transfer`**：三种请求模式 × PageMajor/HeadMajor，共 6 组；每组两层、每层四个不同 page-byte plane，归档容量 **417792 B**，8 个逻辑页。独立生成逐字节 pattern，碎片物理映射 `{5,2,3,7}` → `{1,6,4,0}` 的全部 plane/page 往返和覆盖回写一致；frontier **250 → 130 → 0 → 12**，保留第 2 页前 2 token 的 frontier 语义，越界/空洞/无效物理页被拒绝。pageable 初始提交量和 trim 到 0 后提交量均为 0，中间 trim 能实际减少提交量；auto 在本次小归档上选择 pinned。4 GiB 准入边界和失败 pin 的策略另有纯函数断言，不宣称在本测试人为制造了实际大块 pin 失败。
 - 新增延迟 H2D 的 trim 用例：先观察到失败 `trim must drain outstanding archive H2D reads`，再增加读取完成事件保护，6 组全部通过。初次测试构建在新接口未实现处失败；实现后基础及延迟用例均通过。外部数据为 `host-kv-red-build.log`、`host-kv-trim-red-build.log`、`stage3-step1-byte-test.log`。
 - 全量构建退出 **0**；全量 CTest **97 项：93 通过、4 因缺少其他模型制品跳过、0 失败**，耗时 **66.85 s**。新测试在完整套件中耗时 1.53 s（与其他测试并行）；另一次单独运行退出 0。记录：`stage3-step1-build.log`、`ctest-stage3-step1.log`。数值全部为实测或明确的测试配置，未提供未经测量的推理性能结论。
+
+### 第 2 步：传输引擎与真实多 plane 吞吐（2026-09-30，基于 `7eb5655a`）
+
+- 新增 `src/core/kvmem/host_kv_transfer.{h,cpp}`。加载期固定单工作线程、一个非阻塞 CUDA staging stream、每个 ticket 的 ready/consumed 事件、每层生产/回写事件；pageable 固定 **4×64 MiB** cacheable 锁页环，pinned **0 B** 环且 H2D/D2H 直接用归档。运行期不申请新的锁页、设备存储或 CUDA 事件。普通 CPU 任务描述/队列可分配，不参与 CUDA Graph 地址。归档与调用方 staging、生产/消费 stream 必须比引擎活得久；C=1 调度入口由调用方串行调用。
+- `plan_host_kv_staging()` 从真实归档 plane 字节求最大单层流式量，再加 64 MiB；容量覆盖低于最小值会报错。16 个 Main 全注意力层、INT8、262K 逻辑容量、128K 驻留预算时，流式层 **264 MiB**、staging **328 MiB**。设备 span 由外部 workspace 提供，引擎不自行申请 staging；与 `build_workspace_plan()` 的统一求解/扣减视图、GDN 提前调度、ViewTable 的 DeviceOnly/Both/HostOnly 状态在后续第 4 步接线，不修改现有 dense 预算。
+- `prefetch(layer,plane,first,count,device_offset)` 保留原始逻辑号，按最多 64 MiB 的连续 plane 段排入 FIFO；跨层可以提前排队。CPU 等到 worker 记录 ready 后才向消费流提交 `cudaStreamWaitEvent`，不在 CPU 等 DMA 完成；`release` 在实际消费后记录 consumed，覆盖 live range 会被拒绝，重用已释放范围必须等待对应 consumed。事件槽引用计数防止依赖尚未被传输流捕获时重录事件。访问顺序不由传输完成时间决定，split/LSE 顺序仍留给第 3 步新内核。
+- 引擎对归档取得唯一传输所有权：直接归档写入/恢复/trim 被拒绝，须由 owner 排序。异步回写通过生产流事件等待 KV 写完；同一传输流保证此前读取先于归档覆盖。pageable D2H 经固定环、CPU memcpy 回归档，pinned 直接 D2H；工作线程只写字节并兑现 completion future，主线程读取该层时才发布完成 frontier，避免元数据数据竞争。`trim` 先 drain 队列、DMA 和消费事件，重置 ticket，再截断精确 frontier、增加 generation。snapshot/restore 运行时尚未接线，不声称已实现完整恢复。
+- 新 CTest **`test_host_kv_transfer_engine`**：pinned/pageable × PageMajor/HeadMajor 四组，每组两层、四种 plane；独立字节 pattern 校验全部页。覆盖四槽/事件反复复用（48 次）、其他层提前排队、延迟消费者 50 ms 后跨流覆盖、异步回写、延迟生产者 50 ms 后回写、归档覆盖前已排队读取的旧字节、过小预算/live 重叠/旧 generation 拒绝与 trim 到 **130**。真实 INT8 几何另断言 **264/328 MiB**。先写测试时新接口未实现，构建失败（`host-transfer-red-build.log`）；实现后的独立基础测试和完整套件中的扩展测试均通过。
+
+**真实多 plane 手动微基准。** 新增 `bench/host_kv_transfer_bench.cpp`，启用 `NINFER_BUILD_BENCHMARKS=ON` 后构建目标 `ninfer_host_kv_transfer_bench`，分别执行 `pinned`、`pageable`。真实 INT8 几何：64 token/page，K/V 各 `I8 [256,4 heads]`，K/V scale 各 `FP16 [4,4 heads]`；单层每页 135168 B，16 层、4096 页归档 **8858370048 B = 8.25 GiB**。先从真实 PagedKVPool 建立完整主机镜像，然后释放整个设备源；计时期间只从归档读。字节为确定性的 layer/plane pattern，不是模型实际生成的 KV 值，不影响传输布局。
+
+每个正式层读取后半 **2048 页（128K token）**：K/V 各 128 MiB、两个 scale 各 4 MiB，分 6 个 ticket 连续放入 **328 MiB** staging 的前 **264 MiB**。预热 2 层，正式 16 层覆盖各层归档一次，共 **4429185024 B = 4.125 GiB**。`steady_clock` 计时包括 CPU 入队、pageable memcpy、异步 H2D、GPU 事件等待和每层最终同步；不含归档初始化、归档写回、末尾 D2H 校验。正式循环后独立比对最后一层全部 **276824064 B**；每次均通过。前面各 layer/page 的内容正确性由上述 CTest 覆盖。本基准没有 GDN/注意力/LSE，因此未实测计算与跨层传输的重叠收益，也不代表模型推理吞吐。
+
+| 模式 | 第 1 次 GiB/s（耗时 s） | 第 2 次 GiB/s（耗时 s） | 两次平均 GiB/s | 锁页环 |
+|---|---|---|---|---|
+| pinned | **8.7644（0.4706542）** | **7.6075（0.5422307）** | **8.1859** | 0 |
+| pageable | **2.7551（1.4972063）** | **3.2208（1.2807308）** | **2.9880** | 256 MiB |
+
+四次独立进程按 pinned/pageable 交替运行。测量前整卡占用 **1930 MiB**、后 **1934 MiB**，PCIe **3.0×16**；构造归档前可用物理内存约 **17.62–17.88 GiB**，引擎就绪时 pinned 约 **9.29–9.32 GiB**、pageable 约 **9.09–9.10 GiB**。这是无模型服务加载的传输微基准状态，不替代阶段 0′ 的「262K 模型就绪后」锁页上限测量。可分页数字低于阶段 0′ 整块基准 4.19 GiB/s：这次有多 plane、4.125 GiB 读取足迹、任务/消费事件和每层同步，测试口径不同，尚未隔离各因素的贡献，不据此断言唯一原因。D4 仍按用户决定保留 auto 优先完整锁页。
+
+数据全部在仓库外 `D:\deeplearning\NInfer\logs\kvmem-stage0-baseline`：`stage3-transfer-{pinned,pageable}-{1,2}.{json,log}`、`stage3-transfer-summary.json`（命令、基准/源码 SHA-256、基线提交）、`stage3-transfer-gpu-{before,after}.csv`。复现实验使用 CMake **3.31.10**、CUDA **13.3**、MSVC；系统 VS 自带 CMake 3.25.1 不能配置本项目，实际使用研究目录中现有的 CMake。
+
+最终完整构建退出 **0**；**构建结束后**运行全量 CTest，**98 项：94 通过、4 缺少其他模型制品跳过、0 失败**，耗时 **63.30 s**（`stage3-step2-build.log`、`ctest-stage3-step2.log`）。一次误提前启动测试造成 Windows 正在运行的 exe 被锁、链接 LNK1104 与测试 BAD_COMMAND；保留 `stage3-step2-build-interrupted.log` / `ctest-stage3-step2-premature.log`，不把那轮作为验证结果。无新增 dense 内核/分派修改；第 2 步提交后停下等待审阅，不实现第 3 步。
 
 ## 阶段 4：稀疏 decode
 

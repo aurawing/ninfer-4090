@@ -64,6 +64,7 @@ endfunction()
 
 # Artifact framing and model-independent runtime contracts.
 ninfer_add_op_test(test_host_kv_transfer SOURCES core/test_host_kv_transfer.cpp)
+ninfer_add_op_test(test_host_kv_transfer_engine SOURCES core/test_host_kv_transfer_engine.cpp)
 
 ninfer_add_test(ninfer_concurrent_executor_cancel_test
   SOURCES test_concurrent_executor_cancel.cpp

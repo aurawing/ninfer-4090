@@ -104,8 +104,13 @@ struct HostKVArchive::Impl {
     std::vector<std::uint32_t> frontiers, pending_frontiers;
     std::vector<cudaEvent_t> done, read_done;
     std::vector<bool> pending, reading;
+    std::vector<std::shared_future<void>> external_done;
+    void* transfer_owner = nullptr;
 
     ~Impl() {
+        for (auto& completion : external_done) {
+            if (completion.valid()) { completion.wait(); }
+        }
         for (std::size_t i = 0; i < done.size(); ++i) {
             if (done[i]) {
                 if (pending[i]) { (void)cudaEventSynchronize(done[i]); }
@@ -197,6 +202,7 @@ HostKVArchive::HostKVArchive(HostKVArchiveLayout layout, HostArchiveMode request
     state.committed.resize(layers);
     state.frontiers.resize(layers);
     state.pending_frontiers.resize(layers);
+    state.external_done.resize(layers);
     state.pending.resize(layers);
     state.reading.resize(layers);
     state.done.resize(layers);
@@ -262,6 +268,12 @@ std::size_t HostKVArchive::committed_bytes() const noexcept {
 }
 void HostKVArchive::synchronize_layer(std::size_t layer) {
     auto& state = *impl_;
+    auto& external = state.external_done.at(layer);
+    if (external.valid()) {
+        external.get();
+        state.frontiers[layer] = state.pending_frontiers[layer];
+        external = {};
+    }
     if (state.pending.at(layer)) {
         CUDA_CHECK(cudaEventSynchronize(state.done[layer]));
         state.frontiers[layer] = state.pending_frontiers[layer];
@@ -284,6 +296,9 @@ void HostKVArchive::writeback(const PagedKVPool& pool, std::size_t layer, std::u
                               std::span<const std::int32_t> ids, std::uint32_t frontier,
                               cudaStream_t stream) {
     auto& state = *impl_;
+    if (state.transfer_owner) {
+        throw std::logic_error("attached archive writeback must use its transfer owner");
+    }
     state.validate_pool(pool, layer, ids);
     synchronize_layer(layer);
     const auto old = state.frontiers.at(layer);
@@ -332,6 +347,9 @@ std::span<const std::byte> HostKVArchive::pages(std::size_t layer, std::size_t p
 }
 void HostKVArchive::restore_to_pool(PagedKVPool& pool, std::size_t layer, std::uint32_t first,
                                     std::span<const std::int32_t> ids, cudaStream_t stream) {
+    if (impl_->transfer_owner) {
+        throw std::logic_error("attached archive restore must use its transfer owner");
+    }
     impl_->validate_pool(pool, layer, ids);
     synchronize_layer(layer);
     if (ids.size() > std::numeric_limits<std::uint32_t>::max()) {
@@ -358,6 +376,12 @@ void HostKVArchive::restore_to_pool(PagedKVPool& pool, std::size_t layer, std::u
     impl_->reading[layer] = true;
 }
 void HostKVArchive::trim(std::uint32_t frontier) {
+    if (impl_->transfer_owner) {
+        throw std::logic_error("attached archive trim must use its transfer owner");
+    }
+    trim_owned(frontier);
+}
+void HostKVArchive::trim_owned(std::uint32_t frontier) {
     auto& state = *impl_;
     synchronize();
     for (auto old : state.frontiers) {
@@ -391,6 +415,40 @@ void HostKVArchive::trim(std::uint32_t frontier) {
         state.pending_frontiers[layer] = frontier;
     }
     ++state.generation;
+}
+
+void HostKVArchive::attach_transfer_owner(void* owner) {
+    if (!owner || impl_->transfer_owner) {
+        throw std::logic_error("host KV archive already has a transfer owner");
+    }
+    synchronize();
+    impl_->transfer_owner = owner;
+}
+void HostKVArchive::detach_transfer_owner(void* owner) noexcept {
+    if (impl_->transfer_owner == owner) { impl_->transfer_owner = nullptr; }
+}
+std::vector<std::span<std::byte>> HostKVArchive::prepare_async_writeback(
+    std::size_t layer, std::uint32_t first, std::uint32_t count, std::uint32_t frontier,
+    std::shared_future<void> completion) {
+    auto& state = *impl_;
+    synchronize_layer(layer);
+    const auto old = state.frontiers.at(layer);
+    if (count == 0 || frontier < old || frontier > state.layout.max_context ||
+        first > page_count(old) || count > state.layout.logical_pages - first ||
+        first + count > page_count(frontier) ||
+        (frontier > old && (first > old / kPagedKVPageSize || first + count < page_count(frontier)))) {
+        throw std::invalid_argument("async host KV writeback invalid range or frontier");
+    }
+    std::vector<std::span<std::byte>> result;
+    result.reserve(state.layout.layers[layer].size());
+    for (std::size_t p = 0; p < state.layout.layers[layer].size(); ++p) {
+        state.ensure_committed(layer, p, first + count);
+        const auto& spec = state.layout.layers[layer][p];
+        result.emplace_back(state.address(spec, first), spec.page_bytes * count);
+    }
+    state.pending_frontiers[layer] = frontier;
+    state.external_done[layer] = std::move(completion);
+    return result;
 }
 
 } // namespace ninfer::kvmem
