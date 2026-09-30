@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <atomic>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -172,6 +173,71 @@ void exercise(HostArchiveMode mode, PagedKVPlaneOrder order) {
     const auto new_value = archive.pages(0, 0, 2, 1);
     require(std::equal(new_value.begin(), new_value.end(), replacement.begin()),
             "writeback must wait for the producing CUDA stream");
+    // A delayed producer on layer 0 cannot block a subsequent layer-1 H2D.
+    // Completion timestamps come from separate observers, not assumed ordering.
+    engine.synchronize();
+    const auto start = std::chrono::steady_clock::now();
+    auto milliseconds = [&] {
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+    };
+    CUDA_CHECK(cudaLaunchHostFunc(device.stream, [](void*) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }, nullptr));
+    auto independent_wb = engine.writeback(pool, 0, 2, changed, 2560, device.stream);
+    std::atomic<double> writeback_ms{0};
+    std::jthread observer([&] { independent_wb.wait(); writeback_ms.store(milliseconds()); });
+    auto independent_pf = engine.prefetch(1, 0, 0, 1, 0);
+    engine.wait(independent_pf, device.load_stream);
+    const double prefetch_issued_ms = milliseconds();
+    CUDA_CHECK(cudaMemcpyAsync(check_a.data(), engine.staged(independent_pf).data,
+                                check_a.size(), cudaMemcpyDeviceToHost, device.load_stream));
+    engine.release(independent_pf, device.load_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.load_stream));
+    const double prefetch_ms = milliseconds();
+    const bool writeback_was_pending = independent_wb.wait_for(std::chrono::milliseconds(0)) ==
+                                      std::future_status::timeout;
+    independent_wb.get(); observer.join();
+    std::cout << "delayed-writeback mode=" << (mode == HostArchiveMode::Pinned ? "pinned" : "pageable")
+              << " order=" << (order == PagedKVPlaneOrder::PageMajor ? "page" : "head")
+              << " prefetch_issued_ms=" << prefetch_issued_ms
+              << " prefetch_complete_ms=" << prefetch_ms
+              << " writeback_complete_ms=" << writeback_ms.load() << '\n';
+    require(writeback_was_pending && prefetch_ms < writeback_ms.load(),
+            "delayed writeback must not hold up later unrelated prefetch");
+    const auto independent_value = bytes(check_a.size(), 4, 0);
+    require(std::memcmp(check_a.data(), independent_value.data(), independent_value.size()) == 0,
+            "independent prefetch bytes during delayed writeback");
+    engine.synchronize();
+
+    // Force an earlier archive H2D reader to remain queued behind a consumer.
+    // The D2H worker must capture its ready event before overwriting that archive.
+    auto held = engine.prefetch(1, 0, 0, 1, 0);
+    engine.wait(held, device.load_stream);
+    CUDA_CHECK(cudaLaunchHostFunc(device.load_stream, [](void*) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }, nullptr));
+    engine.release(held, device.load_stream);
+    auto queued_old = engine.prefetch(0, 0, 2, 1, 0);
+    engine.wait(queued_old, device.load_stream);
+    CUDA_CHECK(cudaMemcpyAsync(check_a.data(), engine.staged(queued_old).data,
+                                check_a.size(), cudaMemcpyDeviceToHost, device.load_stream));
+    engine.release(queued_old, device.load_stream);
+    // All startup tickets have been used by the reuse loop above. The next
+    // disjoint segment therefore reuses a released ticket's event/metadata.
+    auto reused_slot = engine.prefetch(1, 1, 0, 1, 4 * check_a.size());
+    engine.wait(reused_slot, device.load_stream);
+    engine.release(reused_slot, device.load_stream);
+    const auto version3 = bytes(produced.size(), 0, 2, 3);
+    std::memcpy(produced.data(), version3.data(), version3.size());
+    pool.copy_page_from_host(0, 0, produced.data(), device.stream);
+    engine.writeback(pool, 0, 2, changed, 2560, device.stream).get();
+    engine.synchronize();
+    require(std::memcmp(check_a.data(), replacement.data(), replacement.size()) == 0,
+            "separate D2H must wait for prior archive H2D readers");
+    const auto version3_host = archive.pages(0, 0, 2, 1);
+    require(std::equal(version3_host.begin(), version3_host.end(), version3.begin()),
+            "separate D2H must publish new archive bytes");
     auto stale = engine.prefetch(0, 0, 0, 1, 0);
     rejects([&] { archive.trim(128); }, "attached archive mutations must go through transfer owner");
     engine.trim(130);

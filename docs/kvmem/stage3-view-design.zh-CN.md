@@ -33,7 +33,9 @@
 
 阶段 0′ 的独立 64 MiB 微基准测得 1/2 线程 `memcpy` 约 5.98/6.00 GiB/s，合成的可分页环流水线端到端约 4.19/3.86 GiB/s，锁页直传约 9.83 GiB/s；262K 配置就绪后整块可锁页 15488 MiB（约 15.1 GiB）。这些数字尚未计入真实多 plane 布局、逐层预取和 LSE kernel，不能直接当作模型吞吐预测。阶段 3 第 2 步要在两种模式下测真实「归档 → 设备 staging」吞吐。D15 限制主机工作线程最多 2 个；可分页路径首版以 1 个拷贝线程为默认。
 
-第 2 步已实现 `HostKVArchive` 与 `HostKVTransferEngine`：加载期固定四槽、单拷贝工作线程及非阻塞传输流；每个 ticket 描述层/plane、原始逻辑页范围和 staging 字节偏移，单次不超过 64 MiB。ready/consumed 事件与 generation 保护 DMA、消费者及槽复用；跨层任务可提前排队，不按完成时间重排。引擎持有归档的唯一传输所有权，回写经生产流事件排序，并由 future 发布完成，trim 先 drain。staging 使用调用方已有 `DeviceSpan`，`plan_host_kv_staging()` 已给出容量和覆盖参数校验；第 4 步才接入 `build_workspace_plan()`、GDN 调度和视图驱逐，产品 CLI 属第 7 步。因此目前不是可启动的 tiered 推理模式。
+第 2 步已实现 `HostKVArchive` 与 `HostKVTransferEngine`。审阅后修正为加载期固定两个拷贝工作线程及两条非阻塞 H2D/D2H 流，仍只分配可分页模式的四槽环。预取 worker 只提交 H2D；回写 worker 等生产事件、提交 D2H，pageable 再 memcpy 进归档，pinned 直接回写后通过完成事件兑现 future；等待回写不阻塞预取 worker。回写捕获此前最后一笔 H2D 的 ready 事件，依 H2D FIFO 顺序保护所有较早归档读取（包括 ticket 已复用的情况），但之后的预取没有回写依赖。两条流共用四槽时，每槽有独占 CPU lease 与 DMA 完成事件；D2H 等生产者之前不占槽，异常途中需先 drain DMA 再释放 lease，运行期不另申请锁页内存或事件。
+
+每个 ticket 描述层/plane、原始逻辑页范围和 staging 字节偏移，单次不超过 64 MiB。ready/consumed 事件、引用计数与 generation 保护 DMA、消费者及槽复用；D2H 捕获 ready 前先在 CPU 确认它已记录，避免 CUDA 把未记录事件当作完成。跨层任务可提前排队，不按完成时间重排。引擎持有归档的唯一传输所有权，trim 先 drain 两条流和两个 worker。staging 使用调用方已有 `DeviceSpan`，`plan_host_kv_staging()` 已给出容量和覆盖参数校验；第 4 步才接入 `build_workspace_plan()`、GDN 调度和视图驱逐，产品 CLI 属第 7 步。因此目前不是可启动的 tiered 推理模式。
 
 真实 16 层 INT8 K/V/FP16-scale 布局的手动微基准：262K 归档 **8.25 GiB**、每层流入 128K 页数据 **264 MiB**、staging **328 MiB**。两次独立进程的锁页直传为 **8.76 / 7.61 GiB/s**，可分页四槽为 **2.76 / 3.22 GiB/s**；计时含排队、主机复制、DMA 和每层末尾同步，完整 264 MiB 字节校验通过。该基准没有 GDN、注意力或 LSE，不证明模型吞吐或计算与传输的重叠效果。与阶段 0′ 的合成整块测量口径不同，细节及外部数据见 progress。
 

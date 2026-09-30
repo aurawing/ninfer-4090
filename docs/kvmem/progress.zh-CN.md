@@ -184,6 +184,22 @@ foreach ($check in @('racecheck', 'synccheck', 'initcheck')) {
 
 **每步 logits 诊断重录也已完成。** 九例各 64 步的 top-8 与完整 BF16 target logits 均保存在新目录 `diagnostic/`（`*.top8.json`、`*.target-logits.bf16.bin`、`*.accept.bin`）；**9/9** 的诊断输出 token 与该次未插桩基线完全一致，每步 top-1 与诊断实际生成 ID 一致，六例 needle 也均答对。与旧数据相同，这些 `logits_fp32` 是 BF16 原值转成 FP32 表示，不是舍入前的 FP32。诊断禁用 CUDA Graph、增加读回同步，耗时不作为性能数据，也不能从本次一致推断 Q5 已确定性。脚本、SHA-256、命令和摘要在外部目录；所有临时 target 读回/分块钩子均已撤回，未改 Q5 或其他 dense 内核。传输修正与新部分注意力尚未完成。
 
+### 第 2 步审阅修正：回写与预取独立推进（2026-10-01，基于 `1fff2bb6`）
+
+- 新回归先在旧引擎上运行：第 0 层生产者延迟 `sleep_for(50ms)`，回写后马上排第 1 层预取。旧引擎 **退出 1**：预取下发 **62.7265 ms**、完成 **62.7946 ms**，回写完成 **62.5122 ms**，复现同 worker/同流的队头阻塞（`transfer-sync-red-test.log`）。Windows 调度使实际延迟约 62 ms，不把 sleep 请求值当作实际完成时间。
+- 两条非阻塞 CUDA 流、最多 **2 个**主机工作线程：预取 worker/FIFO 只提交 H2D；D2H 回写与其完成事件等待在第二个 worker，pageable 的环→归档 memcpy 也在第二个 worker。pinned 直接 D2H 后事件完成再发布 future。仍是 pageable **4×64 MiB** cacheable 环、pinned **0 B** 环；没有运行期锁页/设备/事件分配。
+- 两 worker 通过独占 lease 共用四槽，每槽带 DMA 事件，异常时先 drain 再释放以免另一 worker 改写尚在传输的字节。回写捕获此前最新 H2D ticket 的 ready 事件（先等其确已 record，再 CUDA wait），H2D FIFO 保护所有此前读归档的 DMA；引用计数保护 ready generation 不被重录，覆盖 ticket 已复用的情形。后续的无关层预取没有回写/生产者依赖。同层读取新归档仍须等待对应回写 future；这是数据依赖，未绕过它。reset/trim/destructor 排空两个 worker 与两条流。
+- 新旧逐字节检查全部通过，四种 mode/order；新增测试覆盖 50 ms 延迟回写与后续无关预取、延迟消费者之后读取旧归档再覆盖、ticket 复用后的旧读保护。测试额外的时间 observer thread 只用于测试记录，不是生产引擎的第三个 worker。独立绿色运行退出 0，时间均为 `steady_clock` 从提交前开始的毫秒；预取下发取 worker 已记录 ready 的观察时刻，完成含字节读回同步，回写完成由 future observer 记录：
+
+| 归档 / 源布局 | 预取下发 ms | 预取完成 ms | 回写完成 ms |
+|---|---:|---:|---:|
+| pinned / PageMajor | 0.2086 | 0.2364 | 62.2248 |
+| pinned / HeadMajor | 0.1506 | 0.1859 | 61.3671 |
+| pageable / PageMajor | 0.1464 | 0.1776 | 62.3957 |
+| pageable / HeadMajor | 0.1283 | 0.1509 | 62.4526 |
+
+源池及生产流必须活到 completion future 完成，源 KV 字节在此之前不改动，已写入 API 注释。原有归档往返、异步回写、事件多次复用、live range 与旧 generation 拒绝、trim 语义保留。证据在 `D:\deeplearning\NInfer\logs\kvmem-stage3-attention` 的 `transfer-sync-{red,green}-{build,test}.log`；完整构建退出 **0**（`transfer-sync-full-build.log`）。构建完成后全量 CTest **99 项：95 通过、4 缺少其他模型制品跳过、0 失败，62.87 s**（`ctest-transfer-sync.log`）。没有修改 dense 内核/分派或接入 tiered 运行时。
+
 ## 阶段 4：稀疏 decode
 
 - 状态：未开始

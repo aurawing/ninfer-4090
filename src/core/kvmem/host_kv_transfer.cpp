@@ -7,8 +7,10 @@
 #include <cstring>
 #include <deque>
 #include <iostream>
+#include <exception>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -65,7 +67,7 @@ struct HostKVTransferEngine::Impl {
     struct RingSlot {
         std::unique_ptr<PinnedHostBuffer> memory;
         cudaEvent_t done = nullptr;
-        bool used = false;
+        bool used = false, claimed = false;
     };
     struct Job {
         bool writeback = false;
@@ -81,7 +83,8 @@ struct HostKVTransferEngine::Impl {
     DeviceSpan staging;
     HostKVStagingPlan plan;
     int device = 0;
-    cudaStream_t stream = nullptr;
+    cudaStream_t stream = nullptr; // H2D: only the prefetch worker submits here.
+    cudaStream_t writeback_stream = nullptr;
     std::vector<Slot> slots;
     std::vector<cudaEvent_t> ready, consumed, producer_ready, writeback_done;
     std::array<RingSlot, 4> ring;
@@ -89,9 +92,9 @@ struct HostKVTransferEngine::Impl {
     std::uint64_t next_sequence = 1;
     std::mutex mutex;
     std::condition_variable changed;
-    std::deque<Job> jobs;
-    std::thread worker;
-    bool stopping = false, active = false;
+    std::deque<Job> jobs, writeback_jobs;
+    std::thread worker, writeback_worker;
+    bool stopping = false, active = false, writeback_active = false;
     std::exception_ptr error;
 
     Impl(HostKVArchive& a, DeviceSpan s, HostKVStagingPlan p) : archive(a), staging(s), plan(p) {}
@@ -102,6 +105,8 @@ struct HostKVTransferEngine::Impl {
         }
         changed.notify_all();
         if (worker.joinable()) { worker.join(); }
+        if (writeback_worker.joinable()) { writeback_worker.join(); }
+        if (writeback_stream) { (void)cudaStreamSynchronize(writeback_stream); }
         if (stream) { (void)cudaStreamSynchronize(stream); }
         for (const auto& slot : slots) {
             if (slot.waited && !slot.released) { (void)cudaStreamSynchronize(slot.consumer); }
@@ -114,10 +119,12 @@ struct HostKVTransferEngine::Impl {
         }
         for (auto& slot : ring) { if (slot.done) { (void)cudaEventDestroy(slot.done); } }
         if (stream) { (void)cudaStreamDestroy(stream); }
+        if (writeback_stream) { (void)cudaStreamDestroy(writeback_stream); }
     }
     void initialize() {
         CUDA_CHECK(cudaGetDevice(&device));
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&writeback_stream, cudaStreamNonBlocking));
         slots.resize(plan.ticket_capacity);
         ready.resize(slots.size());
         consumed.resize(slots.size());
@@ -136,8 +143,12 @@ struct HostKVTransferEngine::Impl {
         }
         auto started = std::make_shared<std::promise<void>>();
         auto startup = started->get_future();
-        worker = std::thread([this, started] { run(started); });
+        worker = std::thread([this, started] { run(started, false); });
         startup.get();
+        auto wb_started = std::make_shared<std::promise<void>>();
+        auto wb_startup = wb_started->get_future();
+        writeback_worker = std::thread([this, wb_started] { run(wb_started, true); });
+        wb_startup.get();
     }
     void check_error() const { if (error) { std::rethrow_exception(error); } }
     Slot& validate(HostKVTransferTicket ticket) {
@@ -150,11 +161,47 @@ struct HostKVTransferEngine::Impl {
         }
         return slots[ticket.slot];
     }
-    RingSlot& acquire_ring() {
-        auto& slot = ring[ring_cursor++ % ring.size()];
-        if (slot.used) { CUDA_CHECK(cudaEventSynchronize(slot.done)); }
-        return slot;
+    // Both workers share the same four startup slots. A D2H worker waits for
+    // its producer before claiming a slot; it never holds up H2D for that wait.
+    std::size_t acquire_ring() {
+        std::size_t chosen = 0;
+        {
+            std::unique_lock lock(mutex);
+            changed.wait(lock, [&] {
+                return error || std::any_of(ring.begin(), ring.end(),
+                    [](const RingSlot& slot) { return !slot.claimed; });
+            });
+            check_error();
+            for (std::size_t n = 0; n < ring.size(); ++n) {
+                chosen = ring_cursor++ % ring.size();
+                if (!ring[chosen].claimed) { ring[chosen].claimed = true; break; }
+            }
+        }
+        try {
+            if (ring[chosen].used) { CUDA_CHECK(cudaEventSynchronize(ring[chosen].done)); }
+        } catch (...) { release_ring(chosen); throw; }
+        return chosen;
     }
+    void release_ring(std::size_t slot) noexcept {
+        { std::lock_guard lock(mutex); ring[slot].claimed = false; }
+        changed.notify_all();
+    }
+    struct RingLease {
+        Impl& owner;
+        std::size_t index;
+        cudaStream_t dma_stream;
+        int exceptions = std::uncaught_exceptions();
+        RingLease(Impl& o, cudaStream_t s) : owner(o), index(o.acquire_ring()), dma_stream(s) {}
+        RingLease(const RingLease&) = delete;
+        RingLease& operator=(const RingLease&) = delete;
+        ~RingLease() {
+            // A failed event record must not publish a slot while its DMA still
+            // uses host bytes. Drain before another worker can claim it.
+            if (std::uncaught_exceptions() > exceptions) { (void)cudaStreamSynchronize(dma_stream); }
+            owner.release_ring(index);
+        }
+        RingSlot& slot() { return owner.ring[index]; }
+    };
     void process_prefetch(const Job& job) {
         for (auto dependency : job.dependencies) {
             // Reference counts prevent another ticket from re-recording this event
@@ -166,9 +213,11 @@ struct HostKVTransferEngine::Impl {
         Slot target;
         { std::lock_guard lock(mutex); target = slots[job.slot]; }
         const void* source = job.source;
+        std::optional<RingLease> lease;
         RingSlot* host_slot = nullptr;
         if (archive.mode() == HostArchiveMode::Pageable) {
-            host_slot = &acquire_ring();
+            lease.emplace(*this, stream);
+            host_slot = &lease->slot();
             std::memcpy(host_slot->memory->data(), source, target.bytes);
             source = host_slot->memory->data();
         }
@@ -187,16 +236,28 @@ struct HostKVTransferEngine::Impl {
         const auto& layout = archive.layout().layers[job.layer][plane];
         const auto ids = std::span<const std::int32_t>(job.pages).subspan(begin, count);
         if (archive.layout().pool_order == PagedKVPlaneOrder::PageMajor) {
-            job.pool->copy_pages_to_host(layout.pool_plane, ids, destination, stream);
+            job.pool->copy_pages_to_host(layout.pool_plane, ids, destination, writeback_stream);
         } else {
             for (std::size_t i = 0; i < count; ++i) {
                 job.pool->copy_page_to_host(layout.pool_plane, ids[i],
-                    static_cast<std::byte*>(destination) + i * layout.page_bytes, stream);
+                    static_cast<std::byte*>(destination) + i * layout.page_bytes, writeback_stream);
             }
         }
     }
     void process_writeback(const Job& job) {
-        CUDA_CHECK(cudaStreamWaitEvent(stream, producer_ready[job.layer], 0));
+        // Waiting here blocks only the second worker, never the prefetch worker.
+        CUDA_CHECK(cudaEventSynchronize(producer_ready[job.layer]));
+        for (auto dependency : job.dependencies) {
+            {
+                std::unique_lock lock(mutex);
+                changed.wait(lock, [&] { return error || slots[dependency].enqueued; });
+                check_error();
+            }
+            // An unrecorded CUDA event would be treated as already complete.
+            // Capture its exact ready generation only after H2D has recorded it.
+            CUDA_CHECK(cudaStreamWaitEvent(writeback_stream, ready[dependency], 0));
+            { std::lock_guard lock(mutex); --slots[dependency].references; }
+        }
         for (std::size_t plane = 0; plane < job.destinations.size(); ++plane) {
             const auto page_bytes = archive.layout().layers[job.layer][plane].page_bytes;
             if (archive.mode() == HostArchiveMode::Pinned) {
@@ -206,9 +267,10 @@ struct HostKVTransferEngine::Impl {
                 if (!per_tile) { throw std::invalid_argument("KV page exceeds fixed transfer tile"); }
                 for (std::size_t begin = 0; begin < job.pages.size(); begin += per_tile) {
                     const auto count = std::min(per_tile, job.pages.size() - begin);
-                    auto& slot = acquire_ring();
+                    RingLease lease(*this, writeback_stream);
+                    auto& slot = lease.slot();
                     pool_copy(job, plane, begin, count, slot.memory->data());
-                    CUDA_CHECK(cudaEventRecord(slot.done, stream));
+                    CUDA_CHECK(cudaEventRecord(slot.done, writeback_stream));
                     slot.used = true;
                     CUDA_CHECK(cudaEventSynchronize(slot.done));
                     std::memcpy(job.destinations[plane].data() + begin * page_bytes,
@@ -216,11 +278,13 @@ struct HostKVTransferEngine::Impl {
                 }
             }
         }
-        CUDA_CHECK(cudaEventRecord(writeback_done[job.layer], stream));
+        CUDA_CHECK(cudaEventRecord(writeback_done[job.layer], writeback_stream));
         CUDA_CHECK(cudaEventSynchronize(writeback_done[job.layer]));
         job.completion->set_value();
     }
-    void run(const std::shared_ptr<std::promise<void>>& started) noexcept {
+    void run(const std::shared_ptr<std::promise<void>>& started, bool writebacks) noexcept {
+        auto& queue = writebacks ? writeback_jobs : jobs;
+        auto& busy = writebacks ? writeback_active : active;
         try { CUDA_CHECK(cudaSetDevice(device)); started->set_value(); }
         catch (...) {
             { std::lock_guard lock(mutex); error = std::current_exception(); }
@@ -232,40 +296,44 @@ struct HostKVTransferEngine::Impl {
             Job job;
             {
                 std::unique_lock lock(mutex);
-                changed.wait(lock, [&] { return stopping || !jobs.empty(); });
-                if (jobs.empty()) { if (stopping) { return; } continue; }
-                job = std::move(jobs.front());
-                jobs.pop_front();
-                active = true;
+                changed.wait(lock, [&] { return error || stopping || !queue.empty(); });
+                if (error) { return; }
+                if (queue.empty()) { if (stopping) { return; } continue; }
+                job = std::move(queue.front());
+                queue.pop_front();
+                busy = true;
             }
             try {
                 if (job.writeback) { process_writeback(job); }
                 else { process_prefetch(job); }
             } catch (...) {
                 const auto failure = std::current_exception();
-                (void)cudaStreamSynchronize(stream);
+                (void)cudaStreamSynchronize(writebacks ? writeback_stream : stream);
                 std::lock_guard lock(mutex);
-                error = failure;
+                if (!error) { error = failure; }
                 if (job.completion) { job.completion->set_exception(failure); }
-                for (auto& queued : jobs) {
-                    if (queued.completion) { queued.completion->set_exception(failure); }
+                for (auto* pending : {&jobs, &writeback_jobs}) {
+                    for (auto& queued : *pending) {
+                        if (queued.completion) { queued.completion->set_exception(failure); }
+                    }
+                    pending->clear();
                 }
-                jobs.clear();
-                active = false;
+                busy = false;
                 changed.notify_all();
                 return;
             }
-            { std::lock_guard lock(mutex); active = false; }
+            { std::lock_guard lock(mutex); busy = false; }
             changed.notify_all();
         }
     }
     void synchronize() {
         {
             std::unique_lock lock(mutex);
-            changed.wait(lock, [&] { return error || (!active && jobs.empty()); });
+            changed.wait(lock, [&] { return error || (!active && !writeback_active && jobs.empty() && writeback_jobs.empty()); });
             check_error();
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaStreamSynchronize(writeback_stream));
         for (std::size_t i = 0; i < slots.size(); ++i) {
             if (slots[i].released) { CUDA_CHECK(cudaEventSynchronize(consumed[i])); }
             else if (slots[i].waited) { CUDA_CHECK(cudaStreamSynchronize(slots[i].consumer)); }
@@ -287,7 +355,7 @@ HostKVTransferEngine::HostKVTransferEngine(HostKVArchive& archive, DeviceSpan st
     try { impl_->initialize(); }
     catch (...) { archive_.detach_transfer_owner(this); throw; }
     std::clog << "[kvmem] stage_bytes=" << plan.capacity_bytes
-              << " copy_workers=1 pinned_ring_bytes=" << pinned_ring_bytes() << '\n';
+              << " copy_workers=2 pinned_ring_bytes=" << pinned_ring_bytes() << '\n';
 }
 HostKVTransferEngine::~HostKVTransferEngine() {
     // Impl joins queued jobs and drains DMA/consumer events before freeing its ring.
@@ -398,8 +466,8 @@ std::shared_future<void> HostKVTransferEngine::writeback(
             throw std::invalid_argument("KV writeback physical page outside pool");
         }
     }
-    // FIFO worker + one staging stream place this write after earlier archive reads.
-    // The producer event orders device KV writes without a whole-layer CPU wait.
+    // Fence earlier H2D archive readers before the separate D2H stream overwrites
+    // their source bytes. Unrelated later prefetches remain independent.
     Impl::Job job;
     job.writeback = true;
     job.layer = layer;
@@ -413,7 +481,19 @@ std::shared_future<void> HostKVTransferEngine::writeback(
         CUDA_CHECK(cudaEventRecord(impl_->producer_ready[layer], producer));
         std::lock_guard lock(impl_->mutex);
         impl_->check_error();
-        impl_->jobs.push_back(std::move(job));
+        for (std::size_t i = 0; i < impl_->slots.size(); ++i) {
+            if (impl_->slots[i].sequence && (job.dependencies.empty() ||
+                impl_->slots[i].sequence > impl_->slots[job.dependencies[0]].sequence)) {
+                job.dependencies.assign(1, i);
+            }
+        }
+        // H2D is FIFO: its last prior ready event fences every earlier archive
+        // read, even if that read's ticket slot has since been reused. Later
+        // prefetches have no dependency on this writeback or its producer.
+        impl_->writeback_jobs.push_back(std::move(job));
+        for (auto dependency : impl_->writeback_jobs.back().dependencies) {
+            ++impl_->slots[dependency].references;
+        }
         impl_->changed.notify_all();
     } catch (...) {
         if (job.completion) { job.completion->set_exception(std::current_exception()); }

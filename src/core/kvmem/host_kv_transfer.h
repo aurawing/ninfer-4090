@@ -21,7 +21,7 @@ struct HostKVTransferTicket {
     std::uint64_t archive_generation = 0;
 };
 
-// Serialized C=1 scheduling; one copy worker, one nonblocking staging stream.
+// Serialized C=1 scheduling; two copy workers, independent nonblocking H2D/D2H streams.
 // Archive and caller-owned workspace/consumer streams must outlive this owner.
 // Each prefetch covers <=64 MiB; callers tile larger planes in logical order.
 class HostKVTransferEngine {
@@ -39,6 +39,8 @@ public:
     [[nodiscard]] DeviceSpan staged(HostKVTransferTicket ticket);
     // Record after the consuming kernel(s); protects the range and event slot from reuse.
     void release(HostKVTransferTicket ticket, cudaStream_t consumer_stream);
+    // The pool and producer stream must remain alive, and the source device
+    // bytes must remain unchanged, until the returned future completes.
     [[nodiscard]] std::shared_future<void> writeback(
         const PagedKVPool& pool, std::size_t layer, std::uint32_t first,
         std::span<const std::int32_t> physical_pages, std::uint32_t new_frontier,
