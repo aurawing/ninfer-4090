@@ -8,5 +8,7 @@ void gqa_partial_launch(bool prefill, const Tensor& q, const Tensor& positions, 
                         std::int32_t splits, AttentionPartial& partial, cudaStream_t stream);
 void partial_lse_merge_launch(const AttentionPartial& input, AttentionPartial& output,
                               cudaStream_t stream);
+void partial_lse_accumulate_launch(const AttentionPartial& input, AttentionPartial& state,
+                                   bool reset, cudaStream_t stream, Tensor* final_output);
 void partial_finalize_launch(const AttentionPartial& input, Tensor& output, cudaStream_t stream);
 } // namespace ninfer::ops::detail

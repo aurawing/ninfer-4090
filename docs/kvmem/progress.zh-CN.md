@@ -260,6 +260,98 @@ $env:NINFER_TEST_VISION_GGUF = 'D:\deeplearning\kvmem-v0.16.0-rc3-windows-x86_64
 & $ctest --test-dir build-vision-integration --output-on-failure -j 4
 ```
 
+### 审阅后：同步修复合回指定分支（2026-10-01）
+
+按本轮授权只更新默认分支、CPU 视觉分支及后续工作的 `feat/kvmem`。`81869152` 无冲突 cherry-pick 到 `feat/rtx-4090-sm89-native`，新提交 **`c3d228ea`**；`fix/i8-small-t-attn-sync` 用 `--no-ff` 合并进 `feat/vision-cpu-ggml`，合并提交 **`333f68d0`**。两条分支均在各自完整构建及全量 CTest 通过后 push，其他分支未更新。
+
+| 分支 / 提交 | CTest 总数 | 通过 | 跳过 | 失败 | 全量测试用时 |
+|---|---:|---:|---:|---:|---:|
+| `feat/rtx-4090-sm89-native` / `c3d228ea` | 85 | 81 | 4 | 0 | 44.73 s |
+| `feat/vision-cpu-ggml` / `333f68d0` | 97 | 93 | 4 | 0 | 61.63 s |
+
+四项跳过仍是缺少其他真实模型制品的 prefix / 35B / DFlash 测试，不作为已通过。主线首次构建遇到旧版 XGrammar UTF-8 字符串被 MSVC 按 CP936 解析的问题，仅在本地 CMake cache 的 `CMAKE_CXX_FLAGS` 增加 `/utf-8` 后完整重建，未改源码或提交构建配置。视觉分支的私有 GGML 补丁哈希因 Git checkout 的 CRLF 与原缓存 LF 不同而被拒绝；仅将本地补丁脚本恢复为缓存对应的 LF 字节（SHA-256 `8319b456b2b4ec75818eb2507bd056c07482a7f0ed95e2c8a36393ddd09c01e2`），Git 没有内容差异，再完整构建通过。构建与测试顺序执行，未并发重链接测试二进制。
+
+证据保存在仓库外 **`D:\deeplearning\NInfer\logs\kvmem-stage3-optimization`**：`main-sync-build.log`（首次失败）、`main-sync-build-utf8.log`（完整构建成功）、`main-sync-ctest.log`；`vision-sync-build.log`（缓存校验失败）、`vision-sync-build-lf.log`（完整构建成功）、`vision-sync-ctest.log`。两个分支上的生产 dense 变更均仅为原定的两处 CTA 同步。
+
+### 波动来源收尾：Q5 residual 单 split（2026-10-01，临时代码已撤回）
+
+正常修复版 CLI 构建完成后，从 **02:49:26 UTC** 开始仅临时将 `launch_residual_exact` 的 `kSplits=2` 改为 **1**，加真实分块与最后 prefill logits 的诊断读回；没有改 W8、其他 dense 算子或分派。固定 `prompt-512.json`，不带视觉、MTP 关闭、`--no-cuda-graph --greedy --no-thinking --kv-dtype rk4v4-e8 --prefill-chunk 1024 --max-context 32768 --kv-capacity 32768 --max-new 1`。两次均保留 checkpoint 的 **`[0,508)、[508,512)`** 分块。
+
+结果：两次完整 **248320 个 BF16 logits 逐位相同**，含有效 248077 项；不同项 **0**，相对 L2 **0**，top-1 均为 **ID 16**。对比上一轮相同配置下 Q5 split2 的 246134/248077 个有效项不同、相对 L2 0.1248612403，此结果支持 **Q5 residual 原子累加是此最小用例在注意力同步修复后剩下的波动来源**。关闭 MTP 的路径未执行 W8 的 MTP split launch；Q5 split2 向已有 residual 添加两份 BF16 部分和，三个项的舍入顺序可变，split1 后只有一份残差写回。两次运行的结论不推广为所有长度与 MTP 场景都已证明唯一来源，也不把原子求和顺序波动改称同步正确性 bug。
+
+到 **02:51:34 UTC** 已撤回 Q5、target 诊断钩子和临时头文件，总计约 **2 分 8 秒**，低于 15 分钟限时；源码检查仅进度文档有改动。没有提交临时代码，Q5 的原生产设置保持 split2。数据位于上述外部目录的 `q5-single-split-512/`：双份 `.logits/.chunks/.stdout.txt/.stderr.txt`、完整命令与统计 `summary.json`、临时二进制及 SHA-256 `evidence.json`；构建和执行日志为 `q5-single-probe-build.log`、`q5-single-probe-run.log`。
+
+### 新部分注意力性能优化（2026-10-01，主基准达标；profile 与扩展限制待审阅）
+
+限时起点 **2026-10-01 02:52:31 UTC**，保守按连续 48 小时在 **2026-10-03 02:52:31 UTC** 截止。约 5 小时内完成 12 轮候选、最终复测及全量验证。只修改新 partial/LSE API、kernel、launcher、独立测试和 benchmark，dense 内核、codec helper、分派及 target 运行时没有变化，不开始第 4 步。全部日志、原版/候选二进制、工具与测量留在仓库外 **`D:\deeplearning\NInfer\logs\kvmem-stage3-optimization`**。
+
+**Profile 未完成。** Nsight Compute 2026.2.1 对原版 INT8 dense、T1024/131072 keys 的实际 profile 退出 1，报 **ERR_NVGPUCTRPERM**；metrics 查询及仅 LaunchStats 同样受限。最终复查 `ncu-accepted-permission-recheck.txt` 仍为同一错误，注意 query 返回 0 也不能表示拿到了数据。一次只读管理员启动在 Windows UAC 被取消，未启动管理员进程、未更改全局设置，不重试提权。GPU 性能计数器权限待用户开启；**没有 tensor 管线利用率、共享 bank conflicts、实际 occupancy 或 DRAM 流量报告**，本项不能算完成。旧版和最终 benchmark 已保留，权限就绪后可补同配置 before/after。
+
+**源码/编译证据的归因，尚非硬件 profile。** 原量化 prefill 是每 CTA 的 10 token×6 head（60 行），现在为单 Q head 的 64 行/64 key，与 dense 相同深度的异步 K/V 流水线、query-tile-major 栅格。不能把 10→64 误解为 K/V 复用增加 6.4 倍：原 CTA 已复用六个 head。新路径减少逐 key 元数据/掩码处理，P fragment 跨 D slice 复用，全因果/边界 producer 共用一个 PV/预取消费端，rk4 的 FP32 逆 H64 融入 epilogue；低 split 显著减少 partial 写出和 merge 流量。编译资源为 prefill 16 warp、128 寄存器、26880 B 静态 +65536 B 动态共享；与 dense 的 92672 B 很接近，两者的资源上限均为一 CTA/SM，不能仅由 theoretical occupancy 解释原性能差距。仍有寄存器 spill，未用 profile 证明它的动态成本。
+
+官方 CUDA 13.3.73 portable cuobjdump/nvdisasm 经 SHA-256 校验，仅用于离线反汇编。T4 RK4 从 batch8 到 batch11 的静态指令数 **5522→4461**、PRMT **218→40**、HMMA **64→32**；这是代码消除/向量打包的编译证据，不是动态执行次数。早期标量 nibble 写入已被编译器向量化为 STS.128，所以不把 i4x16 改动的收益错误归因于 store 事务减少。证据为 `common-pv-batch11-build.log`、`batch*-rk4-t4-13.sass.txt`、`rk4-t4-static-sass-summary.json`。
+
+**最终单 pass 主基准。** 真实 PageMajor four-plane INT8 **264 MiB**、rk4 **136 MiB**，131072 key，全部位于 staging；同一 Q/KV 字节、同一因果位置，CUDA event/eager，5 次预热。split **1、2、4、8、16、32** 重新扫描，3 格式×5 个 T×6 个 split 共 **90 行**（`accepted-split-sweep.csv`）。参数在最终三轮之前固定：量化大 T 用 S=1；T4 INT8 S=32、rk4 S=64。T4 每轮 600 次、大 T 每轮 40 次；每组 dense 在新路径前后各测一次，最终 18 行全部保留，dense 前后最大漂移 **1.753%**，没有因速度不理想剔除轮次。以下为三次中位数及最差比例，整体含 partial、固定 LSE fold 和 BF16 输出；比例是各轮比例的中位数，不要求等于两个耗时中位数之比。
+
+| 格式 | T | split | dense ms | 新整体 ms | 新/dense 中位数 | 最差轮比例 | scratch+state MiB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| int8 | 4 | 32 | 0.342281 | 0.326313 | 0.953535 | 0.953642 | 3.117920 |
+| int8 | 1024 | 1 | 22.638400 | 20.964600 | 0.924420 | 0.930262 | 48.375000 |
+| int8 | 2048 | 1 | 45.578900 | 42.169700 | 0.921302 | 0.927111 | 96.750000 |
+| rk4v4-e8 | 4 | 64 | 0.249395 | 0.226442 | 0.908830 | 0.910526 | 6.141357 |
+| rk4v4-e8 | 1024 | 1 | 26.494100 | 23.958300 | 0.904088 | 0.904770 | 48.375000 |
+| rk4v4-e8 | 2048 | 1 | 52.963200 | 47.088800 | 0.888386 | 0.889262 | 96.750000 |
+
+**六项均三次达标**：T1024/2048 ≤1.10；T4 ≤1.05。这里是一个全注意力层的计算微基准，不含 H2D/归档/GDN/模型；没有据此宣称整模型 prefill 或 tok/s 已通过门禁。原数据和失败候选均保留，不采用已发现错误的 FMA 候选速度。
+
+**BF16 对原实现的配对复测。** 注意力主体不改，固定原来的 T4/S32、T1024/S2、T2048/S1；旧、新交替执行三轮，第二轮反向排序，计时次数与上表相同。T2048 原始中位数比例有约 **+0.078%** 的差别，dense 归一化后约 **-0.014%**，没有可分辨的性能退步；不把计时噪声说成严格每次都更快。BF16 本身的大 T 相对 dense 仍约 2 倍，本轮并未承诺把它优化到量化目标。
+
+| T | 旧整体 ms 中位数 | 新整体 ms 中位数 | 配对新/旧比例中位数 | 配对 dense 归一化比例中位数 |
+|---|---:|---:|---:|---:|
+| 4 | 0.627442 | 0.624242 | 0.994919 | 0.994387 |
+| 1024 | 47.734900 | 47.565200 | 0.998347 | 0.999341 |
+| 2048 | 95.532300 | 95.601700 | 1.000782 | 0.999862 |
+
+**FP32 carry 与加载期预算。** `attention_partial_lse_accumulate()` 用唯一 FP32 `(O,m,l)` state 加当前 S 份 scratch；reset 不读旧 state，之后总是 prior-first，再升序 split，空 pass 保持已生成状态的位模式。末次可融合 BF16 finalize。权重 exp 独立并行，最大值扫描、分母/O 求和仍固定顺序；三处 CTA barrier 保护共享暂存，容量 parts+3，不依赖 DMA 完成顺序。没有为每个 pass 留一份 partial，也没有浮点原子。无分配的 `plan_attention_partial_workspace()` 先按预算与 launch 域降低 preferred split，再验证实际容量；预算为 **258×24×T×(S+1)×4 B**。T1024/S1 **48.375 MiB**、S2 **72.5625 MiB**、S3 **96.75 MiB**；T2048/S1 **96.75 MiB**。第 4 步才由 `build_workspace_plan()` 与视图/staging/输出统一预算。
+
+**多 pass 扩展及未达标项。** 保持总 key 数不变，按逻辑顺序分成 2/4 段，复用上述 scratch/state，计时含每次 fold 与最后输出（`accepted-multipass-2/4.csv`）：
+
+| 格式 | T | 两 pass 整体/dense | 四 pass 整体/dense |
+|---|---:|---:|---:|
+| int8 | 4 | 1.035370 | 1.134190 |
+| int8 | 1024 | 0.927295 | 0.945993 |
+| int8 | 2048 | 0.927823 | 0.945296 |
+| rk4v4-e8 | 4 | 1.031430 | 1.201420 |
+| rk4v4-e8 | 1024 | 0.905230 | 0.911093 |
+| rk4v4-e8 | 2048 | 0.893607 | 0.906319 |
+
+两 pass 的 T4 ≤1.05，四 pass 的大 T ≤1.10；**四 pass T4 的 INT8 1.134190、rk4 1.201420 未达到 1.05**。额外 launch、重复 Q/旋转处理与逐 pass fold 是源码/计时所示候选开销，未拿到硬件 profile，不能量化各项占比。单 pass 六项达标不代表任意 pass 数都达标；在第 4 步采用多遍 small-T 前需审阅这项限制。本轮保留正确确定性，不删概率残差、不降低精度或改 dense 以凑速度；停在审阅点。
+
+**独立数值与正确性。** 原 36 例完整保留，新增 T64/65 producer/tile 边界 6 例、巨大有限公共 logits 12 例、穷举全部 256 packed byte 的 6 例，共 **60 个 FP64 用例**。raw FP32 O/m/l、最终 BF16 和 carry 重复运行逐位一致，原 oracle `relL2≤1/256`、多 pass 对单次 `relL2≤1e-3` 与 gross 阈值不变。各格式 oracle 最大相对 L2 为 BF16 **0.00166783337**、INT8 **0.00187258759**、rk4 **0.00169578062**；carry 对单次 FP32 的最大相对 L2 为 **2.32439e-6 / 1.84725e-4 / 1.42141e-4**。融合输出另直接对独立 FP64，合并的 reset=false、中性 NaN payload、空 pass 字节不变和融合/独立输出均覆盖。
+
+一次候选 FMA 概率写法在巨大公共 logits 上被只读审阅发现风险，新增测试先在错误版本失败（`large-logits-red-test.log`，relL2=1/非有限），再仅在新内核用 `__fsub_rn` 后 `__fmul_rn` 修正；无放宽判据。预算降低 split 的边界问题也先以 `budget-cap-red-test.log` 复现。只读终审确认 i4x16 sign/PRMT/对齐、BF16 pair 舍入、PV 共享生命周期及固定顺序 LSE，无必须修问题。
+
+每轮改动后均重跑 FP64/重复检查与 compute-sanitizer **13.0.85** 三项，失败性能候选撤回。最终 `batch12-oracle.log` / `batch12-gqa.log` 退出 **0**；racecheck **0 hazards / 0 errors / 0 warnings**，synccheck/initcheck 各 **0 errors**。恢复 `NINFER_BUILD_BENCHMARKS=OFF` 后完整 product 构建退出 **0**；全量 CTest **100 项，96 通过、4 因缺少其他真实模型制品跳过、0 失败，69.04 s**（`accepted-full-build.log`、`accepted-full-ctest.log`）。跳过不算已通过。所有临时 Q5/诊断代码已撤回，性能代码按授权单独提交到 `feat/kvmem` 并 push，不接线第 4 步。
+
+复现脚本均在外部数据目录：`run-batch12.ps1`（60 例/旧 GQA/sanitizer/候选计时）、`run-accepted-benchmarks.ps1`（90 行扫描、固定三轮、2/4 pass、BF16 旧新配对）、`summarize-accepted.py`（统计）、`run-accepted-full-checks.ps1`（恢复产品配置/完整构建/全量 CTest）。例如 repo 下加载 x64 VsDevCmd 后：
+
+```powershell
+$data = 'D:\deeplearning\NInfer\logs\kvmem-stage3-optimization'
+$env:PATH = 'D:\deeplearning\NInfer\runtime\ninfer-rtx4090-windows-x64-vision-modes-v3;' + $env:PATH
+$env:NINFER_OP_REPORT_STATS = '1'
+$san = 'D:\deeplearning\NInfer\logs\kvmem-stage0-baseline\sanitizer-tools\cuda_sanitizer_api-windows-x86_64-13.0.85-archive\compute-sanitizer\compute-sanitizer.exe'
+foreach ($check in @('racecheck', 'synccheck', 'initcheck')) {
+    & $san --tool $check --error-exitcode 99 --log-file "$data\batch12-$check.log" `
+        '.\build-vision-integration\tests\test_attention_partial_lse_merge.exe' `
+        *> "$data\batch12-$check-stdout.log"
+    if ($LASTEXITCODE -ne 0) { throw "$check failed: $LASTEXITCODE" }
+}
+# benchmark 需先打开 NINFER_BUILD_BENCHMARKS，测量完成后恢复 OFF；步骤不可并发。
+& '.\build-vision-integration\bench\ninfer_attention_partial_bench.exe' `
+    --format int8 --tokens 1024 --splits 1 --repeats 40
+# --passes 2/4 复用 state，整体计时包含所有 fold；默认 passes=1。
+```
+
 ## 阶段 4：稀疏 decode
 
 - 状态：未开始

@@ -41,6 +41,14 @@
 
 第 3 步已实现独立只读算子：`gqa_attention_partial_prefill/decode()` 接收 resident/staging 两组 PageMajor plane、访问列表、由 `attention_access_prefix()` 生成的 key 前缀和及 frontier；输出 FP32 未归一化 `(O,m,l)`，`attention_partial_lse_merge()` 固定按输入 part 升序合并，`attention_partial_finalize()` 最后归一化为 BF16。rk4v4-e8 的部分 O 在 FP32 上逆 H64 后才合并。Q scale、概率和概率低位残差均有独立共享存储，不沿用旧 small-T 的清零竞争或 scale/P alias。空列表用空 Tensor 与单个零 prefix 表示；空 split 是中性状态。列表每页完整、仅 frontier 末页可短，因此 compact ordinal 直接查列表条目；绝对位置仍读原始 logical_page。具体 API 形状、上限、独立 FP64 oracle、重复确定性、sanitizer 和 264 MiB 微基准见 progress 第 3 步。
 
+性能优化后的量化 prefill 使用每个 Q head 的 64-query / 64-key tile、query-tile-major 栅格及与 dense 同深度的异步 K/V 流水线；BF16 注意力主体保持原实现。整页访问只读一次 logical/physical 映射，全因果 tile 与末页/因果边界分别实例化。rk4v4-e8 的逆 H64 融入 FP32 epilogue；Q scale 仍独立暂存并有明确 CTA 同步。概率必须先显式减去本 tile 的最大 score，再乘 scale，避免巨大有限公共 logits 在融合乘加时发生抵消误差。
+
+跨 pass 不保留各遍的全部 partial：`attention_partial_lse_accumulate()` 把当前 S 个 split 固定按升序折叠进唯一的 FP32 `(O,m,l)` state，已有 state 总是第一项；首遍 reset 不读取旧字节，空遍保持已生成 state 的位模式。末遍可同时输出 BF16，省去独立 finalize launch；普通 out-of-place merge/finalize API 仍保留。split 权重的 exp 可以独立并行计算，但最大值扫描、prior-first 和 split 升序求和保持固定；共享 maximum/denominator 的复用必须经过 CTA barrier，不能按传输到达顺序归并。调用方在执行流上按固定 pass 编号串行调用，传输完成顺序不能改变折叠顺序。
+
+`plan_attention_partial_workspace(max_tokens, preferred_splits, byte_budget)` 是无分配的加载期规划接口：预算只包含当前 pass scratch 与一份 state，按 `258 × 24 × T × (S+1) × sizeof(float)` 计算，与 pass 总数无关；preferred split 超预算就降低，连 S=1 都放不下则明确报错。100 MiB 预算下 T1024 最多 S=3（96.75 MiB），S=1/2 为48.375/72.5625 MiB；T2048 只能 S=1（96.75 MiB）。第 4 步再由 `build_workspace_plan()` 把该结果与输出、列表、设备 staging 和驻留视图统一预算，本步不接入目标运行时。
+
+最终计算微基准的单 pass 六项（INT8/rk4，T4/1024/2048）三次均达到对应 1.05/1.10 目标；量化大 T 选择 S=1。两 pass T4 也在 1.05 内，四 pass T4 仍约 1.134/1.201 倍，不能推广为任意划分都达标。BF16 与原版配对无可分辨退步。真实流式 H2D/模型吞吐与影子门禁仍留给第 4 步；Nsight Compute 目前受计数器权限限制，硬件 profile 未完成，具体数据/限制见 progress。
+
 当前 launcher 由调用方传入固定 split 数，再按实际可见 key 前缀划分。第 4 步在加载期结合 query 子块、视图和 staging 预算选 split，不能由 DMA 完成先后选择，也不能直接沿用 benchmark 的大 workspace。尚未新增产品参数、视图状态机或整模型影子接线；README 门禁 A/B 留在接线后的验证。
 
 ## 4. frontier、trim、restore 与 checkpoint

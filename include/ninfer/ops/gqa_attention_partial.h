@@ -10,6 +10,7 @@ struct AttentionPageAccess {
     std::int32_t logical_page;
     std::int32_t physical_page;
 };
+
 static_assert(sizeof(AttentionPageAccess) == 2 * sizeof(std::int32_t));
 
 // Boundary-time validation; original logical IDs must be strictly increasing.
@@ -31,7 +32,7 @@ struct AttentionPartial {
 // lists (pages = Tensor{}, prefix = I32 [1] containing zero) and splits are
 // neutral: O=0,m=-inf,l=0. An empty physical pool has null code/scale tensors.
 // All nonempty cache planes are PageMajor. Prefill T <= 655350, decode T <= 16;
-// 96*T*parts <= INT32_MAX bounds the inverse-rotation CUDA grid.
+// The conservative launch-capacity limit 96*T*parts <= INT32_MAX is retained.
 // A pass may contain any sorted subset; covering each key exactly once across
 // passes is the caller's responsibility. No cache mutation or ownership occurs.
 // Output parts == splits (1..512). Splits depend on actual visible key prefix
@@ -58,6 +59,28 @@ void gqa_attention_partial_decode(const Tensor& q, const Tensor& positions, floa
 // BF16 rounding. Neutral parts are ignored, including their O payload.
 void attention_partial_lse_merge(const AttentionPartial& input, AttentionPartial& output,
                                  cudaStream_t stream);
+// Fold the current pass into one persistent FP32 state. A reset ignores prior
+// state bytes; otherwise prior state is the first term, followed by ascending
+// split ID. Scratch/state must be disjoint. Neutral passes preserve state bits.
+// Optional final_output fuses the last normalization into the merge, leaving
+// the persistent state in FP32. It must be BF16 [256,24,T] and disjoint.
+void attention_partial_lse_accumulate(const AttentionPartial& input, AttentionPartial& state,
+                                      bool reset, cudaStream_t stream,
+                                      Tensor* final_output = nullptr);
+// Loading-time budget: current split scratch plus one persistent state; no
+// allocation here and no factor for the number of streamed passes.
+[[nodiscard]] std::size_t attention_partial_workspace_bytes(int tokens, int splits);
+
+struct AttentionPartialWorkspacePlan {
+    std::int32_t splits;
+    std::size_t bytes;
+};
+
+// Loading-time selection only: cap preferred_splits to scratch+state budget,
+// fail if even one split cannot fit. Never depend on transfer arrival order.
+[[nodiscard]] AttentionPartialWorkspacePlan
+plan_attention_partial_workspace(int max_tokens, int preferred_splits, std::size_t byte_budget);
+
 void attention_partial_finalize(const AttentionPartial& input, Tensor& output,
                                 cudaStream_t stream); // BF16 [256,24,T]
 

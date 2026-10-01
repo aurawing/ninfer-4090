@@ -4,15 +4,18 @@
 
 namespace ninfer::test::partial_attention_reference {
 using namespace ninfer::test::attention_reference;
+
 struct Parts {
     DeviceBuffer o, m, l;
     ops::AttentionPartial tensors;
+
     Parts(int tokens, int parts)
         : o(std::size_t(256) * 24 * tokens * parts * 4), m(std::size_t(24) * tokens * parts * 4),
           l(m.bytes), tensors{Tensor(o.p, DType::FP32, {256, 24, tokens, parts}),
                               Tensor(m.p, DType::FP32, {24, tokens, parts}),
                               Tensor(l.p, DType::FP32, {24, tokens, parts})} {}
 };
+
 inline int run(Format format, int tokens, int splits, bool prefill, int scenario = 0,
                bool multipass = false, int pool_mode = 0) {
     EncodedCache host(format, 512);
@@ -24,60 +27,56 @@ inline int run(Format format, int tokens, int splits, bool prefill, int scenario
                 for (int which = 0; which < 2; ++which)
                     for (int g = 0; g < 4; ++g) {
                         const int shift = (key / 64 + h + g + key % 3 + which) % 3 - 1;
-                        auto& scales = which ? host.vs : host.ks;
-                        auto& values = which ? host.decoded_v : host.decoded_k;
+                        auto& scales    = which ? host.vs : host.ks;
+                        auto& values    = which ? host.decoded_v : host.decoded_k;
                         scales[page_index(4, key / 64, h, key % 64, g)] = std::uint16_t(
                             (format == Format::Int8 ? 0x2400 : 0x2800) + shift * 1024);
                         for (int d = g * 64; d < (g + 1) * 64; ++d)
                             values[d + 256 * (h + 4 * key)] *= std::ldexp(1.0, shift);
                     }
     auto dk = to_device(host.k), dv = to_device(host.v), dks = to_device(host.ks),
-         dvs = to_device(host.vs);
+         dvs  = to_device(host.vs);
     auto view = [&](int first, int count) {
         const bool bf16 = format == Format::Bf16, packed = format == Format::Rk4v4E8;
         const auto bytes = std::size_t(host.code_dim) * 64 * 4 * (bf16 ? 2 : 1);
         PagedKVLayerView v;
         if (count) {
-            v.k_pages = Tensor(static_cast<std::byte*>(dk.p) + first * bytes,
-                               bf16 ? DType::BF16 : (packed ? DType::U8 : DType::I8),
-                               {host.code_dim, 64, 4, count});
-            v.v_pages = Tensor(static_cast<std::byte*>(dv.p) + first * bytes, v.k_pages.dtype,
-                               {host.code_dim, 64, 4, count});
+            v.k_pages       = Tensor(static_cast<std::byte*>(dk.p) + first * bytes,
+                                     bf16 ? DType::BF16 : (packed ? DType::U8 : DType::I8),
+                                     {host.code_dim, 64, 4, count});
+            v.v_pages       = Tensor(static_cast<std::byte*>(dv.p) + first * bytes, v.k_pages.dtype,
+                                     {host.code_dim, 64, 4, count});
             v.k_scale_pages = Tensor(static_cast<std::uint16_t*>(dks.p) + first * 64 * 4 * 4,
                                      DType::FP16, {4, 64, 4, count});
             v.v_scale_pages = Tensor(static_cast<std::uint16_t*>(dvs.p) + first * 64 * 4 * 4,
                                      DType::FP16, {4, 64, 4, count});
         }
-        v.head_dim = 256;
+        v.head_dim     = 256;
         v.num_kv_heads = 4;
-        v.dtype = bf16 ? DType::BF16 : DType::I8;
-        v.quant_group = bf16 ? 0 : 64;
+        v.dtype        = bf16 ? DType::BF16 : DType::I8;
+        v.quant_group  = bf16 ? 0 : 64;
         v.packed_k = v.packed_v = v.rotate_k = v.rotate_v = v.e8_lattice = packed;
         return v;
     };
     const int resident_count = pool_mode == 1 ? 8 : (pool_mode == 2 ? 0 : 4);
     auto resident = view(0, resident_count), staging = view(resident_count, 8 - resident_count);
     std::vector<ops::AttentionPageAccess> pages{{0, 3}, {2, 7}, {100, 0}, {2998, 6}, {3000, 4}};
-    if (scenario == 2)
-        pages.clear();
-    if (scenario == 3)
-        pages = {{3000, 4}};
+    if (scenario == 2) pages.clear();
+    if (scenario == 3) pages = {{3000, 4}};
     constexpr int frontier = 192013;
     auto prefix = ops::attention_access_prefix(pages, frontier, resident_count, 8 - resident_count);
     auto da = to_device(pages), df = to_device(prefix);
     const auto q = queries(tokens);
-    auto dq = to_device(q);
+    auto dq      = to_device(q);
     std::vector<std::int32_t> positions(tokens);
     std::iota(positions.begin(), positions.end(), frontier - tokens);
     if (scenario == 1) {
         const int boundaries[]{0,   1,   31,   62,   63,     64,     65,     127,
                                128, 129, 6399, 6400, 191872, 192000, 192004, 192012};
-        if (tokens != 16)
-            throw std::invalid_argument("boundary fixture needs T=16");
+        if (tokens != 16) throw std::invalid_argument("boundary fixture needs T=16");
         std::copy(std::begin(boundaries), std::end(boundaries), positions.begin());
     }
-    if (scenario == 3)
-        std::iota(positions.begin(), positions.end(), 0);
+    if (scenario == 3) std::iota(positions.begin(), positions.end(), 0);
     auto dp = to_device(positions);
     Tensor tq(dq.p, DType::BF16, {256, 24, tokens}), tp(dp.p, DType::I32, {tokens});
     Tensor ta = pages.empty() ? Tensor{} : Tensor(da.p, DType::I32, {2, int(pages.size())});
@@ -86,8 +85,7 @@ inline int run(Format format, int tokens, int splits, bool prefill, int scenario
     for (auto page : pages)
         for (int j = 0; j < 64; ++j) {
             const int pos = page.logical_page * 64 + j;
-            if (pos < frontier)
-                logical_positions[page.physical_page * 64 + j] = pos;
+            if (pos < frontier) logical_positions[page.physical_page * 64 + j] = pos;
         }
     const auto expected = oracle(host, q, positions, {}, logical_positions);
     Parts partial(tokens, splits), merged(tokens, 1);
@@ -121,7 +119,7 @@ inline int run(Format format, int tokens, int splits, bool prefill, int scenario
             return 1;
         }
         if (!repeat) {
-            first = actual;
+            first   = actual;
             first_o = a;
             first_m = b;
             first_l = c;
@@ -148,13 +146,19 @@ inline int run(Format format, int tokens, int splits, bool prefill, int scenario
     int failures = verify_reduction((label + " scenario=" + std::to_string(scenario)).c_str(), got,
                                     expected, {1.0 / 256, 1.1e-3, 3.9e-3});
     if (multipass) {
-        Parts pieces(tokens, splits * 3), streamed(tokens, 1);
-        std::vector<float> combined_first;
+        Parts pieces(tokens, splits * 3), streamed(tokens, 1), carry(tokens, 1);
+        DeviceBuffer carried_bf16(output.bytes), separately_finalized(output.bytes);
+        Tensor carry_out(carried_bf16.p, DType::BF16, {256, 24, tokens}),
+            separate_out(separately_finalized.p, DType::BF16, {256, 24, tokens});
+        std::vector<float> combined_first, carry_first_o, carry_first_m, carry_first_l;
         for (int repeat = 0; repeat < 2; ++repeat) {
+            carry.o.fill(255);
+            carry.m.fill(255);
+            carry.l.fill(255);
+            carried_bf16.fill(255);
             for (int pass = 0; pass < 3; ++pass) {
                 std::vector<ops::AttentionPageAccess> subset;
-                for (std::size_t i = pass; i < pages.size(); i += 3)
-                    subset.push_back(pages[i]);
+                for (std::size_t i = pass; i < pages.size(); i += 3) subset.push_back(pages[i]);
                 auto count = ops::attention_access_prefix(subset, frontier, resident_count,
                                                           8 - resident_count);
                 auto ds = to_device(subset), dc = to_device(count);
@@ -163,6 +167,33 @@ inline int run(Format format, int tokens, int splits, bool prefill, int scenario
                 Tensor tc(dc.p, DType::I32, {int(count.size())});
                 invoke(tq, tp, 0.0625f, resident, staging, ts, tc, frontier, splits,
                        partial.tensors, nullptr);
+                ops::attention_partial_lse_accumulate(partial.tensors, carry.tensors, pass == 0,
+                                                      nullptr, pass == 2 ? &carry_out : nullptr);
+                // An all-neutral pass must preserve every existing state bit,
+                // including -inf maxima and zeros for wholly masked rows.
+                cuda_synchronize();
+                const auto saved_o = from_device<float>(carry.o, carry.o.bytes / 4),
+                           saved_m = from_device<float>(carry.m, carry.m.bytes / 4),
+                           saved_l = from_device<float>(carry.l, carry.l.bytes / 4);
+                std::vector<float> neutral_o(partial.o.bytes / 4, 0),
+                    neutral_m(partial.m.bytes / 4, -std::numeric_limits<float>::infinity()),
+                    neutral_l(partial.l.bytes / 4, 0);
+                Parts neutral(tokens, splits);
+                neutral.o.copy_from_host(neutral_o.data(), neutral.o.bytes);
+                neutral.m.copy_from_host(neutral_m.data(), neutral.m.bytes);
+                neutral.l.copy_from_host(neutral_l.data(), neutral.l.bytes);
+                ops::attention_partial_lse_accumulate(neutral.tensors, carry.tensors, false,
+                                                      nullptr);
+                cuda_synchronize();
+                const auto after_o = from_device<float>(carry.o, carry.o.bytes / 4),
+                           after_m = from_device<float>(carry.m, carry.m.bytes / 4),
+                           after_l = from_device<float>(carry.l, carry.l.bytes / 4);
+                if (std::memcmp(saved_o.data(), after_o.data(), carry.o.bytes) ||
+                    std::memcmp(saved_m.data(), after_m.data(), carry.m.bytes) ||
+                    std::memcmp(saved_l.data(), after_l.data(), carry.l.bytes)) {
+                    std::cerr << "FAIL neutral carry changed state\n";
+                    ++failures;
+                }
                 for (auto buffers :
                      {std::pair{&partial.o, &pieces.o}, std::pair{&partial.m, &pieces.m},
                       std::pair{&partial.l, &pieces.l}})
@@ -172,6 +203,26 @@ inline int run(Format format, int tokens, int splits, bool prefill, int scenario
                                           cudaMemcpyDeviceToDevice),
                                "collect partial pass");
             }
+            cuda_synchronize();
+            ops::attention_partial_finalize(carry.tensors, separate_out, nullptr);
+            cuda_synchronize();
+            if (from_device<std::uint16_t>(carried_bf16, carried_bf16.bytes / 2) !=
+                from_device<std::uint16_t>(separately_finalized, separately_finalized.bytes / 2)) {
+                std::cerr << "FAIL fused carry finalization differs\n";
+                ++failures;
+            }
+            const auto carried_o = from_device<float>(carry.o, carry.o.bytes / 4),
+                       carried_m = from_device<float>(carry.m, carry.m.bytes / 4),
+                       carried_l = from_device<float>(carry.l, carry.l.bytes / 4);
+            if (repeat && (std::memcmp(carry_first_o.data(), carried_o.data(), carry.o.bytes) ||
+                           std::memcmp(carry_first_m.data(), carried_m.data(), carry.m.bytes) ||
+                           std::memcmp(carry_first_l.data(), carried_l.data(), carry.l.bytes))) {
+                std::cerr << "FAIL carry repeat mismatch\n";
+                ++failures;
+            }
+            carry_first_o = carried_o;
+            carry_first_m = carried_m;
+            carry_first_l = carried_l;
             ops::attention_partial_lse_merge(pieces.tensors, streamed.tensors, nullptr);
             ops::attention_partial_finalize(streamed.tensors, out, nullptr);
             cuda_synchronize();
@@ -195,6 +246,18 @@ inline int run(Format format, int tokens, int splits, bool prefill, int scenario
             one_fp32[i] = one_l[i / 256] > 0 ? one_o[i] / one_l[i / 256] : 0;
         failures += verify_reduction((label + " multipass-vs-single FP32").c_str(), streamed_fp32,
                                      one_fp32, {1e-3, 1e-4, 1e-3});
+        std::vector<double> carry_fp32(carry_first_o.size());
+        for (std::size_t i = 0; i < carry_fp32.size(); ++i)
+            carry_fp32[i] =
+                carry_first_l[i / 256] > 0 ? carry_first_o[i] / carry_first_l[i / 256] : 0;
+        failures += verify_reduction((label + " carry-vs-single FP32").c_str(), carry_fp32,
+                                     one_fp32, {1e-3, 1e-4, 1e-3});
+        const auto carry_bits = from_device<std::uint16_t>(carried_bf16, carried_bf16.bytes / 2);
+        std::vector<double> carried_values(carry_bits.size());
+        std::transform(carry_bits.begin(), carry_bits.end(), carried_values.begin(),
+                       [](auto x) { return double(bf16_to_f32(x)); });
+        failures += verify_reduction((label + " carry direct FP64 oracle").c_str(), carried_values,
+                                     expected, {1.0 / 256, 1.1e-3, 3.9e-3});
         output.copy_to_host(actual.data(), output.bytes);
         std::transform(actual.begin(), actual.end(), got.begin(),
                        [](auto x) { return double(bf16_to_f32(x)); });
