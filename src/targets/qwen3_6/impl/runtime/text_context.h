@@ -3,6 +3,7 @@
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
+#include "targets/qwen3_6/impl/runtime/tiered_context.h"
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -173,6 +174,7 @@ public:
     }
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
+    void set_tiered_context(qwen3_6::detail::TieredContext* owner) noexcept { tiered_ = owner; }
 
     void set_prefill_turn_checkpoint_frontier(std::int64_t position) noexcept {
         prefill_turn_checkpoint_frontier_ = position;
@@ -300,6 +302,7 @@ private:
     Tensor& prefill_hidden_;
     std::uint32_t prefill_chunk_;
     std::uint32_t text_kv_base_;
+    qwen3_6::detail::TieredContext* tiered_ = nullptr;
     const Tensor* active_cache_positions_                 = nullptr;
     const Tensor* active_rope_positions_                  = nullptr;
     const Tensor* active_kv_table_rows_                   = nullptr;

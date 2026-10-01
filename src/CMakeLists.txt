@@ -32,6 +32,7 @@ add_library(ninfer_core STATIC
   core/paged_kv_cache.cu
   core/kvmem/host_kv_archive.cpp
   core/kvmem/host_kv_transfer.cpp
+  core/kvmem/kv_view_table.cpp
   core/linear_attention_state.cpp
   core/layout.cpp
   core/tensor.cpp

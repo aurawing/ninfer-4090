@@ -46,6 +46,22 @@ bool rejects_vision_options(const std::vector<std::string>& flags) {
 
 int main() {
     int failures = 0;
+    const auto named_tiered = parse({"ninfer-serve", "model.ninfer", "--kv-mode", "tiered-exact",
+                                    "--kv-dtype", "int8", "--kvmem-view-tokens", "16384",
+                                    "--kvmem-sink-tokens", "0"});
+    failures += check(named_tiered.kv_mode == ninfer::KvMode::TieredExact &&
+                          named_tiered.kvmem.view_tokens == 16384 && named_tiered.kvmem.sink_tokens == 0,
+                      "server must preserve documented tiered view/sink options");
+    const auto tiered = accepts({"ninfer-serve", "model.ninfer", "--kv-mode", "tiered-exact",
+                                 "--kv-dtype", "int8", "--kvmem-view", "8192",
+                                 "--kvmem-host-archive", "pinned"});
+    failures += check(tiered && tiered->kv_mode == ninfer::KvMode::TieredExact &&
+                          tiered->kvmem.view_tokens == 8192 &&
+                          tiered->kvmem.host_archive == ninfer::HostKVArchiveMode::Pinned,
+                      "server tiered configuration was not preserved");
+    failures += check(!accepts({"ninfer-serve", "model.ninfer", "--kv-mode", "invalid"}) &&
+                          !accepts({"ninfer-serve", "model.ninfer", "--kvmem-host-archive", "invalid"}),
+                      "server accepted invalid tiered configuration");
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.vision_cpu_cache_mib == 128, "server CPU cache default mismatch");

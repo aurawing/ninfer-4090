@@ -97,14 +97,15 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_alignment    = 1;
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
-    base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    base->allow_prefix_reuse             = options.allow_prefix_reuse && !tiered;
     base->token_mask                     = options.token_mask;
     base->disable_speculation            = options.disable_speculation;
     const std::uint32_t reserved_context_tokens =
         base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
                                            ? 0U
                                            : base->summary.effective_output_tokens - 1U);
-    base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+    base->text_kv_page_entitlement = tiered && !tiered->shadow()
+                                       ? tiered->view_pages() : pages_for_tokens(reserved_context_tokens);
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
             capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
@@ -161,7 +162,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         base->vision_control         = std::move(control);
     }
 
-    if (prompt.identity.turn_rewrite_boundary) {
+    if (!tiered && prompt.identity.turn_rewrite_boundary) {
         const std::uint32_t candidate = *prompt.identity.turn_rewrite_boundary;
         if (candidate == 0 || candidate >= base->summary.prompt_tokens) {
             throw std::invalid_argument("turn rewrite boundary must lie inside the prompt");

@@ -207,7 +207,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                : 0),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
-      work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
+      work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
       round_host(sizeof(TokenId)),
       ordinary_host(
           plan.speculative_backend == SpeculativeBackend::None
@@ -325,6 +325,27 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     const auto yarn = compute_yarn_config(capacity);
     ops::set_text_rope_frequencies(yarn.inv_freq.data());
     device.synchronize();
+    if (workspace_plan.tiered) {
+        // Default-stream allocation/touch-fill must finish before nonblocking copy workers see it.
+        CUDA_CHECK(cudaDeviceSynchronize());
+        const DeviceSpan tiered_backing{
+            static_cast<std::byte*>(workspace_storage.base()) + workspace_plan.general_capacity,
+            workspace_plan.tiered->bytes};
+        tiered = std::make_unique<qwen3_6::detail::TieredContext>(
+            *workspace_plan.tiered, decoder->text_kv, tiered_backing, device.stream);
+        std::clog << "[kvmem] tiered-exact disables turn checkpoints and retained resume until stage 3 step 6\n";
+        if (kv_dtype == DType::BF16) {
+            std::clog << "[kvmem] BF16 tiered is functional only; large-T performance is not guaranteed\n";
+        }
+        std::clog << "[kvmem] main_view_bytes=" << text_kv_bytes
+                  << " mtp_dense_bytes=" << mtp_kv_bytes
+                  << " staging_bytes=" << workspace_plan.tiered->staging.capacity_bytes
+                  << " partial_bytes=" << workspace_plan.tiered->partial.bytes
+                  << " metadata_and_fixed_bytes="
+                  << workspace_plan.tiered->bytes - workspace_plan.tiered->staging.capacity_bytes
+                      - workspace_plan.tiered->partial.bytes
+                  << " general_workspace_bytes=" << workspace_plan.general_capacity << '\n';
+    }
     prepare_graphs();
     work.reset();
     work.reset_peak();
@@ -332,6 +353,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
+    if (tiered) {
+        try { tiered->drain(); tiered->log_stats(); }
+        catch (const std::exception& error) { std::clog << "[kvmem] shutdown: " << error.what() << '\n'; }
+    }
     ops::set_text_rope_frequencies(nullptr);
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
@@ -483,6 +508,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     sequence.retained = false;
     try {
         if (request_plan.reuse == ReusePath::FullReset) {
+            if (tiered) { tiered->reset(device.stream); }
             sequence.kv.reset();
             ordered_reset(sequence);
             sequence.ledger.clear();
@@ -592,7 +618,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 sequence.execution_frontier = base;
                 sequence.ledger_frontier    = static_cast<std::uint32_t>(loaded_tokens.size());
                 sequence.ledger.assign(loaded_tokens.begin(), loaded_tokens.end());
-                sequence.retained           = true;
+                sequence.retained           = !tiered;
                 set_device_i32(io.rope_delta, sequence.rope_delta);
 
                 CUDA_CHECK(cudaStreamSynchronize(device.stream));
@@ -708,7 +734,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 sequence.execution_frontier = base;
                 sequence.ledger_frontier    = static_cast<std::uint32_t>(loaded_tokens.size());
                 sequence.ledger.assign(loaded_tokens.begin(), loaded_tokens.end());
-                sequence.retained           = true;
+                sequence.retained           = !tiered;
                 set_device_i32(io.rope_delta, sequence.rope_delta);
             }
         } else if (request_plan.reuse == ReusePath::AppendAtFrontier) {
@@ -1048,7 +1074,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             if (terminal[row]) {
                 release_sequence_growth_entitlement(sequence);
                 unbind_sequence_kv(sequence);
-                sequence.retained = true;
+                sequence.retained = !tiered;
                 request.lifecycle = Lifecycle::Complete;
             } else {
                 request.lifecycle = Lifecycle::Active;
@@ -1105,6 +1131,10 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
         request.cpu_vision_cache = request.prefill->vision->cpu_vision_cache_stats();
     }
     request.prefill.reset();
+    if (tiered) {
+        try { tiered->reset(device.stream); }
+        catch (const std::exception& error) { std::clog << "[kvmem] reset: " << error.what() << '\n'; }
+    }
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
     sequence.execution_frontier = 0;
@@ -1228,9 +1258,12 @@ void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
-    if (main_tokens > sequence.kv->text.mapped_token_capacity()) {
+    if (tiered && !tiered->shadow()) {
+        sequence.kv->text.materialize_pages(tiered->view_pages(), device.stream);
+    } else if (main_tokens > sequence.kv->text.mapped_token_capacity()) {
         sequence.kv->text.materialize_tokens(main_tokens, device.stream);
     }
+    if (tiered) { tiered->bind_pages(sequence.kv->text.page_ids()); }
     if (backend_tokens != 0 && backend_tokens > sequence.kv->backend->mapped_token_capacity()) {
         sequence.kv->backend->materialize_tokens(backend_tokens, device.stream);
     }
@@ -1244,7 +1277,8 @@ void ProgramImplCore::trim_sequence_kv(SequenceState& sequence, std::uint32_t ma
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV trim requested without an allocation");
     }
-    sequence.kv->text.trim_tokens(main_tokens);
+    if (tiered && main_tokens < tiered->frontier()) { tiered->trim(main_tokens, device.stream); }
+    if (!tiered || tiered->shadow()) { sequence.kv->text.trim_tokens(main_tokens); }
     if (sequence.kv->backend) { sequence.kv->backend->trim_tokens(backend_tokens); }
 }
 
@@ -1467,7 +1501,7 @@ void ProgramImplCore::prepare_graphs() {
                                        prefill_hidden,
                                        prefill_chunk,
                                        proposal_head,
-                                       attn_scale};
+                                       attn_scale, tiered.get()};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -1780,7 +1814,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, attn_scale},
+             proposal_head, attn_scale, tiered.get()},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -2043,7 +2077,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, attn_scale},
+             proposal_head, attn_scale, tiered.get()},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -2188,7 +2222,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                   replay_records ? &*replay_records : nullptr, io,
                                                   prefill_hidden, prefill_chunk, proposal_head,
-                                                  attn_scale},
+                                                  attn_scale, tiered.get()},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
@@ -2352,7 +2386,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
-                                                     proposal_head, attn_scale},
+                                                     proposal_head, attn_scale, tiered.get()},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,
@@ -2471,7 +2505,7 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
         sequence.mtp_draft_count = 0;
         release_sequence_growth_entitlement(sequence);
         unbind_sequence_kv(sequence);
-        sequence.retained = true;
+        sequence.retained = !tiered;
     }
     request.lifecycle = terminal ? Lifecycle::Complete : Lifecycle::Active;
     request.pending   = {};
@@ -2517,6 +2551,7 @@ void ProgramImplCore::reset_memory_peaks() noexcept {
 }
 
 void ProgramImplCore::snapshot_lane_to_disk(std::uint32_t lane, DiskStateCache& disk_cache) {
+    if (tiered) { return; }
     if (lane >= max_concurrency) { return; }
     SequenceState& sequence = sequences[lane];
     if (sequence.ledger.empty() || sequence.text_kv_valid == 0) { return; }
@@ -2661,6 +2696,7 @@ void ProgramImplCore::snapshot_lane_to_disk(std::uint32_t lane, DiskStateCache& 
 }
 
 void ProgramImplCore::snapshot_turn_checkpoint_to_disk(std::uint32_t lane, DiskStateCache& disk_cache) {
+    if (tiered) { return; }
     if (lane >= max_concurrency) { return; }
     SequenceState& sequence = sequences[lane];
     if (!sequence.turn_checkpoint.valid || sequence.turn_checkpoint.frontier < 128 ||

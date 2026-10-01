@@ -1,5 +1,6 @@
 #include "options.h"
 #include "product/speculative_options.h"
+#include "product/kvmem_options.h"
 
 #include <cerrno>
 #include <cmath>
@@ -104,6 +105,14 @@ std::string usage_text(const char* argv0) {
            "  --no-cuda-graph             Disable CUDA Graph capture/replay (executes via standard CUDA streams)\n"
            "  --wddm-evictable-budget     Allow aggressive WDDM memory budgeting against total VRAM on dedicated GPUs (Windows only)\n\n"
            "Quantization & Storage Layouts:\n"
+           "  --kv-mode <mode>            dense (default), tiered-exact (C=1); kvmem is reserved\n"
+           "  --kvmem-view-tokens <N>    Resident view ceiling (default 131072; budget may reduce)\n"
+           "                              Alias: --kvmem-view; tiered replaces dense --kv-capacity\n"
+           "  --kvmem-sink-tokens <N>    Always-resident prefix (default 256; alias --kvmem-sink)\n"
+           "  --kvmem-host-archive <m>   auto (default), pinned, pageable; fixed at loading\n"
+           "  --kvmem-staging-mib <N>    Loading-time staging capacity override\n"
+           "                            Tiered supports BF16, INT8, rk4v4-e8. BF16 guarantees\n"
+           "                            functionality only; large-T performance is not guaranteed.\n"
            "  --kv-dtype <dtype>          KV cache storage data type and quantization layout:\n"
            "                                bf16       - 16-bit brain floating-point\n"
            "                                int8       - 8-bit integer channel-quantized\n"
@@ -179,6 +188,16 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
+        } else if (arg == "--kv-mode") {
+            options.kv_mode = product::parse_kv_mode(value(arg));
+        } else if (arg == "--kvmem-view-tokens" || arg == "--kvmem-view") {
+            options.kvmem.view_tokens = parse_u32(value(arg), "kvmem-view");
+        } else if (arg == "--kvmem-sink-tokens" || arg == "--kvmem-sink") {
+            options.kvmem.sink_tokens = parse_u32(value(arg), "kvmem-sink", true);
+        } else if (arg == "--kvmem-host-archive") {
+            options.kvmem.host_archive = product::parse_host_archive_mode(value(arg));
+        } else if (arg == "--kvmem-staging-mib") {
+            options.kvmem.staging_capacity_bytes = std::size_t(parse_u32(value(arg), "kvmem-staging-mib")) << 20;
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
@@ -299,7 +318,7 @@ Options parse_options(int argc, char** argv) {
     if (options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
-    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+    if (options.kv_mode == KvMode::Dense && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }

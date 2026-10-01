@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -122,10 +123,19 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto load_plan        = Target::plan_load(binder, options, weights_profile);
     auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
+    const char* shadow_env = std::getenv("NINFER_KVMEM_SHADOW");
+    const bool normal_tiered = options.kv_mode == KvMode::TieredExact &&
+                               !(shadow_env && std::string_view(shadow_env) == "1");
+    const KvCapacityPolicy effective_kv_policy = runtime::execution_kv_capacity_policy(
+        options.kv_mode, options.kv_capacity, !normal_tiered);
+    if (normal_tiered) {
+        std::clog << "[kvmem] resident capacity uses --kvmem-view-tokens and available GPU budget; "
+                     "--kv-capacity applies to dense mode, logical archive uses --max-context\n";
+    }
     const std::size_t preflight_runtime_bytes =
         runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes,
                                             options.wddm_evictable_budget);
-    (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
+    (void)runtime::resolve_kv_capacity(effective_kv_policy, curve, preflight_runtime_bytes);
 
     auto progress     = artifact_progress(options.load_progress);
     auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
@@ -136,7 +146,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     device.synchronize();
     const std::size_t weights_capacity_bytes = stats.h2d_bytes;
     runtime::KvCapacityResolution capacity_resolution = runtime::resolve_kv_capacity(
-        options.kv_capacity, curve,
+        effective_kv_policy, curve,
         current_free_device_bytes(weights_capacity_bytes, options.wddm_evictable_budget,
                                   preflight_runtime_bytes));
     auto sequence_plan = std::move(sequence_planner).finalize(capacity_resolution.main_page_groups);

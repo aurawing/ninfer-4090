@@ -43,6 +43,18 @@ bool rejects(const std::vector<std::string>& flags) {
 
 int main() {
     int failures = 0;
+    const auto named_tiered = parse({"--kv-mode", "tiered-exact", "--kv-dtype", "int8",
+                                    "--kvmem-view-tokens", "16384", "--kvmem-sink-tokens", "0"});
+    failures += check(named_tiered.kv_mode == ninfer::KvMode::TieredExact &&
+                          named_tiered.kvmem.view_tokens == 16384 && named_tiered.kvmem.sink_tokens == 0,
+                      "CLI must preserve documented tiered view/sink options");
+    failures += check(accepts({"--kv-mode", "tiered-exact", "--kv-dtype", "int8",
+                              "--kvmem-view", "8192", "--kvmem-sink", "256",
+                              "--kvmem-host-archive", "pageable"}).has_value(),
+                      "CLI must accept tiered-exact options");
+    failures += check(rejects({"--kv-mode", "invalid"}) &&
+                          rejects({"--kvmem-host-archive", "invalid"}),
+                      "CLI must reject invalid tiered modes");
     const ninfer::EngineOptions engine_defaults;
     failures += check(!engine_defaults.enable_vision &&
                           engine_defaults.vision_device == ninfer::VisionDevice::Cuda &&

@@ -39,6 +39,8 @@ struct ServeOptions {
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    KvMode kv_mode                         = KvMode::Dense;
+    TieredKVOptions kvmem;
     SpeculativeOptions speculative;
     bool enable_vision                     = false;
     std::uint32_t vision_max_tokens        = 8192;

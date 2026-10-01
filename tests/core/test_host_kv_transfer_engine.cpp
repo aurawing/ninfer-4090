@@ -40,6 +40,8 @@ void staging_plan_contract() {
     auto plan = plan_host_kv_staging(host, 2048);
     require(plan.maximum_layer_stream_bytes == 264ULL * 1024 * 1024, "real INT8 stream budget");
     require(plan.capacity_bytes == 328ULL * 1024 * 1024, "stage must add one 64 MiB tile");
+    require(plan.ticket_capacity >= host.layers.size() + 18,
+            "tickets cover current layer transfers plus queued layer writeback fences");
     rejects([&] { (void)plan_host_kv_staging(host, 2048, plan.capacity_bytes - 1); },
             "undersized stage override must fail");
 }
@@ -208,6 +210,38 @@ void exercise(HostArchiveMode mode, PagedKVPlaneOrder order) {
     const auto independent_value = bytes(check_a.size(), 4, 0);
     require(std::memcmp(check_a.data(), independent_value.data(), independent_value.size()) == 0,
             "independent prefetch bytes during delayed writeback");
+    engine.synchronize();
+
+    // A tail writeback must not hold up completed history on the SAME layer.
+    const auto same_start = std::chrono::steady_clock::now();
+    CUDA_CHECK(cudaLaunchHostFunc(device.stream, [](void*) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }, nullptr));
+    auto same_wb = engine.writeback(pool, 0, 2, changed, 2560, device.stream);
+    rejects([&] { (void)engine.prefetch_completed(0, 0, 2, 1, 0); },
+            "completed history must reject an overlapping pending writeback");
+    rejects([&] { (void)engine.prefetch_completed(0, 0, 40, 1, 0); },
+            "completed history must reject unarchived pages");
+    auto same_pf = engine.prefetch_completed(0, 0, 0, 1, 0);
+    engine.wait(same_pf, device.load_stream);
+    CUDA_CHECK(cudaMemcpyAsync(check_a.data(), engine.staged(same_pf).data,
+                                check_a.size(), cudaMemcpyDeviceToHost, device.load_stream));
+    engine.release(same_pf, device.load_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.load_stream));
+    const double same_pf_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - same_start).count();
+    const bool same_pending = same_wb.wait_for(std::chrono::milliseconds(0)) ==
+                              std::future_status::timeout;
+    same_wb.get();
+    const double same_wb_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - same_start).count();
+    std::cout << "same-layer-prefetch mode=" << (mode == HostArchiveMode::Pinned ? "pinned" : "pageable")
+              << " prefetch_complete_ms=" << same_pf_ms << " writeback_complete_ms=" << same_wb_ms << '\n';
+    require(same_pending && same_pf_ms < same_wb_ms,
+            "completed same-layer history prefetch must not wait for tail writeback");
+    const auto same_value = bytes(check_a.size(), 0, 0);
+    require(std::memcmp(check_a.data(), same_value.data(), same_value.size()) == 0,
+            "same-layer completed history bytes");
     engine.synchronize();
 
     // Force an earlier archive H2D reader to remain queued behind a consumer.

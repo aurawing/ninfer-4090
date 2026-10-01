@@ -278,6 +278,8 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.device               = options_.device;
     engine_options.max_context          = options_.max_context;
     engine_options.kv_capacity          = options_.kv_capacity;
+    engine_options.kv_mode              = options_.kv_mode;
+    engine_options.kvmem                = options_.kvmem;
     engine_options.max_concurrency      = options_.max_concurrency;
     engine_options.max_pending_requests = options_.max_pending_requests;
     engine_options.pending_timeout_ms   = options_.pending_timeout_ms;

@@ -32,6 +32,17 @@ enum class KvCapacityMode : std::uint8_t {
     Automatic,
 };
 
+enum class KvMode : std::uint8_t { Dense, TieredExact, KVMem };
+enum class HostKVArchiveMode : std::uint8_t { Auto, Pinned, Pageable };
+
+struct TieredKVOptions {
+    std::uint32_t view_tokens = 131072;
+    std::uint32_t sink_tokens = 256;
+    HostKVArchiveMode host_archive = HostKVArchiveMode::Auto;
+    std::size_t staging_capacity_bytes = 0;
+    std::size_t partial_budget_bytes = 100ULL * 1024 * 1024;
+};
+
 inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
 
 struct KvCapacityPolicy {
@@ -88,6 +99,8 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    KvMode kv_mode                     = KvMode::Dense;
+    TieredKVOptions kvmem;
     SpeculativeOptions speculative;
     bool enable_vision                 = false;
     std::uint32_t vision_max_tokens    = 8192;

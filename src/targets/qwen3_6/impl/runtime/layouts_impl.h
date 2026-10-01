@@ -17,10 +17,13 @@
 #include "ninfer/ops/swa.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -104,7 +107,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                    static_cast<std::uint32_t>(kPagedKVPageSize))
             : 0ULL;
     const std::uint32_t mtp_physical_pages = static_cast<std::uint32_t>(
-        checked_i32(static_cast<std::uint64_t>(physical_pages) + mtp_extra_pages,
+        checked_i32(static_cast<std::uint64_t>(plan.kv_mode == KvMode::TieredExact
+                                                  ? logical_pages : physical_pages) + mtp_extra_pages,
                     "MTP Paged KV physical pages exceed int32"));
     LayoutBuilder builder;
     PersistentLayout out;
@@ -127,6 +131,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
+                     .allow_tiered_text_pages   = plan.kv_mode == KvMode::TieredExact &&
+                                                  !plan.shadow_validate,
                      .linear_attention =
                          {
                              .layers         = TextConfig::gdn_layers(),
@@ -543,10 +549,49 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
     out.capacity = std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
                              out.dflash_context, out.dflash_round, out.vision_encode});
+    out.general_capacity = out.capacity;
+    if (plan.kv_mode == KvMode::TieredExact) {
+        const auto view_pages = plan.shadow_validate
+                                    ? std::min(page_count(plan.kvmem.view_tokens), page_count(plan.capacity))
+                                    : plan.main_page_groups;
+        out.tiered = qwen3_6::detail::plan_tiered_runtime(
+            plan.persistent.decoder.text_kv.pool, plan.capacity, view_pages,
+            std::max(chunk_u32, plan.draft_window + 1U), plan.kvmem,
+            plan.shadow_validate, plan.measure_transfer_waits);
+        out.general_capacity = checked_add(out.general_capacity, kArenaAlign - 1,
+                                            "tiered general workspace alignment") /
+                               kArenaAlign * kArenaAlign;
+        out.capacity = checked_add(out.general_capacity, out.tiered->bytes,
+                                    "tiered workspace reservation");
+    }
     return out;
 }
 
 void validate_target_options(DeviceContext& device, const EngineOptions& options) {
+    if (options.kv_mode == KvMode::KVMem) {
+        throw std::invalid_argument("kv-mode kvmem is not implemented; use tiered-exact");
+    }
+    if (options.kv_mode != KvMode::Dense && options.kv_mode != KvMode::TieredExact) {
+        throw std::invalid_argument("unknown kv-mode");
+    }
+    const bool tiered = options.kv_mode == KvMode::TieredExact;
+    const char* shadow_env = std::getenv("NINFER_KVMEM_SHADOW");
+    const bool shadow = tiered && shadow_env && std::string_view(shadow_env) == "1";
+    if (tiered) {
+        if (TextConfig::head_dim != 256 || TextConfig::query_heads != 24 ||
+            TextConfig::kv_heads != 4 || TextConfig::full_attention_layers() != 16) {
+            throw std::invalid_argument("tiered-exact requires Qwen27B 24Q/4KV/256D geometry");
+        }
+        const bool supported_kv = options.kv_cache == KvCacheStorage::BFloat16 ||
+                                  options.kv_cache == KvCacheStorage::Int8Group64 ||
+                                  options.kv_cache == KvCacheStorage::RK4V4E8;
+        if (options.max_concurrency != 1 || !supported_kv ||
+            options.speculative.backend == SpeculativeBackend::DFlash) {
+            throw std::invalid_argument("tiered-exact requires C=1, BF16/INT8/rk4v4-e8 KV and ordinary or MTP decoding");
+        }
+        (void)qwen3_6::detail::tiered_page_limits(options.max_context, options.prefill_chunk,
+                                                 options.kvmem);
+    }
     if (options.max_context == 0 || options.max_context > Variant::maximum_context) {
         throw std::invalid_argument("max_context exceeds the variant native context capacity");
     }
@@ -563,7 +608,7 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("maximum Main KV page count exceeds uint32");
     }
-    switch (options.kv_capacity.mode) {
+    if (!tiered || shadow) { switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit: {
         if (options.kv_capacity.explicit_tokens < options.max_context) {
             throw std::invalid_argument("kv_capacity must be at least max_context");
@@ -579,7 +624,7 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         break;
     default:
         throw std::invalid_argument("unknown kv_capacity policy");
-    }
+    } }
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
         if (options.speculative.draft_tokens != 0 ||
@@ -629,6 +674,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->draft_window        = inputs.draft_window;
     impl->speculative_backend = inputs.speculative_backend;
+    impl->kv_mode             = inputs.kv_mode;
+    impl->kvmem               = inputs.kvmem;
+    impl->shadow_validate     = inputs.shadow_validate;
+    impl->measure_transfer_waits = inputs.measure_transfer_waits;
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
@@ -713,6 +762,14 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
+        .kv_mode             = options.kv_mode,
+        .kvmem               = options.kvmem,
+        .shadow_validate     = options.kv_mode == KvMode::TieredExact &&
+                               std::getenv("NINFER_KVMEM_SHADOW") &&
+                               std::string_view(std::getenv("NINFER_KVMEM_SHADOW")) == "1",
+        .measure_transfer_waits = options.kv_mode == KvMode::TieredExact &&
+                                  std::getenv("NINFER_KVMEM_TRANSFER_TIMING") &&
+                                  std::string_view(std::getenv("NINFER_KVMEM_TRANSFER_TIMING")) == "1",
         .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8,
         .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
         .kv_packed_v = options.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
@@ -733,14 +790,31 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kv_e8_root    = options.kv_cache == KvCacheStorage::RK2V4E8,
         .proposal_head       = options.speculative.proposal_head,
         .features            = qwen3_6::startup_features(options),
-        .use_cuda_graph      = options.use_cuda_graph,
-        .enable_prompt_cache = options.enable_prompt_cache,
+        .use_cuda_graph      = options.use_cuda_graph && options.kv_mode == KvMode::Dense,
+        .enable_prompt_cache = options.enable_prompt_cache && options.kv_mode == KvMode::Dense,
         .device              = options.device,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
-    const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
-    const std::uint64_t maximum_pages64 =
+    const bool normal_tiered = inputs.kv_mode == KvMode::TieredExact && !inputs.shadow_validate;
+    const auto limits = normal_tiered
+                            ? qwen3_6::detail::tiered_page_limits(inputs.capacity, inputs.prefill_chunk,
+                                                                  inputs.kvmem)
+                            : qwen3_6::detail::TieredPageLimits{logical_pages, logical_pages};
+    std::uint32_t minimum_pages = normal_tiered ? limits.minimum
+                                                : std::max(logical_pages, inputs.max_concurrency);
+    if (normal_tiered && inputs.kvmem.staging_capacity_bytes != 0) {
+        auto probe_inputs = inputs;
+        probe_inputs.kvmem.staging_capacity_bytes = 0;
+        const auto probe = build_sequence_candidate(probe_inputs, minimum_pages);
+        minimum_pages = qwen3_6::detail::tiered_staging_page_limits(
+            probe->workspace.tiered->archive, limits, inputs.kvmem.staging_capacity_bytes).minimum;
+    }
+    const std::uint64_t maximum_pages64 = normal_tiered ? limits.maximum :
         static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;
+    if (inputs.kv_mode == KvMode::TieredExact) {
+        if (options.use_cuda_graph) { std::clog << "tiered-exact disables CUDA Graph execution (eager)\n"; }
+        if (options.enable_prompt_cache) { std::clog << "tiered-exact disables disk prompt cache\n"; }
+    }
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("maximum Main KV page count exceeds uint32");
     }

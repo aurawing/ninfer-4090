@@ -287,6 +287,8 @@ int main(int argc, char** argv) {
         engine_options.device                 = cli.device;
         engine_options.max_context            = cli.max_context;
         engine_options.kv_capacity            = cli.kv_capacity;
+        engine_options.kv_mode                = cli.kv_mode;
+        engine_options.kvmem                  = cli.kvmem;
         engine_options.prefill_chunk          = cli.prefill_chunk;
         engine_options.kv_cache               = cli.kv_cache;
         engine_options.speculative            = cli.speculative;

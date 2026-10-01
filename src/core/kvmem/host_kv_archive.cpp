@@ -95,6 +95,37 @@ HostKVArchiveLayout plan_host_kv_archive(const PagedKVPool& pool, std::size_t pe
     return result;
 }
 
+HostKVArchiveLayout plan_host_kv_archive(const PagedKVPoolLayout& pool, std::size_t per_layer,
+                                         std::uint32_t max_context) {
+    if (max_context == 0 || per_layer == 0 || pool.planes.empty() ||
+        pool.planes.size() % per_layer != 0 ||
+        page_count(max_context) > pool.spec.logical_page_capacity ||
+        pool.spec.page_group_count == 0) {
+        throw std::invalid_argument("invalid host KV archive pool/context layout");
+    }
+    HostKVArchiveLayout result;
+    result.max_context = max_context;
+    result.logical_pages = page_count(max_context);
+    result.os_page_bytes = os_page_bytes();
+    result.pool_order = pool.spec.plane_order;
+    result.layers.resize(pool.planes.size() / per_layer);
+    for (std::size_t layer = 0; layer < result.layers.size(); ++layer) {
+        for (std::size_t plane = 0; plane < per_layer; ++plane) {
+            const auto index = layer * per_layer + plane;
+            const auto plane_bytes = pool.planes[index].storage.region.bytes;
+            if (plane_bytes % pool.spec.page_group_count != 0) {
+                throw std::invalid_argument("host KV pool plane is not an integral page layout");
+            }
+            const auto bytes = plane_bytes / pool.spec.page_group_count;
+            const auto capacity = rounded(checked_mul(bytes, result.logical_pages),
+                                          result.os_page_bytes);
+            result.layers[layer].push_back({result.bytes, bytes, capacity, index});
+            result.bytes = checked_add(result.bytes, capacity);
+        }
+    }
+    return result;
+}
+
 struct HostKVArchive::Impl {
     HostKVArchiveLayout layout;
     HostArchiveMode mode = HostArchiveMode::Pageable;
@@ -102,6 +133,7 @@ struct HostKVArchive::Impl {
     std::uint64_t generation = 0;
     std::vector<std::vector<std::size_t>> committed;
     std::vector<std::uint32_t> frontiers, pending_frontiers;
+    std::vector<std::uint32_t> pending_first, pending_end;
     std::vector<cudaEvent_t> done, read_done;
     std::vector<bool> pending, reading;
     std::vector<std::shared_future<void>> external_done;
@@ -202,6 +234,8 @@ HostKVArchive::HostKVArchive(HostKVArchiveLayout layout, HostArchiveMode request
     state.committed.resize(layers);
     state.frontiers.resize(layers);
     state.pending_frontiers.resize(layers);
+    state.pending_first.resize(layers);
+    state.pending_end.resize(layers);
     state.external_done.resize(layers);
     state.pending.resize(layers);
     state.reading.resize(layers);
@@ -332,6 +366,8 @@ void HostKVArchive::writeback(const PagedKVPool& pool, std::size_t layer, std::u
         throw;
     }
     state.pending_frontiers[layer] = frontier;
+    state.pending_first[layer] = first;
+    state.pending_end[layer] = end;
     state.pending[layer] = true;
 }
 
@@ -344,6 +380,20 @@ std::span<const std::byte> HostKVArchive::pages(std::size_t layer, std::size_t p
         throw std::out_of_range("host KV archive range beyond valid frontier");
     }
     return {impl_->address(spec, first), spec.page_bytes * count};
+}
+std::span<const std::byte> HostKVArchive::completed_pages(
+    std::size_t layer, std::size_t plane, std::uint32_t first, std::uint32_t count) {
+    const auto& state = *impl_;
+    const auto& spec = state.layout.layers.at(layer).at(plane);
+    const auto valid_pages = page_count(state.frontiers.at(layer));
+    if (first > valid_pages || count > valid_pages - first) {
+        throw std::out_of_range("completed KV history beyond committed frontier");
+    }
+    if ((state.pending.at(layer) || state.external_done.at(layer).valid()) && count &&
+        first < state.pending_end.at(layer) && first + count > state.pending_first.at(layer)) {
+        throw std::logic_error("completed KV history overlaps pending writeback");
+    }
+    return {state.address(spec, first), spec.page_bytes * count};
 }
 void HostKVArchive::restore_to_pool(PagedKVPool& pool, std::size_t layer, std::uint32_t first,
                                     std::span<const std::int32_t> ids, cudaStream_t stream) {
@@ -447,6 +497,8 @@ std::vector<std::span<std::byte>> HostKVArchive::prepare_async_writeback(
         result.emplace_back(state.address(spec, first), spec.page_bytes * count);
     }
     state.pending_frontiers[layer] = frontier;
+    state.pending_first[layer] = first;
+    state.pending_end[layer] = first + count;
     state.external_done[layer] = std::move(completion);
     return result;
 }

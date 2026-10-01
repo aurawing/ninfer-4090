@@ -1,5 +1,6 @@
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
+#include "product/kvmem_options.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -120,6 +121,14 @@ std::string serve_usage_text(const char* argv0) {
            "  --disk-cache-dir <DIR>            Directory path for prompt cache (default: %LOCALAPPDATA%/ninfer/cache/<profile>)\n"
            "  --disk-cache-gb <N>               Disk cache storage quota limit in GiB (default: 30)\n\n"
            "Quantization & Storage Layouts:\n"
+           "  --kv-mode <mode>            dense (default), tiered-exact (C=1); kvmem is reserved\n"
+           "  --kvmem-view-tokens <N>    Resident view ceiling (default 131072; budget may reduce)\n"
+           "                              Alias: --kvmem-view; tiered replaces dense --kv-capacity\n"
+           "  --kvmem-sink-tokens <N>    Always-resident prefix (default 256; alias --kvmem-sink)\n"
+           "  --kvmem-host-archive <m>   auto (default), pinned, pageable; fixed at loading\n"
+           "  --kvmem-staging-mib <N>    Loading-time staging capacity override\n"
+           "                            Tiered supports BF16, INT8, rk4v4-e8. BF16 guarantees\n"
+           "                            functionality only; large-T performance is not guaranteed.\n"
            "  --kv-dtype <dtype>          KV cache storage data type and quantization layout:\n"
            "                                bf16       - 16-bit brain floating-point\n"
            "                                int8       - 8-bit integer channel-quantized\n"
@@ -208,6 +217,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
+        } else if (arg == "--kv-mode") {
+            options.kv_mode = product::parse_kv_mode(require_value("--kv-mode"));
+        } else if (arg == "--kvmem-view-tokens" || arg == "--kvmem-view") {
+            options.kvmem.view_tokens = parse_positive_u32(require_value("--kvmem-view"), "kvmem-view");
+        } else if (arg == "--kvmem-sink-tokens" || arg == "--kvmem-sink") {
+            options.kvmem.sink_tokens = parse_positive_u32(require_value("--kvmem-sink"), "kvmem-sink", true);
+        } else if (arg == "--kvmem-host-archive") {
+            options.kvmem.host_archive = product::parse_host_archive_mode(require_value("--kvmem-host-archive"));
+        } else if (arg == "--kvmem-staging-mib") {
+            options.kvmem.staging_capacity_bytes = std::size_t(parse_positive_u32(require_value("--kvmem-staging-mib"), "kvmem-staging-mib")) << 20;
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
@@ -382,7 +401,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
-    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+    if (options.kv_mode == KvMode::Dense && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }

@@ -15,6 +15,28 @@ int check(bool condition, const char* message) {
 
 int main() {
     int failures = 0;
+    const auto explicit_policy = ninfer::KvCapacityPolicy::explicit_capacity(262144);
+    const auto tiered_policy = ninfer::runtime::execution_kv_capacity_policy(
+        ninfer::KvMode::TieredExact, explicit_policy, false);
+    failures += check(tiered_policy.mode == ninfer::KvCapacityMode::Automatic &&
+                          tiered_policy.automatic_headroom_bytes == ninfer::kDefaultKvCapacityHeadroomBytes,
+                      "normal tiered must retain default automatic GPU headroom");
+    for (const auto mode : {ninfer::KvMode::Dense, ninfer::KvMode::TieredExact}) {
+        const auto policy = ninfer::runtime::execution_kv_capacity_policy(mode, explicit_policy, true);
+        failures += check(policy.mode == explicit_policy.mode &&
+                              policy.explicit_tokens == explicit_policy.explicit_tokens &&
+                              policy.automatic_headroom_bytes == explicit_policy.automatic_headroom_bytes,
+                          "dense/shadow explicit policy changed");
+    }
+    const auto dense_policy = ninfer::runtime::execution_kv_capacity_policy(
+        ninfer::KvMode::Dense, explicit_policy, false);
+    failures += check(dense_policy.mode == ninfer::KvCapacityMode::Explicit &&
+                          dense_policy.explicit_tokens == 262144,
+                      "normal dense physical policy changed");
+    const auto zero_auto = ninfer::runtime::execution_kv_capacity_policy(
+        ninfer::KvMode::TieredExact, ninfer::KvCapacityPolicy::automatic(0), false);
+    failures += check(zero_auto.automatic_headroom_bytes == 0,
+                      "explicit API automatic headroom override changed");
     const ninfer::runtime::SequenceCapacityCurve curve{
         .main_page_tokens                     = 64,
         .minimum_main_page_groups             = 2,

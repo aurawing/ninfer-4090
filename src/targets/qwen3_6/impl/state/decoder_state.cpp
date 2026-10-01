@@ -15,7 +15,8 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers,
                               std::uint32_t capacity, std::int32_t kv_heads, std::int32_t head_dim,
                               DType dtype, std::int32_t quant_group, std::int32_t table_rows,
                               std::uint32_t physical_page_groups, bool packed_v, bool rotate_k,
-                              bool rotate_v, bool packed_k, bool e8_lattice, bool e8_root) {
+                              bool rotate_v, bool packed_k, bool e8_lattice, bool e8_root,
+                              bool allow_tiered_pages = false) {
     if (layers == 0 || capacity == 0 || kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
         throw std::invalid_argument("Paged KV cache dimensions must be positive");
     }
@@ -35,7 +36,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers,
     }
 
     const std::uint32_t logical_pages = page_count(capacity);
-    if (physical_page_groups < logical_pages) {
+    if (physical_page_groups == 0 || (!allow_tiered_pages && physical_page_groups < logical_pages)) {
         throw std::invalid_argument("Paged KV physical pages are below logical capacity");
     }
 
@@ -82,7 +83,8 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                 spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                 spec.kv_table_rows, spec.text_physical_page_groups,
                                 spec.kv_packed_v, spec.kv_rotate_k, spec.kv_rotate_v,
-                                spec.kv_packed_k, spec.kv_e8_lattice, spec.kv_e8_root);
+                                spec.kv_packed_k, spec.kv_e8_lattice, spec.kv_e8_root,
+                                spec.allow_tiered_text_pages);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,

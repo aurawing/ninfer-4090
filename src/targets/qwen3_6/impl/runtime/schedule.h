@@ -40,6 +40,7 @@ struct ExecutionCore {
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
     float attn_scale = kAttentionScale;
+    qwen3_6::detail::TieredContext* tiered = nullptr;
 };
 
 

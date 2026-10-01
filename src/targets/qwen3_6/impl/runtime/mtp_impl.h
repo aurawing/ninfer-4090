@@ -86,6 +86,13 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, &state.mtp_cache);
         card.set_attn_scale(state.execution.attn_scale);
+        card.set_tiered_context(state.execution.tiered);
+        if (state.execution.tiered) {
+            state.execution.tiered->begin_block(
+                static_cast<std::uint32_t>(state.host_ingress.base_frontiers[0]),
+                static_cast<std::uint32_t>(state.host_ingress.current_extents[0]) + 1,
+                state.execution.device.stream);
+        }
 
         Tensor anchors           = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers         = frame.base_frontiers.slice(0, 0, batch_size);

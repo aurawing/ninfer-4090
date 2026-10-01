@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -53,7 +54,11 @@ HostKVStagingPlan plan_host_kv_staging(const HostKVArchiveLayout& layout,
     }
     const auto capacity = override_bytes ? override_bytes : minimum;
     const auto tiles = capacity / kHostKVTransferTileBytes + (capacity % kHostKVTransferTileBytes != 0);
-    return {resident, largest, capacity, add(add(tiles, multiply(planes, 2)), 4)};
+    // One queued writeback per layer may pin the last earlier H2D ticket's
+    // ready-event generation until its GPU producer runs. Reserve those slots
+    // as well as the active layer and the overlapping prefetch handoff.
+    return {resident, largest, capacity,
+            add(add(add(tiles, multiply(planes, 2)), 4), layout.layers.size())};
 }
 
 struct HostKVTransferEngine::Impl {
@@ -368,7 +373,18 @@ std::size_t HostKVTransferEngine::pinned_ring_bytes() const noexcept {
 HostKVTransferTicket HostKVTransferEngine::prefetch(std::size_t layer, std::size_t plane,
                                                    std::uint32_t first, std::uint32_t count,
                                                    std::size_t offset) {
-    auto source = archive_.pages(layer, plane, first, count);
+    return prefetch_impl(layer, plane, first, count, offset, false);
+}
+HostKVTransferTicket HostKVTransferEngine::prefetch_completed(
+    std::size_t layer, std::size_t plane, std::uint32_t first, std::uint32_t count,
+    std::size_t offset) {
+    return prefetch_impl(layer, plane, first, count, offset, true);
+}
+HostKVTransferTicket HostKVTransferEngine::prefetch_impl(
+    std::size_t layer, std::size_t plane, std::uint32_t first, std::uint32_t count,
+    std::size_t offset, bool completed_only) {
+    auto source = completed_only ? archive_.completed_pages(layer, plane, first, count)
+                                 : archive_.pages(layer, plane, first, count);
     if (source.empty() || source.size() > kHostKVTransferTileBytes ||
         offset > impl_->plan.capacity_bytes || source.size() > impl_->plan.capacity_bytes - offset) {
         throw std::invalid_argument("KV prefetch tile or device offset exceeds startup capacity");
@@ -380,20 +396,26 @@ HostKVTransferTicket HostKVTransferEngine::prefetch(std::size_t layer, std::size
         throw std::overflow_error("KV transfer sequence exhausted");
     }
     std::size_t selected = state.slots.size();
+    std::size_t unused = state.slots.size();
     for (std::size_t i = 0; i < state.slots.size(); ++i) {
         const auto& slot = state.slots[i];
         if (slot.sequence && !slot.released && overlaps(offset, source.size(), slot.offset, slot.bytes)) {
             throw std::logic_error("prefetch would overwrite a live staging segment");
         }
-        if (!slot.sequence && selected == state.slots.size()) { selected = i; }
-    }
-    if (selected == state.slots.size()) {
-        for (std::size_t i = 0; i < state.slots.size(); ++i) {
-            if (state.slots[i].released && state.slots[i].references == 0) { selected = i; break; }
+        if (!slot.sequence && unused == state.slots.size()) { unused = i; }
+        if (slot.released && slot.references == 0 && selected == state.slots.size()) {
+            selected = i;
         }
     }
     if (selected == state.slots.size()) {
-        throw std::runtime_error("startup KV transfer ticket capacity exhausted");
+        selected = unused;
+    }
+    if (selected == state.slots.size()) {
+        std::size_t references = 0;
+        for (const auto& slot : state.slots) { references += slot.references; }
+        throw std::runtime_error("startup KV transfer ticket capacity exhausted: layer=" +
+            std::to_string(layer) + " capacity=" + std::to_string(state.slots.size()) +
+            " references=" + std::to_string(references));
     }
     Impl::Job job;
     job.slot = selected;

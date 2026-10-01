@@ -34,6 +34,9 @@ struct HostKVArchiveLayout {
 [[nodiscard]] HostKVArchiveLayout plan_host_kv_archive(const PagedKVPool& pool,
                                                       std::size_t planes_per_layer,
                                                       std::uint32_t max_context);
+[[nodiscard]] HostKVArchiveLayout plan_host_kv_archive(const PagedKVPoolLayout& pool,
+                                                      std::size_t planes_per_layer,
+                                                      std::uint32_t max_context);
 [[nodiscard]] std::uint64_t available_physical_memory_bytes();
 void check_host_archive_admission(std::size_t archive_bytes, std::uint64_t available_bytes);
 [[nodiscard]] bool keep_pinned_archive(bool allocation_succeeded,
@@ -72,6 +75,9 @@ private:
     void attach_transfer_owner(void* owner);
     void detach_transfer_owner(void* owner) noexcept;
     void trim_owned(std::uint32_t frontier);
+    // Read completed history without waiting for a disjoint pending tail write.
+    [[nodiscard]] std::span<const std::byte> completed_pages(
+        std::size_t layer, std::size_t plane, std::uint32_t first, std::uint32_t count);
     std::vector<std::span<std::byte>> prepare_async_writeback(
         std::size_t layer, std::uint32_t first, std::uint32_t count, std::uint32_t frontier,
         std::shared_future<void> completion);

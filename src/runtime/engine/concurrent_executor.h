@@ -66,7 +66,7 @@ public:
             disk_config.cache_dir /= slug;
         }
         disk_config.max_cache_bytes = options.prompt_cache_max_bytes;
-        disk_config.enabled         = options.enable_prompt_cache;
+        disk_config.enabled         = options.enable_prompt_cache && options.kv_mode == KvMode::Dense;
         disk_cache_                 = std::make_unique<DiskStateCache>(std::move(disk_config));
         instance_.program->set_disk_state_cache(disk_cache_.get());
         worker_ = std::thread([this] { worker_loop(); });

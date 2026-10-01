@@ -831,7 +831,9 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
-    if (active_sequence_batch_ != 0) {
+    if (tiered_ && !tiered_->shadow()) {
+        tiered_->attention(fidx, qn, kn, v, cache_positions.view({T}), attn_scale_, a, s);
+    } else if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
             throw std::logic_error("Text sequence batch binding does not match aggregate columns");
@@ -849,6 +851,9 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, attn_scale_,
                            batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,
                            s);
+    }
+    if (tiered_ && tiered_->shadow()) {
+        tiered_->shadow_attention(fidx, qn, cache_positions.view({T}), attn_scale_, a, s);
     }
     ops::sigmoid_mul(gate, a, s);
 
@@ -1161,6 +1166,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 ops::scatter(embeddings, indices_device, x, s);
             }
             if constexpr (Tap::enabled) { tap.begin(x); }
+            if (tiered_) {
+                tiered_->begin_block(static_cast<std::uint32_t>(base_i + t0),
+                                     static_cast<std::uint32_t>(len), s);
+            }
             run_layers(x, Phase::Prefill, tap);
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);

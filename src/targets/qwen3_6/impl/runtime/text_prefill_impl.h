@@ -40,6 +40,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          std::int32_t turn_checkpoint_state_slot,
                          std::uint32_t mtp_proposal_extent) {
     card.set_sampling(sampling);
+    card.set_tiered_context(execution.tiered);
     card.set_linear_state_slots(current_state_slot, turn_checkpoint_state_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);

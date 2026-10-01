@@ -146,6 +146,33 @@ void test_round_layout() {
            "DFlash layout does not allocate MTP storage");
 }
 
+void test_tiered_main_layout_guard() {
+    auto spec = decoder_spec(ninfer::DType::BF16, true);
+    spec.text_physical_page_groups = 2;
+    spec.mtp_physical_page_groups = 3;
+    bool dense_rejected = false;
+    try {
+        ninfer::LayoutBuilder builder;
+        (void)q36::plan_decoder_state(builder, spec);
+    } catch (const std::invalid_argument&) { dense_rejected = true; }
+    expect(dense_rejected, "dense Main requires complete logical KV storage");
+    spec.allow_tiered_text_pages = true;
+    ninfer::LayoutBuilder builder;
+    const auto tiered = q36::plan_decoder_state(builder, spec);
+    expect(tiered.text_kv.pool.spec.page_group_count == 2 &&
+               tiered.text_kv.pool.spec.logical_page_capacity == 3,
+           "tiered Main permits fewer physical pages than logical pages");
+    expect(tiered.mtp_kv && tiered.mtp_kv->pool.spec.page_group_count == 3,
+           "tiered MTP keeps complete logical KV storage");
+    spec.mtp_physical_page_groups = 2;
+    bool mtp_rejected = false;
+    try {
+        ninfer::LayoutBuilder invalid;
+        (void)q36::plan_decoder_state(invalid, spec);
+    } catch (const std::invalid_argument&) { mtp_rejected = true; }
+    expect(mtp_rejected, "tiered flag cannot relax MTP storage validation");
+}
+
 void test_mtp_alignment() {
     const std::vector<std::int32_t> scatter{2, 4, 7};
     const q36::MtpAlignmentWindow first = q36::plan_mtp_alignment_window(8, 0, 4);
@@ -318,6 +345,7 @@ void test_yarn_scaling() {
 int main() {
     test_topology();
     test_decoder_layout();
+    test_tiered_main_layout_guard();
     test_round_layout();
     test_mtp_alignment();
     test_vision_control();

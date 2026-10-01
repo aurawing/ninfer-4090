@@ -7,6 +7,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/tensor.h"
+#include "targets/qwen3_6/impl/runtime/tiered_plan.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/startup_features.h>
@@ -57,6 +58,8 @@ struct WorkspacePlan {
     std::size_t dflash_round   = 0;
     std::size_t vision_encode  = 0;
     std::size_t capacity       = 0;
+    std::size_t general_capacity = 0;
+    std::optional<qwen3_6::detail::TieredRuntimePlan> tiered;
 };
 
 struct SequencePlanningInputs {
@@ -66,6 +69,10 @@ struct SequencePlanningInputs {
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    KvMode kv_mode                         = KvMode::Dense;
+    TieredKVOptions kvmem;
+    bool shadow_validate                   = false;
+    bool measure_transfer_waits            = false;
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
     bool kv_packed_v                       = false;
@@ -95,6 +102,10 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    KvMode kv_mode                         = KvMode::Dense;
+    TieredKVOptions kvmem;
+    bool shadow_validate                   = false;
+    bool measure_transfer_waits            = false;
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
     bool kv_packed_v                       = false;

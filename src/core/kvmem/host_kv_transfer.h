@@ -34,6 +34,11 @@ public:
     [[nodiscard]] HostKVTransferTicket prefetch(std::size_t layer, std::size_t plane,
                                                 std::uint32_t first, std::uint32_t count,
                                                 std::size_t device_offset);
+    // No CPU wait for unrelated in-flight writes on this layer. The range
+    // must already be archived and must not overlap any pending writeback.
+    [[nodiscard]] HostKVTransferTicket prefetch_completed(
+        std::size_t layer, std::size_t plane, std::uint32_t first, std::uint32_t count,
+        std::size_t device_offset);
     // CPU waits only until the worker records ready, then GPU waits on the DMA event.
     void wait(HostKVTransferTicket ticket, cudaStream_t consumer_stream);
     [[nodiscard]] DeviceSpan staged(HostKVTransferTicket ticket);
@@ -52,6 +57,8 @@ public:
 
 private:
     struct Impl;
+    HostKVTransferTicket prefetch_impl(std::size_t layer, std::size_t plane,
+        std::uint32_t first, std::uint32_t count, std::size_t offset, bool completed_only);
     HostKVArchive& archive_;
     std::unique_ptr<Impl> impl_;
 };

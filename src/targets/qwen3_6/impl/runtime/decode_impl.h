@@ -26,6 +26,12 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         card.set_attn_scale(state.execution.attn_scale);
+        card.set_tiered_context(state.execution.tiered);
+        if (state.execution.tiered) {
+            state.execution.tiered->begin_block(
+                static_cast<std::uint32_t>(state.host_ingress.cache_positions[0]), 1,
+                state.execution.device.stream);
+        }
 
 
         Tensor tokens          = ordinary.tokens.slice(0, 0, batch_size);
