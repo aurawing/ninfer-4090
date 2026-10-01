@@ -4,7 +4,7 @@
 
 ## 待用户决定的问题
 
-当前没有待决定的 D1–D15 冲突。dense 量化 small-T 注意力同步 bug 已按用户授权在独立分支修复并合并到 `feat/kvmem`；Q5 残差原子累加顺序波动按用户决定保留。传输修正及阶段 3 第 3 步已完成并验证；停在第 3 步审阅点，不接入运行时。prefill 性能与 partial workspace 容量的实测限制见第 3 步记录。D3 的后续方向已由用户在 2026-09-30 确认。
+第 4 步门禁与完整构建/CTest 已通过。用户决定不改 dense，262K 仅按事后批准的独立 FP64 判据评估；三个最大误差层 7、6、8 的完整末段块均满足 tiered/FP64 相对 L2 不超过 dense/FP64，32K/128K 仍满足原 1e-3，门禁 B 与两档 INT8 性能通过。本轮没有新的 D1–D15 冲突；按授权整理提交并 push 后停在本步审阅点，不开始第 5 步。
 
 ## 阶段 0′：基线
 
@@ -352,6 +352,93 @@ foreach ($check in @('racecheck', 'synccheck', 'initcheck')) {
 # --passes 2/4 复用 state，整体计时包含所有 fold；默认 passes=1。
 ```
 
+### 阶段 3 第 4 步：运行时接线（2026-10-02，修订门禁全部通过）
+
+从 `7f01b0d5` 接入 C=1 `tiered-exact`，本步实现和规定门禁已完成，后续范围止于第 4 步审阅：Main 的 16 个全注意力层使用原始逻辑页号视图、页状态与完成 epoch；16 层回写完成后页才由 DeviceOnly 变 Both，最旧非 sink Both 页才可驱逐。块表、混合访问列表和 key 前缀和在同一计算边界上传；每层一遍注意力，流式页索引设备 staging，因果掩码仍由原始逻辑位置决定。下一层预取在上一层 release 后排队，设备 consumed 事件排序；首全注意力层在前三个 GDN 层前排预取。MTP pool 保持 dense，turn checkpoint、retained resume 和磁盘状态缓存按本步授权关闭并记录日志。
+
+新增 CPU 视图状态机、预算和独立运行时 CTest。运行时测试以固定均匀注意力的独立参考覆盖 BF16/INT8、实际主机页换入、trim 后的 HostOnly 尾页前缀恢复、reset、T4 与有效列不足四列时的零填充，以及锁页模式下 16 层连续异步提交与延迟计算。原事件槽策略在层 13 出现 `capacity=26 references=26` 耗尽；修正为优先复用 references=0 的已 release 槽，再选择未用槽，保留 consumed 依赖，避免所有历史 staging 消费槽持续占用引用。`stress-reuse-ctest.log` 中传输和运行时测试 **2/2 通过，3.38 s**。
+
+同层回写与历史预取回归先在原阻塞读取上失败（延迟约 62 ms），再由 `prefetch_completed` 读取已经发布的归档范围通过；读取与正在回写的页重叠时仍拒绝。基础传输/状态机/预算测试首次 **3/3 通过，1.84 s**。量化预算按四个真实 plane 计算，INT8 128K 流式层 **264 MiB**，rk4 **136 MiB**，再加 64 MiB；small-T S64 scratch 与 state 的独立最大尺寸均计入 partial，而不归入元数据。固定 staging override 会先提高视图最小页数再建立容量曲线，不能在较小视图的探测候选上错误拒绝可行配置。
+
+CLI/serve 本步最小配置为 `--kv-mode tiered-exact`、`--kvmem-view-tokens`/`--kvmem-view`、`--kvmem-sink-tokens`/`--kvmem-sink`、`--kvmem-host-archive`、`--kvmem-staging-mib`。普通 tiered 以 view 为物理上限、`max-context` 为逻辑容量，旧 `kv-capacity` 仅用于 dense/影子完整设备池；帮助和加载日志明确此语义。dense 默认分派/内核未改。BF16 帮助注明仅保证功能、不承诺性能。
+
+数据位于仓库外 **`D:\deeplearning\NInfer\logs\kvmem-stage4-runtime`**，旧基线不覆盖。INT8 4K 容量/2K 视图/MTP-3 的算术冒烟答案为 **5**，正常运行退出 0，text prefill **0.710 s**。32K INT8/8K 视图影子比对退出 0，共 32 块、512 个层输出；真实流式字节 **10,378,739,712**，全层最大相对 L2 **0.000269830**、最大绝对误差 **0.25**。影子模式逐层读回、同步与 CPU 比较，**142.450 s** 仅为验证开销，不能代替普通模式性能结果；该例仅生成 1 token，未计为 needle/decode 门禁通过。
+
+rk4v4-e8 的 32K/8K 视图影子第一次运行在首全注意力层、frontier=1024、尚无流式页时失败：相对 L2 **0.00250436**、最大绝对误差 **0.03125**。日志 `shadow-32k-rk4.stderr.txt` 与失败结果保留；门禁 `1e-3` 不放宽。该次失败已在新 finalizer 的 BF16 输出边界修正，32K 后续 GPU 影子通过；dense 未改，262K 后续失败的另一根因见下文。
+
+128K INT8/32K 视图影子第一次运行也通过：128 块、2048 个层输出，相对 L2 最大 **0.000589935**、最大绝对误差 **0.25**，实际流式字节 **161,109,442,560**；逐层读回验证的 text prefill **605.497 s** 不作为性能数值。正常模式的 32K/8K 与 128K/32K INT8、MTP-3 needle 均答对 **73184269**，均生成 64 token，text prefill 分别 **14.633 s / 73.609 s**，decode **41.89 / 11.93 tok/s**；普通运行的 GPU ready 累计等待分别约每层 **56.67–66.81 ms / 277.74–303.70 ms**。详见 `needle-32k-int8.result.json`、`needle-128k-int8.result.json`。
+
+**旋转格式的最终 BF16 边界。** 捕获同一层 dense/partial 输出及原始坐标 FP32 `(O,l)`，在 CPU 用 FP32 H64 复现 `O/l → H64 → BF16 RNE → H64 → BF16 RNE`，相对 L2 从 **0.00250436328** 降为 **0.000109229787**（最大绝对误差 **0.0078125**）。这对应现有 dense launcher 在旋转坐标中先 BF16 写出、再逆旋转的两次舍入；新 partial 原本在 FP32 中直接逆旋转，最后才 BF16 写出。证据位于 `rotation-diagnostic/analysis.json`，不是主机页或访问列表寻址差异。新增可选 rotated finalizer 只对齐最终输出边界，FP32 原始坐标 O/m/l 与固定顺序 LSE carry 完全保留，旧 finalizer/融合合并和所有 dense kernel/helper 不改。新测试独立 FP64 H64 矩阵、直接 FP64→BF16 RNE oracle（相对 L2 **1e-3**）、精确 tie 逐位、空行 NaN payload、输入状态不改和 64 次重复；CUDA 构建、独立 FP64/64 次重复和三个 sanitizer 已实跑通过；32K RK4 GPU 影子最大相对 L2 为 0.000620063，最大绝对误差 0.25。CPU 复现本身不算门禁通过，262K 后续结果见下文。
+
+**自动预算预留修正。** 最初普通 tiered 将旧 Explicit KV 策略转 Auto 时，误沿用 Explicit 的零自动预留值；262K INT8/MTP-3/128K 视图运行后空闲显存约 **276 MiB**，超过 **606.1 s** 尚未完成 prefill，已停止该候选而不冒充完整计时。NVML 采样 TX **2,852,099–4,450,146 KiB/s**、RX **1,757,031–2,439,746 KiB/s**，提示 WDDM 迁移，但没有 Nsight profile，不能仅凭流量确定原因。日志与 `needle-262k-int8-c1024.aborted.json` 保留。普通 tiered 现在对忽略的 Explicit 策略使用 Auto 默认 **1 GiB** 预留；用户显式 Auto 的预留覆盖仍保留，dense/影子策略不变。CPU 回归先实跑失败退出 1（`headroom-red-test-v2.log`），修正后构建/运行通过。修正后按统一预算重测，262K 两档性能均通过，实际预算和结果见下文。
+
+**整页回写的初始化缺陷。** 运行时 initcheck 首次报告 **129024 errors**：尾页只 append 了有效 token，归档回写整个 plane 页时读取未写入的 suffix 字节。因果掩码不读取这些 token，但整页 DMA 仍必须有定义的源。新增完整 suffix 字节回归先退出 1（`page-tail-red-test.log`）；现在只在新逻辑页首次分配时、按 producer compute stream 顺序清零该物理页的全部层/plane，然后 append。已有尾页保留前缀，HostOnly 尾页继续 restore，不触碰普通 dense 的池或内核。回归 GREEN，修正后的三个检查全部通过：initcheck/synccheck **0 errors**，racecheck **0 hazards/0 errors/0 warnings**（`page-tail-green-*.log`）。本次全 attention 数值测试的三 sanitizer 也全部通过：racecheck **0 hazards/0 errors/0 warnings**，synccheck/initcheck **0 errors**；7 项选定 CTest **7/7 通过，8.73 s**，当时最终端到端和全量 CTest 尚未完成，后续完整结果见本节下文。
+
+**普通模式整模型性能已通过。** 32K/8K 视图、128K/32K 视图和 262K INT8 的 MTP-3/64-token needle 均答对 73184269；可分页归档的 32K 也答对，prefill 17.822 s。262K 1024/2048 分块的数据如下，旧数据全部保留：
+
+| 分块 | 实际 GPU 视图 token | Main MiB | staging MiB | partial MiB | text prefill s | 对 dense 212 s 的比例 | 16 层 GPU ready 累计等待 ms | 整卡峰值/最低空闲 MiB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 108800 | 3506.250 | 372.859 | 48.375 | 226.582 | 1.06878 | 11448.705 | 23896 / 247 |
+| 2048 | 101120 | 3258.750 | 388.328 | 96.750 | 216.716 | 1.02225 | 10040.328 | 23592 / 551 |
+
+两档均低于 243.8 s（1.15×212）。数据是一次采样，不承诺不同桌面负载下严格复现；1 GiB 是加载期预算预留，不是整卡运行期间最低空闲保证。GPU ready 等待含 prefill 与后续 64-token decode，不等于仅 prefill 或总 DMA 时间，不能据此声称精确传输覆盖率。普通每层每块只有一次 partial：272×16=4352 / 144×16=2304，没有四遍 decode 或容量后备路径触发。逐层 ready 与独立 CPU enqueue 计时在各 `.stderr.txt`/`.result.json`，完整命令、二进制 SHA、NVML 1 s 整卡采样及原始输入路径均保留。
+
+上述两次运行的加载日志给出以下实际设备预算（B，不是最高运行占用估算）。Main、MTP KV pool payload 与独立 tiered backing 分开；表不包含模型权重，也不能把它的和当作整卡显存峰值：
+
+| 项目 | chunk 1024，B | chunk 2048，B |
+|---|---:|---:|
+| Main 视图 | 3676569600 | 3417047040 |
+| MTP 完整 dense pool | 553783296 | 553783296 |
+| staging（层全部流式量 + 64 MiB） | 390971392 | 407191552 |
+| partial FP32 scratch + state | 50724864 | 101449728 |
+| 元数据/固定区，含对齐 | 164608 | 164608 |
+| 通用 workspace | 180953088 | 361906176 |
+
+两档逻辑页容量均 4096；访问列表为加载期三个独立的 `{logical_page, physical_page}` buffer，**3×32768=98304 B**；前缀和 **3×16388=49164 B**；逻辑块表 **16384 B**，三项有效字节共 **163852 B**，元数据固定区其余 **756 B** 为区域对齐。普通模式未分配 shadow 输出。锁页主机归档 **8858370048 B（8.25 GiB）**，直传、中转环 **0 B**；可分页 32K 验证则使用固定 **4×64 MiB** 锁页环，二者不是设备 staging 的一部分。
+
+本步 tiered 明确关闭 **turn checkpoint、retained resume、磁盘 prompt/state 缓存与 CUDA Graph**（eager 执行）；相关配置、发布及恢复入口均不产生可复用 tiered 快照，日志说明关闭。MTP 本身仍开启，MTP pool 保持 dense，未做第 5 步窗口化；Main 的页 trim/reset 仍受测试覆盖，不能把 checkpoint 关闭等同于关闭这些页生命周期操作。
+
+**262K RK4 原影子判据失败的确定性复现与根因（2026-10-01，历史记录）。** `shadow-262k-rk4-fixed` 在全注意力层 6、frontier **146432** 失败：相对 L2 **0.0010094**、该层最大绝对误差 **0.125**，门禁仍为 `1e-3`。完整 dense KV 和测试资源实际可放下，不能按显存不足跳过。失败数据、原二进制 SHA 与日志均保留。捕获同一份 Q、位置、四个 resident/staging plane、访问列表/前缀及完整输出后，仓库外 `alpha-repro.cpp` 重算 dense 与 partial 均和捕获结果**逐位相同**；一 split 的误差仍为 **0.0010094**，2/4/8 split 为 **0.00269704 / 0.00313621 / 0.00330881**，增加 split 不能解决。
+
+根因已由算术消融坐实：dense prefill 的 alpha 为 `exp2(fma(m, scale_l2, -RN(nm*scale_l2)))`，当 `m==nm` 时仍残留乘积舍入误差；新 partial 先减再乘，指数严格为零。仅在临时新 partial 的 prefill alpha 中照搬 dense FMA（概率仍先减再乘），同一固定输入的误差下降到 **0.0000645685**；dense 输出仍逐位不变。该改法**不能提交**：既有独立 FP64 大公共 logit 测试退出 **1**，例如 RK4/T64/common=1e10 的第一项实际 **0.75**、数学参考 **0.257692**。也对未修改的 dense A3 API 直接跑了独立均匀注意力参考（两个页相同 K、前 64 key 的 V code=1、后 64 code=3）：RK4/common=1e10 的相对 L2 **0.808230**、第一项 **0.730469** 对 **0.257692**；INT8/common=1.2e10 产生 NaN，RK4 同档产生 Inf。极端公共值是诊断，不替代模型代表范围的质量基准，但证明这种 FMA 写法破坏了公共 score 平移不变性。模型固定输入的消融直接说明长历史的实际影子超限主要由 dense alpha 累积舍入引起，不是主机寻址/页传输不一致。
+
+独立捕获数据的 FP64 native-Q8 参考另保留在 `alpha-capture/profile-oracle.json`，选择八个最大逐行差异与四个固定 head 的全部结果，不挑选有利样本；它包含 Q8/FP16 V 计算边界，不等同于主 BF16-Q 数值合同，不能单独据此宣称所有输出比 dense 更精确。实际最大值对应的稳定 alpha 舍入残差约 ±9.54e-7，24576 行中 21892 行的 alpha 不等于 1；连续 2288 块的示意旧项倍率约 **0.998501–1.001638**，这里只是累计量级分析，不是完整时序乘积实测。
+
+证据在外部 `alpha-capture/`、`alpha-repro-{baseline,alpha-only,alpha-only-confirm}-run.log`、`alpha-only-oracle.log`、`alpha-oracle.log`，固定数据捕获运行人为停止且跳过前面各层的 CPU 比较，**不计门禁通过**。临时 alpha 改动和全部源码捕获/完整 logits 钩子均已撤回；不放宽门禁，不把错误 FMA 引入新路径。尚未找到经过完整门禁验证的一般性新路径修正，也未证明所有新路径修正都不可能。当时按用户“不要改 dense 内核/分派”和 D1 的限制，请求用户决定是否另行授权修复 dense prefill 的 alpha/概率指数（先相减再乘）并重录相关金标准，阶段第 4 步未提交/push。**后续用户已明确不修改 dense，并批准仅对 262K 改用 FP64 判据；本段不再是待授权请求，修订与新实测见后文。**
+
+**262K RK4 门禁 B 已通过。** 固定 `needle-262k-90`，dense/tiered-exact 各独立运行三次，MTP-3、贪心、无 vision、无 CUDA graph，每次生成 64 token。六次均答对 73184269，全部 token ID 完全一致；每次 draft/accepted 均为 **47/47（100%）**。对九个 dense/tiered 配对逐步比较有效词表（248077 项）的 BF16 完整 logits，共同前缀均为 64，无分歧点。dense 三次两两最大相对 L2 为 **0.3937184153**，按既定规则得到包络 **0.7874368307**；dense/tiered 九配对的最大值 **0.4103691463**，均在包络内。这是带现有模型 logits 波动包络的门禁通过，**不表示逐位 logits 一致，也不抵消原门禁 A 的超限；262K 的用户修订后 FP64 判定另见后文**。本轮未进一步定位或修改 Q5 波动。
+
+临时完整 logits 钩子只存在于仓库外归档诊断二进制 `stage4-diagnostic-ninfer.exe`（SHA-256 `03e6e0305e911904253b10758142cbb0c24d87c97f3cd7ed4667b016a5394789`），源码已撤回；本组未开启 alpha 捕获/旋转输出捕获。完整命令、输入、64 个 token ID、词表 logits 和 MTP 接受元数据保留于 `gate-b-{dense,tiered}-{1,2,3}.*`。仓库外 `run_gate_b.py`/`check_gate_b.py` 顺序执行并验算，结果 `gate-b-summary.json`，退出 0。最后一次 tiered prefill 228.529 s 与前两次 208.347/209.643 s 的差别如实保留；门禁 B 时序不替代上述 INT8 性能门禁。
+
+**FP64 修订前清理版本的构建与 CTest（历史验证）。** 全部临时源码诊断已撤回后的产品配置（benchmarks OFF）完整构建退出 **0**；随后再次完整构建确认 `ninja: no work to do`。全量 CTest **103 项：99 通过、4 跳过、0 失败，233.42 s**，串行 `-j 1`，为真实 Qwen3.8-27B 权重和视觉 GGUF 设置路径。四项跳过为 Qwen3.6-27B prefix real、35B-A3B real、35B-A3B DFlash real 与 DFlash load-plan，缺少对应测试制品；不计为通过。日志为 `clean-full-build.log`、`final-full-build.log`、`final-full-ctest.log`，复现脚本 `run-production-full-checks.ps1`，均在仓库外数据目录。最终产品 `build-vision-integration/apps/ninfer.exe` 的 SHA-256 为 `5f3763ac9181985341ccf1253cf6ea763841811061c5b6c932c41f11ced396ed`。最终检查 `git diff --check` 退出 0，源码无临时 capture/logits 钩子，dense prefill/decode 内核、原 launcher/wrapper 及新 partial 主体与基线相比无修改；正常 LF→CRLF 提示不表示空白错误。当时分支与 origin 均在 `7f01b0d5`，本步改动留在工作区。规格与质量审阅已通过，但原门禁 A 超限，因此当时未提交/push。后续用户批准 FP64 判据并完成三层验证，结果见下文；没有开始 MTP 窗口化或 checkpoint 恢复。
+
+**用户修订后的 262K FP64 验证（2026-10-02，通过）。** 原始 0.0010094 超限和消融证据保留；用户明确不修 dense，只修订 262K 档门禁 A。临时诊断完整跑到 262080 输入 token，不因旧 1e-3 提前终止，逐层逐块仍计算并记录 tiered/dense 的相对 L2 和最大绝对误差，下游始终用 dense。整个影子过程最大相对 L2 为 **0.00143766**；按各层全程最大值取前三名：第 **7（0.00143766）、6（0.00143742）、8（0.00135455）** 层，含原超限第 6 层。原始完整日志、排名和抓取 SHA 均在 `shadow-262k-rk4-fp64-capture.*`、`fp64-layer-selection.json`、`fp64-capture-binary.json`。影子 prefill 1410.467 s 含诊断读回与落盘，不是普通路径性能。原判据下退出 0 的诊断捕获本身不表示新门禁通过。
+
+在三层分别取最后一个 prefill 块（位置 **261120–262079，T=960**），抓取原始 BF16 Q、位置、dense/tiered BF16 输出及量化 K/V/FP16 scales。抓取时每个 logical page 的混合 resident/staging 四个 plane 与完整 dense pool 原字节逐字节核对，每层 **285143040 B** 全部一致；仅落盘一次规范逻辑页布局，参考不依赖 CUDA 解码。仓库外 `fp64-full-oracle.cpp` 直接包含并调用 `tests/ops/attention_reference.h` 的 FP64 `hadamard()` 与 `oracle()`，signed nibble×原 FP16 scale 后做独立 H64 解码；原始 BF16 Q、因果掩码、double scores/softmax/加权输出，无 Q8 重量化或 HALF V staging 近似。每层完整 **960×24×256=5898240** 个输出聚合，报告三组相对 L2 与最大绝对误差，FP64 参考不做 BF16 最终舍入。六个 CPU 线程只并行独立 token，不改变每行参考的求和顺序；原单元测试 oracle 源码未改。临时抓取源码已从前置完整备份恢复，诊断二进制保留仓库外；任何一个完整层失败即停，不选择有利行或再改判据。
+
+隐藏影子模式的正式判定策略也按修订更新：**仅 262144 logical context 的 RK4（packed K/V、rotate K/V、E8 非 root）** 不因 tiered/dense 的旧 1e-3 先退出，仍检查有限值、逐层记录误差，并在构造/汇总明确打印 `criterion=offline_fp64 status=not_evaluated` 与“退出 0 不是门禁结论”；不在产品中运行巨大 CPU oracle，也不加入临时捕获钩子。32K、128K 和其他格式仍保留严格 1e-3，正常 shadow 关闭时不增加拷贝、算子或同步。预算 CTest 对该策略正反例先 RED（`fp64-policy-red-test.log`，退出 1），实现后 GREEN（退出 0）；只读审阅参考工具与该小改动均通过。
+
+该正式策略与临时抓取清理完成后再次全量构建退出 **0**，CTest **103 项，99 通过、4 制品缺失跳过、0 失败，327.93 s**（`fp64-rule-final-full-build.log`、`fp64-rule-final-full-ctest.log`，脚本 `run-fp64-rule-full-checks.ps1`）。本轮 CTest 与独立 CPU oracle 同时运行，时间不作为性能指标，GPU 上没有并行模型测量。最终产品 `ninfer.exe` SHA-256 为 `e4f7e13433952b0a46f4b48e48b484e1b80239db9ba558d0fef1794c892442eb`，临时诊断 marker/capture 环境钩子已清除；`git diff --check` 退出 0，dense 内核/分派不改。FP64 三层判定独立完成且通过，结果见下表；CTest 全通过不代替门禁 A。
+
+
+**完整末段块的 FP64 结果。** 相对 L2 用对应参考的完整块范数，两个 FP64 比较使用同一个参考范数；最大绝对误差独立记录，不用于改写相对 L2 判据。
+
+| FA 层索引（日志 0 基） | dense/FP64 相对 L2 | tiered/FP64 相对 L2 | tiered/dense 相对 L2 | dense/FP64 最大绝对误差 | tiered/FP64 最大绝对误差 | tiered/dense 最大绝对误差 | 新判据 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 7 | 0.00543534623365 | 0.00542739712411 | 0.00138025890506 | 0.575143965979 | 0.575143965979 | 0.125 | 通过 |
+| 6 | 0.00516397129311 | 0.00516044643686 | 0.00143742396675 | 0.341367090559 | 0.353200096628 | 0.125 | 通过 |
+| 8 | 0.00425544989244 | 0.00424812821871 | 0.00115082877968 | 0.438819035622 | 0.438819035622 | 0.125 | 通过 |
+
+三层各 5898240 个输出均满足新判据，没有删行或再调标准。第 6 层的最大绝对误差 tiered 为 0.353200096628，高于 dense 的 0.341367090559；如实记录，此项不属于用户批准的相对 L2 判据。CPU oracle 耗时分别为层 6 **2092.581 s**、层 7 **1678.537 s**、层 8 **1559.988 s**，是独立参考的计算成本，不是 NInfer 推理性能。CPU 参考原始输出（FP64 全数组）、完整 JSON 和日志在 `fp64-capture-262k/layer-{7,6,8}/oracle-full.*`、`fp64-layer-{7,6,8}-full.log`；汇总 `fp64-gate-a-summary.json`。
+
+复现：先在 x64 MSVC 环境执行外部 `build-fp64-full-oracle.ps1`，再执行 `fp64-full-oracle.exe <数据目录>/fp64-capture-262k/layer-6`；通过后依次计算 layer-7、layer-8，任一非零退出即停止，`run-remaining-fp64.ps1` 实现这一顺序。此程序直接包含仓库单元测试 reference header；构建不启用 fast-math，六线程只并行独立 token。
+
+**本步代码提交（2026-10-02，feat/kvmem）。**
+
+- `6466a166` — `fix(ops): preserve rotated BF16 boundary in partial attention`：新 partial 的旋转 BF16 输出边界与独立 FP64/64 次重复回归；不修改 dense。
+- `d33157a9` — `feat(kvmem): integrate exact tiered KV runtime and budgets`：Main 视图状态机、主机归档/跨层预取接线、统一预算、产品参数、显式关闭的功能、影子策略与对应 CTest。
+- README、设计、实施清单和本测量记录随独立文档提交发布；推送目标仅 `origin/feat/kvmem`，没有合并其他分支。本步达到审阅条件，范围止于第 4 步，未开始第 5 步。
+
 ## 阶段 4：稀疏 decode
 
 - 状态：未开始
@@ -363,3 +450,5 @@ foreach ($check in @('racecheck', 'synccheck', 'initcheck')) {
 | 2026-09-30 | D3 前提 | 后续分层视图保留原始逻辑页号，不直接以紧凑视图槽号代替位置；阶段 0′ 不实现 | `paged_kv_address.cuh:16` 和 prefill/decode 内核按 `position >> 6` 查块表并以原始 key 位置做掩码，详见上文静态核对 | 是，用户明确选择“保留原始页号” |
 | 2026-09-30 | D4 | 默认 `auto`：加载期整块 CUDA 锁页且剩余物理内存 ≥4 GiB 则归档直传，否则释放部分分配后退回可分页归档与 4×64 MiB 中转环；显式 `pinned` 失败即退出，`pageable` 保留旧路径。两者统一「层 → plane → 逻辑页」布局 | 262K 就绪后整块可锁页 15488 MiB；锁页 H2D 9.83 GiB/s，可分页经环端到端 4.19 GiB/s。旧「4090 WDDM 锁页限额更紧」的推断不成立，4060 仍须实测 | 是，用户明确同意修订 |
 | 2026-10-01 | D1，用户授权例外 | 仅修复已知的 dense 量化 small-T 注意力共享内存竞争，独立修复分支合入后重录九组金标准，旧数据保留；Q5 和 dense 分派不改 | 原版 racecheck 64 hazards，修复后 0；12 组各 64 次逐位一致且 FP64 oracle 通过，详见修复记录 | 是，本轮用户明确要求现在修复，并限定文件与两处 barrier |
+| 2026-10-01 | D1 与门禁 A | 262K RK4 的新路径与当前 dense 在 146432 token 处相对 L2 0.0010094，固定输入消融确认 dense prefill alpha 的 FMA 舍入累积；照搬它会破坏现有 FP64 公共 logit 测试。保持门禁和正确新路径，是否另行修 dense 须用户决定 | 固定输入 dense/partial 重算均逐位一致；临时 alpha-only FMA 将两者误差降到 0.0000645685，但独立数值测试失败，未修改 dense 的均匀参考直接出现大误差/非有限输出，详见上文 | 已决定不修 dense；262K 门禁 A 后续按 FP64 修订见下一行，原失败保留 |
+| 2026-10-02 | 门禁 A，D1 保持 | 32K/128K 的 tiered/dense 1e-3 不变；262K RK4 按影子误差选至少三个层（包括原超限层）的末段完整块，采用同一量化 KV 字节的 CPU FP64 oracle，要求逐层 tiered/FP64 相对 L2 不超过 dense/FP64；同时记录 tiered/dense 数值 | **在测得 0.0010094 之后**依据固定输入 alpha 消融作出的事后修订，保留原失败与所有数据；不修改 dense、不放宽任何其他门禁 | 是，用户明确同意；新判据实测通过 |

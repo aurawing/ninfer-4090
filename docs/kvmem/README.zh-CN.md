@@ -45,8 +45,8 @@
 | 内存 | 32 GB DDR4 |
 | 总线 | PCIe 3.0 x16（Comet Lake 不支持 4.0），理论 15.75 GB/s |
 | 工具链 | MSVC、CUDA 13.3、vcpkg、Ninja；构建命令见 `docs/vision-weight-modes.zh-CN.md` 的"构建"一节；llama.cpp 固定在 `b81c99b4`（`NINFER_GGML_SOURCE_DIR`） |
-| 模型 | `qwen3_8_27b.ninfer`（groupwise-int，内嵌视觉）：TODO 用户填写路径 |
-| 视觉 GGUF | `mmproj-BF16.gguf`：TODO 用户填写路径 |
+| 模型 | `D:\deeplearning\NInfer\models\qwen3_8_27b.ninfer`（groupwise-int，内嵌视觉） |
+| 视觉 GGUF | `D:\deeplearning\kvmem-v0.16.0-rc3-windows-x86_64-cuda13.2.86\models\Qwen3.8-27B\Qwen3.8-27B\mmproj-BF16.gguf` |
 | 测试环境变量 | `NINFER_QWEN3_8_27B_WEIGHTS`、`NINFER_TEST_VISION_GGUF` |
 
 现有基线（出自 `docs/vision-cpu-gguf.md` 和 `docs/vision-weight-modes.zh-CN.md`）：
@@ -177,6 +177,11 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
 2. **传输引擎**：可分页归档的中转环、锁页归档的直传、`kv_stage_stream`、跨层预取与事件同步；按真实多 plane 布局分别实测两种路径的「归档 → 设备 staging」吞吐。
 3. **内核**：prefill 注意力的"部分输出"变体，输出 `(O, m, l)`；合并内核。先覆盖 bf16、int8、rk4v4-e8，再补其余精度。
 4. **接线 `tiered-exact`**：视图固定为 sink 加最近的 token，更早的页流式送入。decode 也走流式路径，只用于验证。按 32K（强制小视图）→ 128K → 262K 逐级验证。
+   - 本步限定 C=1；每层每块按逻辑页升序发布一张 resident/staging 混合访问列表，prefill 一遍，decode 至多两遍。staging 在加载期按该层最大流式量加 64 MiB 规划；若后续使用容量不足的后备多遍路径，必须记录日志，不能让四遍 small-T 成为热路径。
+   - 最小 CLI/serve 开关为 `--kv-mode tiered-exact`、`--kvmem-view-tokens`（别名 `--kvmem-view`）、`--kvmem-sink-tokens`（别名 `--kvmem-sink`）、`--kvmem-host-archive auto|pinned|pageable` 和可选 `--kvmem-staging-mib`。逻辑容量仍由 `--max-context` 决定，物理视图由 view 上限和统一显存预算确定；`--kv-capacity` 保留 dense/影子验证的原语义，不作为普通 tiered 的物理容量开关。
+   - BF16 tiered 仅保证功能，不承诺性能。MTP pool 在本步保持 dense；turn checkpoint、retained resume、磁盘状态缓存显式关闭，分别待第 5、6 步实施窗口化和复用。
+   - 加载期普通 tiered 的 Auto 预算默认预留 1 GiB，视图上限不保证全部分配。staging 必须容纳整层流式页加 64 MiB；固定覆盖不足时先提高最小视图，仍无可行预算则拒绝加载，不在 decode 热路径改成四遍。
+   - 隐藏测试环境变量 `NINFER_KVMEM_SHADOW=1` 启用门禁 A；配合 `--kv-mode tiered-exact` 和强制小视图使用。`NINFER_KVMEM_TRANSFER_TIMING=1` 单独启用每层 ready 等待的 CUDA event 累计计时；默认关闭，无计时事件/同步开销。影子读回的 prefill 耗时不作为普通路径性能指标。
 5. **MTP 窗口化**（D11）。
 6. **两个复用点**（D12）。
 7. **准入与 CLI**（D13、D14），同时改写 `paged-kv-cache.md` 里的 non-goal 条款。
@@ -184,7 +189,11 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
 
 退出标准：
 
-- **A，同一次运行的影子注意力门禁**：新增仅用于测试、默认关闭的隐藏参数或环境变量；关闭时 dense 与 tiered 路径均不增加开销。开启时保留设备上的完整 dense KV，并把主机归档作为镜像。每个全注意力层对同一份 Q、同一份 KV 字节分别执行 dense 注意力和 `tiered-exact` 注意力；后者强制小视图，把视图外页视为未驻留，真正经过归档 → staging、部分注意力与 LSE 合并。逐层输出相对 L2 `||tiered-dense||₂/max(||dense||₂, 1e-12)` 不超过 **1e-3**，同时记录最大绝对误差；下游始终使用 dense 输出，保证各层输入相同。**32K（约 8K 视图）与 128K（约 32K 视图）必做**；262K `rk4v4-e8` 在完整 dense KV 加测试资源可放下时执行，否则记录实际显存缺口和原因。此门禁不再要求两次独立 dense 运行逐位相同。
+- **A，同一次运行的影子注意力门禁**：新增仅用于测试、默认关闭的隐藏参数或环境变量；关闭时 dense 与 tiered 路径均不增加开销。开启时保留设备上的完整 dense KV，并把主机归档作为镜像。每个全注意力层对同一份 Q、同一份 KV 字节分别执行 dense 注意力和 `tiered-exact` 注意力；后者强制小视图，把视图外页视为未驻留，真正经过归档 → staging、部分注意力与 LSE 合并。下游始终使用 dense 输出，保证各层输入相同；此门禁不要求两次独立 dense 运行逐位相同。
+
+  - **32K（约 8K 视图）与 128K（约 32K 视图）必做**：逐层输出相对 L2 `||tiered-dense||₂/max(||dense||₂, 1e-12)` 不超过 **1e-3**，同时记录最大绝对误差，原判据不变。
+  - **262K `rk4v4-e8`**：完整 dense KV 加测试资源可放下时执行，否则记录实际显存缺口和原因。按影子相对 L2 选择误差最大的至少三个全注意力层，包含此前超限的层；每层至少取 prefill 末段一个完整块。用单元测试同一套 CPU FP64 oracle，从该块原始 BF16 Q 和同一份量化 KV 字节解码计算参考输出。每层分别报告 dense/FP64、tiered/FP64、tiered/dense 的相对 L2 和最大绝对误差；**各层的 tiered/FP64 相对 L2 必须不超过 dense/FP64，相对 L2 的参考范数均取 FP64 输出**。任何一层不满足就停止报告，不再调整判据。继续记录 tiered/dense 数值，不以它的 1e-3 为本档退出标准。用户在测得 0.0010094 之后，根据固定输入 alpha 消融证据同意此修订；dense 内核、分派和金标准不改，详见 progress 偏差表。
+
 - **B，decode 门禁**：同一 262K 用例，MTP-3 分别运行 dense、`tiered-exact` 各 **3 次**，每次解码 64 个 token。在逐 token 的共同前缀上计算完整词表 logits 相对 L2，每步不超过 `max(1e-3, 2 × dense 三次两两比较所得的最大相对 L2)`；若出现分歧，记录首个分歧步、双方候选 ID 和对应运行的 logits，仅当该步 dense 的 top-1/top-2 差值不超过 dense 三次在该步观测到的最大差距波动时通过并列判据。每次 needle 都须答对，同时记录 MTP 接受率；分歧后不同生成轨迹的 logits 不作逐步误差比较。
 - int8 归档能完整跑完 262K，prefill 时间不超过 dense 的 1.15 倍；
 - 多轮复用正确；
