@@ -84,4 +84,13 @@ plan_attention_partial_workspace(int max_tokens, int preferred_splits, std::size
 void attention_partial_finalize(const AttentionPartial& input, Tensor& output,
                                 cudaStream_t stream); // BF16 [256,24,T]
 
+// Optional rotated-V output epilogue for a single merged FP32 state. For each
+// 64-coordinate group: normalize O/l, apply normalized Sylvester H64, round to
+// BF16 (nearest-even), apply H64 again, and round the original-basis result to
+// BF16. This matches the rotated-V dense output rounding boundary. O,m,l stay
+// bitwise unchanged in original V coordinates; l<=0 ignores O and emits zeros.
+// Same shape, storage and non-overlap contract as attention_partial_finalize.
+void attention_partial_finalize_rotated(const AttentionPartial& input, Tensor& output,
+                                        cudaStream_t stream);
+
 } // namespace ninfer::ops

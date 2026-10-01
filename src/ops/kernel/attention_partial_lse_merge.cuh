@@ -1,4 +1,5 @@
 #pragma once
+#include "ops/kernel/gqa_attention_kv_quant.cuh"
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <math_constants.h>
@@ -68,5 +69,26 @@ __global__ void attention_partial_finalize_kernel(const float* o, const float* l
         const float denominator = l[i / 256];
         result[i]               = __float2bfloat16(denominator > 0 ? o[i] / denominator : 0.0f);
     }
+}
+
+// One row per 128-thread CTA, one complete warp per 64-coordinate group.
+// Each lane owns coordinates lane and lane+32. All lanes execute both H64
+// calls with a full mask; no partial-warp synchronization or shared scratch.
+__global__ void attention_partial_finalize_rotated_kernel(const float* o, const float* l,
+                                                          __nv_bfloat16* result) {
+    constexpr unsigned FullMask = 0xffffffffu;
+    const int row = int(blockIdx.x), group = int(threadIdx.x) / 32,
+              lane = int(threadIdx.x) & 31;
+    const std::int64_t i = std::int64_t(row) * 256 + group * 64 + lane;
+    const float denominator = l[row];
+    // Ignore even NaN O payloads for neutral rows, as the standard finalizer does.
+    float x0 = denominator > 0 ? o[i] / denominator : 0.0f;
+    float x1 = denominator > 0 ? o[i + 32] / denominator : 0.0f;
+    gqa_kv_hadamard64(x0, x1, FullMask);
+    x0 = __bfloat162float(__float2bfloat16_rn(x0));
+    x1 = __bfloat162float(__float2bfloat16_rn(x1));
+    gqa_kv_hadamard64(x0, x1, FullMask);
+    result[i] = __float2bfloat16_rn(x0);
+    result[i + 32] = __float2bfloat16_rn(x1);
 }
 } // namespace ninfer::ops

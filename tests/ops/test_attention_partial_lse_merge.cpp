@@ -4,6 +4,172 @@ using namespace ninfer::test;
 using namespace ninfer::test::partial_attention_reference;
 
 namespace {
+// Direct H64 matrix multiplication in FP64 is independent of the device
+// butterfly/shuffle schedule. H64 is orthonormal and its own inverse.
+std::array<double, 64> reference_h64(const std::array<double, 64>& input) {
+    std::array<double, 64> output{};
+    for (int i = 0; i < 64; ++i)
+        for (int j = 0; j < 64; ++j) {
+            unsigned bits = unsigned(i & j);
+            bool negative = false;
+            while (bits) {
+                negative = !negative;
+                bits &= bits - 1;
+            }
+            output[i] += (negative ? -input[j] : input[j]) * 0.125;
+        }
+    return output;
+}
+
+// Round the FP64 mathematical value directly to BF16, including halfway ties.
+// No CUDA helper, FP32 conversion, or intermediate BF16 original-basis round.
+std::uint16_t reference_bf16(double value) {
+    const auto sign = std::uint16_t(std::signbit(value) ? 0x8000 : 0);
+    value = std::abs(value);
+    if (!value) return sign;
+    if (!std::isfinite(value))
+        return std::uint16_t(sign | (std::isnan(value) ? 0x7fc0 : 0x7f80));
+    int exponent;
+    const double fraction = std::frexp(value, &exponent);
+    const bool subnormal = exponent < -125;
+    const double scaled = subnormal ? std::ldexp(value, 133) : fraction * 256;
+    auto rounded = std::uint32_t(std::floor(scaled));
+    const double remainder = scaled - rounded;
+    if (remainder > 0.5 || (remainder == 0.5 && (rounded & 1))) ++rounded;
+    if (exponent > 128) return std::uint16_t(sign | 0x7f80);
+    const auto magnitude = subnormal ? rounded :
+                                      std::uint32_t((exponent + 126) * 128) + rounded - 128;
+    return std::uint16_t(sign | std::min(magnitude, std::uint32_t(0x7f80)));
+}
+
+int test_rotated_finalize_oracle(int tokens, bool exact_boundary, bool sharp) {
+    const int rows = 24 * tokens;
+    Parts input(tokens, 1);
+    std::vector<float> o(std::size_t(rows) * 256), m(rows), l(rows);
+    std::vector<std::uint16_t> expected(o.size()), ordinary(o.size());
+    for (int row = 0; row < rows; ++row) {
+        const bool empty = row % 11 == 0;
+        m[row] = empty ? -std::numeric_limits<float>::infinity() : float((row % 17) - 8);
+        double denominator = exact_boundary ? std::ldexp(1.0, row % 5) : 0.0;
+        if (!exact_boundary)
+            for (int key = 0; key < (sharp ? 2 : 23); ++key)
+                denominator += sharp ? (key ? 0.03125 : 1.0) :
+                                       std::exp(-double(key % 7) * 0.125);
+        l[row] = empty ? 0.0f : float(denominator);
+        for (int group = 0; group < 4; ++group) {
+            std::array<double, 64> values{};
+            if (exact_boundary) {
+                // Exact dyadic rotated values include even/odd BF16 halfway
+                // ties, alternating signs and different row/head/group data.
+                for (int d = 0; d < 64; ++d)
+                    values[d] = ((d + row + group) & 1 ? -1.0 : 1.0) *
+                                (1.0 + ((d * 7 + row * 3 + group * 11) % 127) / 256.0);
+                values = reference_h64(values);
+            } else {
+                // Independent sharp/soft probability-value sums; only O/l
+                // stored in the FP32 input defines the epilogue's oracle.
+                for (int d = 0; d < 64; ++d)
+                    for (int key = 0; key < (sharp ? 2 : 23); ++key) {
+                        const double weight = sharp ? (key ? 0.03125 : 1.0) :
+                                                      std::exp(-double(key % 7) * 0.125);
+                        values[d] +=
+                            weight * std::sin((d + 64 * group + 3 * row + 7 * key) * 0.173);
+                    }
+            }
+            for (int d = 0; d < 64; ++d) {
+                const auto index = std::size_t(row) * 256 + group * 64 + d;
+                o[index] = empty ? std::numeric_limits<float>::quiet_NaN() :
+                                  float(exact_boundary ? values[d] * l[row] : values[d]);
+                values[d] = empty ? 0.0 : double(o[index]) / double(l[row]);
+                ordinary[index] = reference_bf16(values[d]);
+            }
+            values = reference_h64(values);
+            for (auto& value : values) value = double(bf16_to_f32(reference_bf16(value)));
+            values = reference_h64(values);
+            for (int d = 0; d < 64; ++d)
+                expected[std::size_t(row) * 256 + group * 64 + d] = reference_bf16(values[d]);
+        }
+    }
+    input.o.copy_from_host(o.data(), input.o.bytes);
+    input.m.copy_from_host(m.data(), input.m.bytes);
+    input.l.copy_from_host(l.data(), input.l.bytes);
+    DeviceBuffer output(o.size() * 2);
+    Tensor out(output.p, DType::BF16, {256, 24, tokens});
+    std::vector<std::uint16_t> first;
+    for (int repeat = 0; repeat < 64; ++repeat) {
+        output.fill(255);
+        ops::attention_partial_finalize_rotated(input.tensors, out, nullptr);
+        cuda_synchronize();
+        const auto bits = from_device<std::uint16_t>(output, o.size());
+        if (repeat && bits != first) {
+            std::cerr << "FAIL rotated finalizer repeat mismatch\n";
+            return 1;
+        }
+        first = bits;
+    }
+    const auto after_o = from_device<float>(input.o, o.size()),
+               after_m = from_device<float>(input.m, m.size()),
+               after_l = from_device<float>(input.l, l.size());
+    if (std::memcmp(o.data(), after_o.data(), input.o.bytes) ||
+        std::memcmp(m.data(), after_m.data(), input.m.bytes) ||
+        std::memcmp(l.data(), after_l.data(), input.l.bytes)) {
+        std::cerr << "FAIL rotated finalizer changed FP32 input state\n";
+        return 1;
+    }
+    for (int row = 0; row < rows; ++row)
+        for (int d = 0; d < 256; ++d) {
+            const auto value = first[std::size_t(row) * 256 + d];
+            if (!std::isfinite(bf16_to_f32(value)) || (l[row] == 0 && value != 0)) {
+                std::cerr << "FAIL rotated finalizer non-finite/nonzero empty row\n";
+                return 1;
+            }
+        }
+    if (exact_boundary && (first != expected || expected == ordinary)) {
+        std::cerr << "FAIL rotated finalizer exact rounding boundary\n";
+        return 1;
+    }
+    std::vector<double> actual(first.size()), reference(expected.size());
+    std::transform(first.begin(), first.end(), actual.begin(),
+                   [](auto b) { return double(bf16_to_f32(b)); });
+    std::transform(expected.begin(), expected.end(), reference.begin(),
+                   [](auto b) { return double(bf16_to_f32(b)); });
+    const auto label = std::string("rotated finalizer FP64 boundary T=") + std::to_string(tokens) +
+                       (exact_boundary ? " exact ties" : (sharp ? " sharp" : " soft"));
+    return verify_reduction(label, actual, reference, {1e-3, 1.1e-3, 3.9e-3});
+}
+
+int test_rotated_finalize_validation() {
+    Parts input(2, 1), split_input(2, 2);
+    DeviceBuffer output(256 * 24 * 2 * 2);
+    Tensor out(output.p, DType::BF16, {256, 24, 2});
+    int failures = 0;
+    auto rejects = [&](const ops::AttentionPartial& state, Tensor bad) {
+        try {
+            ops::attention_partial_finalize_rotated(state, bad, nullptr);
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+    };
+    rejects(split_input.tensors, out);
+    rejects(input.tensors, Tensor(output.p, DType::FP16, {256, 24, 2}));
+    rejects(input.tensors, Tensor(output.p, DType::BF16, {256, 24, 1}));
+    rejects(input.tensors, Tensor(input.o.p, DType::BF16, {256, 24, 2}));
+    rejects(input.tensors, Tensor(input.m.p, DType::BF16, {256, 24, 2}));
+    rejects(input.tensors, Tensor(input.l.p, DType::BF16, {256, 24, 2}));
+    auto noncontiguous = out;
+    noncontiguous.nb[1] += 2;
+    rejects(input.tensors, noncontiguous);
+    auto bad = input.tensors;
+    bad.l = Tensor(input.l.p, DType::FP16, {24, 2});
+    rejects(bad, out);
+    bad = input.tensors;
+    bad.m = Tensor(nullptr, DType::FP32, {24, 2});
+    rejects(bad, out);
+    bad = input.tensors;
+    bad.o = Tensor(input.o.p, DType::FP32, {128, 24, 2});
+    rejects(bad, out);
+    return failures;
+}
+
 int test_large_common_logits(bool exhaustive_bytes = false) {
     int failures = 0;
     for (auto format : {Format::Int8, Format::Rk4v4E8}) {
@@ -274,6 +440,11 @@ int main() try {
     if (cuda_unavailable()) return 77;
     int failures =
         test_large_common_logits() + test_large_common_logits(true) + test_merge_oracle();
+    failures += test_rotated_finalize_validation();
+    for (int tokens : {1, 17, 65}) failures += test_rotated_finalize_oracle(tokens, true, false);
+    for (int tokens : {2, 65})
+        for (bool sharp : {false, true})
+            failures += test_rotated_finalize_oracle(tokens, false, sharp);
     if (ops::attention_partial_workspace_bytes(1024, 1) != 50724864 ||
         ops::attention_partial_workspace_bytes(1024, 2) != 76087296 ||
         ops::attention_partial_workspace_bytes(2048, 1) != 101449728)

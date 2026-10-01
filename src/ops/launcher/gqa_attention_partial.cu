@@ -134,4 +134,13 @@ void partial_finalize_launch(const AttentionPartial& input, Tensor& output, cuda
                                                   static_cast<__nv_bfloat16*>(output.data));
     CUDA_CHECK(cudaGetLastError());
 }
+
+void partial_finalize_rotated_launch(const AttentionPartial& input, Tensor& output,
+                                     cudaStream_t stream) {
+    const int rows = 24 * input.o.ne[2];
+    attention_partial_finalize_rotated_kernel<<<rows, 128, 0, stream>>>(
+        static_cast<const float*>(input.o.data), static_cast<const float*>(input.l.data),
+        static_cast<__nv_bfloat16*>(output.data));
+    CUDA_CHECK(cudaGetLastError());
+}
 } // namespace ninfer::ops::detail

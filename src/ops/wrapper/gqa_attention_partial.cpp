@@ -185,4 +185,12 @@ void attention_partial_finalize(const AttentionPartial& input, Tensor& output,
     for (const auto* p : {&input.o, &input.m, &input.l}) disjoint(*p, output);
     detail::partial_finalize_launch(input, output, stream);
 }
+
+void attention_partial_finalize_rotated(const AttentionPartial& input, Tensor& output,
+                                        cudaStream_t stream) {
+    parts_shape(input, input.o.ne[2], 1);
+    shape(output, DType::BF16, {256, 24, input.o.ne[2]});
+    for (const auto* p : {&input.o, &input.m, &input.l}) disjoint(*p, output);
+    detail::partial_finalize_rotated_launch(input, output, stream);
+}
 } // namespace ninfer::ops
