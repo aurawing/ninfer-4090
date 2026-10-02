@@ -65,6 +65,8 @@ endfunction()
 # Artifact framing and model-independent runtime contracts.
 ninfer_add_op_test(test_host_kv_transfer SOURCES core/test_host_kv_transfer.cpp)
 ninfer_add_op_test(test_meank_accumulate SOURCES ops/test_meank_accumulate.cpp LIBRARIES ninfer_ops)
+ninfer_add_op_test(test_kvmem_scoring SOURCES ops/test_kvmem_scoring.cpp LIBRARIES ninfer_ops)
+ninfer_add_op_test(test_meank_index_transfer SOURCES core/test_meank_index_transfer.cpp)
 ninfer_add_op_test(test_host_kv_transfer_engine SOURCES core/test_host_kv_transfer_engine.cpp)
 ninfer_add_op_test(ninfer_test_mtp_window SOURCES targets/qwen3_6/test_mtp_window.cpp LIBRARIES ninfer_engine ninfer_ops)
 target_include_directories(ninfer_test_mtp_window PRIVATE ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)

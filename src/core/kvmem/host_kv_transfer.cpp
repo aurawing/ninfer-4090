@@ -385,6 +385,28 @@ HostKVTransferTicket HostKVTransferEngine::prefetch_impl(
     std::size_t offset, bool completed_only) {
     auto source = completed_only ? archive_.completed_pages(layer, plane, first, count)
                                  : archive_.pages(layer, plane, first, count);
+    return enqueue_prefetch(source, offset);
+}
+HostKVTransferTicket HostKVTransferEngine::prefetch_index(
+    std::span<const std::byte> source, std::size_t offset) {
+    if (source.empty() || !source.data()) {
+        throw std::invalid_argument("Mean-K index source is empty");
+    }
+    if (archive_.mode() == HostArchiveMode::Pinned) {
+        unsigned flags = 0;
+        auto result = cudaHostGetFlags(&flags, const_cast<std::byte*>(source.data()));
+        if (result != cudaSuccess) {
+            (void)cudaGetLastError();
+            throw std::invalid_argument("direct Mean-K transfer requires CUDA-pinned memory");
+        }
+        if (flags & cudaHostAllocWriteCombined) {
+            throw std::invalid_argument("Mean-K index must use cacheable pinned memory");
+        }
+    }
+    return enqueue_prefetch(source, offset);
+}
+HostKVTransferTicket HostKVTransferEngine::enqueue_prefetch(
+    std::span<const std::byte> source, std::size_t offset) {
     if (source.empty() || source.size() > kHostKVTransferTileBytes ||
         offset > impl_->plan.capacity_bytes || source.size() > impl_->plan.capacity_bytes - offset) {
         throw std::invalid_argument("KV prefetch tile or device offset exceeds startup capacity");
@@ -413,8 +435,8 @@ HostKVTransferTicket HostKVTransferEngine::prefetch_impl(
     if (selected == state.slots.size()) {
         std::size_t references = 0;
         for (const auto& slot : state.slots) { references += slot.references; }
-        throw std::runtime_error("startup KV transfer ticket capacity exhausted: layer=" +
-            std::to_string(layer) + " capacity=" + std::to_string(state.slots.size()) +
+        throw std::runtime_error("startup KV transfer ticket capacity exhausted: capacity=" +
+            std::to_string(state.slots.size()) +
             " references=" + std::to_string(references));
     }
     Impl::Job job;

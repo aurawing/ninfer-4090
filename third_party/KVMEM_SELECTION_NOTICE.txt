@@ -1,0 +1,11 @@
+KVMem selection policy adaptation
+Source: https://github.com/kvmem/kvmem-qw3
+Commit: 1cf3b2f83bfc071ada9c57491a7d121723051ac0
+Source file: src/kvmem_store.cpp
+Functions: pick_topk_blocks, pick_semantic_groups, set_selection
+License: Apache License 2.0 (source repository root LICENSE).
+The source file contains no copyright header or author/year notice.
+The adaptation in src/core/kvmem/selection_plan.* changes the policy to a pure
+selection/diff plan, separate physical reserves, committed token span validation,
+full recent page coverage, query/current hard policy, and transitive atomic image
+page groups. Source remapping, re-RoPE, storage pools and dependencies are excluded.

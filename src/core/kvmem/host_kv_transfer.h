@@ -39,6 +39,13 @@ public:
     [[nodiscard]] HostKVTransferTicket prefetch_completed(
         std::size_t layer, std::size_t plane, std::uint32_t first, std::uint32_t count,
         std::size_t device_offset);
+    // Read-only Mean-K layer index. Uses the existing ring in pageable mode;
+    // pinned mode requires cacheable CUDA-pinned source memory and copies directly.
+    // Source bytes must remain immutable and alive until synchronize(), or until
+    // the consuming stream has completed its wait and release. wait() alone only
+    // submits a GPU dependency and does not establish host-source completion.
+    [[nodiscard]] HostKVTransferTicket prefetch_index(
+        std::span<const std::byte> source, std::size_t device_offset);
     // CPU waits only until the worker records ready, then GPU waits on the DMA event.
     void wait(HostKVTransferTicket ticket, cudaStream_t consumer_stream);
     [[nodiscard]] DeviceSpan staged(HostKVTransferTicket ticket);
@@ -59,6 +66,8 @@ private:
     struct Impl;
     HostKVTransferTicket prefetch_impl(std::size_t layer, std::size_t plane,
         std::uint32_t first, std::uint32_t count, std::size_t offset, bool completed_only);
+    HostKVTransferTicket enqueue_prefetch(std::span<const std::byte> source,
+        std::size_t offset);
     HostKVArchive& archive_;
     std::unique_ptr<Impl> impl_;
 };

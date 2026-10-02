@@ -34,6 +34,8 @@ add_library(ninfer_core STATIC
   core/kvmem/host_kv_transfer.cpp
   core/kvmem/kv_view_table.cpp
   core/kvmem/host_meank_index.cpp
+  core/kvmem/scoring_resources.cpp
+  core/kvmem/selection_plan.cpp
   core/linear_attention_state.cpp
   core/layout.cpp
   core/tensor.cpp
@@ -81,6 +83,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/layer_norm.cu
   ops/launcher/mtp_pack.cu
   ops/launcher/meank_accumulate.cu
+  ops/launcher/kvmem_score.cu
   ops/launcher/mtp_round.cu
   ops/launcher/speculative_round.cu
   ops/launcher/position.cu
@@ -183,6 +186,7 @@ add_library(ninfer_ops STATIC
   ops/linear/linear.cpp
   ops/wrapper/add_bias.cpp
   ops/wrapper/meank_accumulate.cpp
+  ops/wrapper/kvmem_score.cpp
   ops/wrapper/argmax.cpp
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
