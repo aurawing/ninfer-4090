@@ -46,6 +46,8 @@ bool rejects_vision_options(const std::vector<std::string>& flags) {
 
 int main() {
     int failures = 0;
+    const auto mtp_window=accepts({"ninfer-serve","model.ninfer","--kvmem-mtp-window","8192"});
+    failures += check(mtp_window && mtp_window->kvmem.mtp_window_tokens==8192,"serve MTP window option lost");
     const auto named_tiered = parse({"ninfer-serve", "model.ninfer", "--kv-mode", "tiered-exact",
                                     "--kv-dtype", "int8", "--kvmem-view-tokens", "16384",
                                     "--kvmem-sink-tokens", "0"});

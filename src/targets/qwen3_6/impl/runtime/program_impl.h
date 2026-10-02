@@ -333,6 +333,20 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             workspace_plan.tiered->bytes};
         tiered = std::make_unique<qwen3_6::detail::TieredContext>(
             *workspace_plan.tiered, decoder->text_kv, tiered_backing, device.stream);
+        if (workspace_plan.mtp_window) {
+            const auto& mp=*workspace_plan.mtp_window;
+            const DeviceSpan mtp_backing{static_cast<std::byte*>(workspace_storage.base())+
+                workspace_plan.general_capacity+workspace_plan.tiered->bytes,mp.bytes};
+            mtp_window=std::make_unique<qwen3_6::detail::MtpWindow>(mp,*decoder->mtp_cache(),mtp_backing,device.stream);
+            const auto logical_pages=(capacity+63U)/64U;
+            const auto extra_pages=(draft_window-1U+63U)/64U;
+            const auto old_bytes=(logical_pages+extra_pages)*decoder->mtp_cache()->pool().total_page_bytes();
+            std::clog << "[kvmem-mtp] old_mtp_bytes=" << old_bytes << " new_mtp_bytes=" << mtp_kv_bytes
+                      << " auxiliary_bytes=" << mp.bytes << " physical_pages=" << mp.physical_pages
+                      << " sink_pages=" << mp.sink_pages << " recent_pages=" << mp.recent_pages
+                      << " guard_pages=" << mp.guard_pages
+                      << " main_view_tokens=" << workspace_plan.tiered->view_pages*64U << '\n';
+        }
         std::clog << "[kvmem] tiered-exact disables turn checkpoints and retained resume until stage 3 step 6\n";
         if (kv_dtype == DType::BF16) {
             std::clog << "[kvmem] BF16 tiered is functional only; large-T performance is not guaranteed\n";
@@ -1264,7 +1278,10 @@ void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint
         sequence.kv->text.materialize_tokens(main_tokens, device.stream);
     }
     if (tiered) { tiered->bind_pages(sequence.kv->text.page_ids()); }
-    if (backend_tokens != 0 && backend_tokens > sequence.kv->backend->mapped_token_capacity()) {
+    if (mtp_window && sequence.kv->backend) {
+        sequence.kv->backend->materialize_pages(mtp_window->physical_pages(),device.stream);
+        mtp_window->bind_pages(sequence.kv->backend->page_ids(),device.stream);
+    } else if (backend_tokens != 0 && backend_tokens > sequence.kv->backend->mapped_token_capacity()) {
         sequence.kv->backend->materialize_tokens(backend_tokens, device.stream);
     }
 }
@@ -1279,13 +1296,14 @@ void ProgramImplCore::trim_sequence_kv(SequenceState& sequence, std::uint32_t ma
     }
     if (tiered && main_tokens < tiered->frontier()) { tiered->trim(main_tokens, device.stream); }
     if (!tiered || tiered->shadow()) { sequence.kv->text.trim_tokens(main_tokens); }
-    if (sequence.kv->backend) { sequence.kv->backend->trim_tokens(backend_tokens); }
+    if (mtp_window) mtp_window->trim(backend_tokens,device.stream);
+    else if (sequence.kv->backend) { sequence.kv->backend->trim_tokens(backend_tokens); }
 }
 
 void ProgramImplCore::release_sequence_growth_entitlement(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
     sequence.kv->text.cancel_unmapped_entitlement();
-    if (sequence.kv->backend) { sequence.kv->backend->cancel_unmapped_entitlement(); }
+    if (sequence.kv->backend && !mtp_window) { sequence.kv->backend->cancel_unmapped_entitlement(); }
 }
 
 qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& sequence) const {
@@ -1307,6 +1325,7 @@ void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
 }
 
 void ProgramImplCore::ordered_reset(SequenceState& sequence) {
+    if(mtp_window) mtp_window->reset(device.stream);
     decoder->linear_attention.zero_slot(
         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), device.stream);
     work.reset();
@@ -1501,7 +1520,7 @@ void ProgramImplCore::prepare_graphs() {
                                        prefill_hidden,
                                        prefill_chunk,
                                        proposal_head,
-                                       attn_scale, tiered.get()};
+                                       attn_scale, tiered.get(), mtp_window.get()};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -1814,7 +1833,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, attn_scale, tiered.get()},
+             proposal_head, attn_scale, tiered.get(), mtp_window.get()},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -2077,7 +2096,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, attn_scale, tiered.get()},
+             proposal_head, attn_scale, tiered.get(), mtp_window.get()},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -2222,7 +2241,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                   replay_records ? &*replay_records : nullptr, io,
                                                   prefill_hidden, prefill_chunk, proposal_head,
-                                                  attn_scale, tiered.get()},
+                                                  attn_scale, tiered.get(), mtp_window.get()},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
@@ -2386,7 +2405,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
-                                                     proposal_head, attn_scale, tiered.get()},
+                                                     proposal_head, attn_scale, tiered.get(), mtp_window.get()},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,

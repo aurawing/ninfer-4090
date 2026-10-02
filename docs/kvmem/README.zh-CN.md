@@ -183,6 +183,9 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
    - 加载期普通 tiered 的 Auto 预算默认预留 1 GiB，视图上限不保证全部分配。staging 必须容纳整层流式页加 64 MiB；固定覆盖不足时先提高最小视图，仍无可行预算则拒绝加载，不在 decode 热路径改成四遍。
    - 隐藏测试环境变量 `NINFER_KVMEM_SHADOW=1` 启用门禁 A；配合 `--kv-mode tiered-exact` 和强制小视图使用。`NINFER_KVMEM_TRANSFER_TIMING=1` 单独启用每层 ready 等待的 CUDA event 累计计时；默认关闭，无计时事件/同步开销。影子读回的 prefill 耗时不作为普通路径性能指标。
 5. **MTP 窗口化**（D11）。
+   - `--kvmem-mtp-window` 默认 32768，必须是正的 64 token 倍数。固定物理预算包含 sink、近期页和跨页临时草稿保护页；长上下文默认为 512 页（sink 4、recent 507、guard 1）。容量不足以容纳 sink、分块及保护页时加载前报错。MTP 不归档，保留原始位置，不做 re-RoPE。
+   - 原始逻辑页标签构造访问列表，复用部分注意力内核；节省的 MTP 存储通过统一预算增加 Main 视图。启动打印新旧 MTP 字节及视图变化；旧视图估算明确标为 `old_main_view_tokens_estimate`，使用同一已确定显存预算。
+   - 128K、262K INT8 各比较窗口 MTP 与关闭 MTP 的贪心输出，分歧按门禁 B 判定；needle 正确，接受率相对第 4 步完整池下降不超过 5 个百分点。`NINFER_KVMEM_TRANSFER_TIMING=1` 按 prefill/decode 分别累计每层 ready 等待。
 6. **两个复用点**（D12）。
 7. **准入与 CLI**（D13、D14），同时改写 `paged-kv-cache.md` 里的 non-goal 条款。
 8. **性能**：262K int8 的 `tiered-exact` prefill。

@@ -11,6 +11,7 @@
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/tiered_context.h"
+#include "targets/qwen3_6/impl/runtime/mtp_window.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
@@ -364,6 +365,7 @@ public:
     WorkspaceArena work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::unique_ptr<qwen3_6::detail::TieredContext> tiered;
+    std::unique_ptr<qwen3_6::detail::MtpWindow> mtp_window;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;

@@ -390,7 +390,11 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
-    if (active_sequence_batch_ != 0) {
+    if (mtp_window_) {
+        if (active_sequence_batch_>1) throw std::logic_error("tiered MTP requires C=1");
+        mtp_window_->attention(qn,positions.view({T}),active_valid_columns_ ? *active_valid_columns_ : Tensor{},
+                               attn_scale_,a,s,&kn,&v);
+    } else if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T ||
             active_backend_kv_table_rows_ == nullptr || active_valid_columns_ == nullptr) {
@@ -492,7 +496,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
         ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
         ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
-        ops::gqa_kv_append(kn, v, positions, mtp_kv_.layer_view(0), s);
+        if (mtp_window_) mtp_window_->append(kn,v,positions,Tensor{},s);
+        else ops::gqa_kv_append(kn, v, positions, mtp_kv_.layer_view(0), s);
 
         if (final_chunk) {
             const std::size_t column_bytes =
@@ -534,7 +539,12 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rope(last_rope_position, kCfg.rotary_dim, kCfg.rope_theta, qn, s);
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
-        ops::gqa_attention_cached(qn, last_position, attn_scale_, mtp_kv_.layer_view(0), envelope,
+        if (mtp_window_) {
+            const auto frontier=envelope.max_visible_keys;
+            mtp_window_->begin_transaction(frontier,std::min(mtp_proposal_extent_>0 ? mtp_proposal_extent_-1U : 0U,
+                mtp_window_->plan().capacity-frontier),s);
+            mtp_window_->attention(qn,last_position,Tensor{},attn_scale_,a,s);
+        } else ops::gqa_attention_cached(qn, last_position, attn_scale_, mtp_kv_.layer_view(0), envelope,
                                   work_, a, s);
         ops::sigmoid_mul(gate, a, s);
 

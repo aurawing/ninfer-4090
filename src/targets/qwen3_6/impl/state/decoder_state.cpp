@@ -90,7 +90,8 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                    spec.kv_table_rows, spec.mtp_physical_page_groups,
                                    spec.kv_packed_v, spec.kv_rotate_k, spec.kv_rotate_v,
-                                   spec.kv_packed_k, spec.kv_e8_lattice, spec.kv_e8_root);
+                                   spec.kv_packed_k, spec.kv_e8_lattice, spec.kv_e8_root,
+                                   spec.allow_tiered_mtp_pages);
     }
     layout.linear_attention = plan_linear_attention_state_pool(builder, spec.linear_attention);
     return layout;

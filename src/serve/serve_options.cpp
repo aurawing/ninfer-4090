@@ -125,6 +125,7 @@ std::string serve_usage_text(const char* argv0) {
            "  --kvmem-view-tokens <N>    Resident view ceiling (default 131072; budget may reduce)\n"
            "                              Alias: --kvmem-view; tiered replaces dense --kv-capacity\n"
            "  --kvmem-sink-tokens <N>    Always-resident prefix (default 256; alias --kvmem-sink)\n"
+           "  --kvmem-mtp-window <N>    MTP total physical window including sink (default 32768)\n"
            "  --kvmem-host-archive <m>   auto (default), pinned, pageable; fixed at loading\n"
            "  --kvmem-staging-mib <N>    Loading-time staging capacity override\n"
            "                            Tiered supports BF16, INT8, rk4v4-e8. BF16 guarantees\n"
@@ -223,6 +224,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.kvmem.view_tokens = parse_positive_u32(require_value("--kvmem-view"), "kvmem-view");
         } else if (arg == "--kvmem-sink-tokens" || arg == "--kvmem-sink") {
             options.kvmem.sink_tokens = parse_positive_u32(require_value("--kvmem-sink"), "kvmem-sink", true);
+        } else if (arg == "--kvmem-mtp-window") {
+            options.kvmem.mtp_window_tokens = parse_positive_u32(require_value("--kvmem-mtp-window"), "kvmem-mtp-window");
+            if (!options.kvmem.mtp_window_tokens) throw std::invalid_argument("kvmem-mtp-window must be positive");
         } else if (arg == "--kvmem-host-archive") {
             options.kvmem.host_archive = product::parse_host_archive_mode(require_value("--kvmem-host-archive"));
         } else if (arg == "--kvmem-staging-mib") {

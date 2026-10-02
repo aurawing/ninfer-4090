@@ -106,10 +106,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                   ((static_cast<std::uint64_t>(plan.draft_window - 1U) + kPagedKVPageSize - 1U) /
                    static_cast<std::uint32_t>(kPagedKVPageSize))
             : 0ULL;
-    const std::uint32_t mtp_physical_pages = static_cast<std::uint32_t>(
-        checked_i32(static_cast<std::uint64_t>(plan.kv_mode == KvMode::TieredExact
-                                                  ? logical_pages : physical_pages) + mtp_extra_pages,
-                    "MTP Paged KV physical pages exceed int32"));
+    const std::uint32_t mtp_physical_pages = plan.kv_mode == KvMode::TieredExact && !plan.shadow_validate && plan.features.mtp()
+        ? qwen3_6::detail::plan_mtp_window(plan.capacity, effective_prefill_chunk, plan.kvmem).physical_pages
+        : static_cast<std::uint32_t>(checked_i32(static_cast<std::uint64_t>(plan.kv_mode == KvMode::TieredExact ? logical_pages : physical_pages)+mtp_extra_pages,
+                                                "MTP Paged KV physical pages exceed int32"));
     LayoutBuilder builder;
     PersistentLayout out;
     out.decoder = qwen3_6::plan_decoder_state(
@@ -133,6 +133,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .mtp_physical_page_groups  = mtp_physical_pages,
                      .allow_tiered_text_pages   = plan.kv_mode == KvMode::TieredExact &&
                                                   !plan.shadow_validate,
+                     .allow_tiered_mtp_pages    = plan.kv_mode == KvMode::TieredExact && !plan.shadow_validate,
                      .linear_attention =
                          {
                              .layers         = TextConfig::gdn_layers(),
@@ -561,8 +562,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         out.general_capacity = checked_add(out.general_capacity, kArenaAlign - 1,
                                             "tiered general workspace alignment") /
                                kArenaAlign * kArenaAlign;
+        if (plan.features.mtp() && !plan.shadow_validate) {
+            out.mtp_window=qwen3_6::detail::plan_mtp_window(plan.capacity,chunk_u32,plan.kvmem);
+        }
         out.capacity = checked_add(out.general_capacity, out.tiered->bytes,
                                     "tiered workspace reservation");
+        if (out.mtp_window) out.capacity=checked_add(out.capacity,out.mtp_window->bytes,"MTP ring workspace reservation");
     }
     return out;
 }
@@ -857,6 +862,27 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_6::detail::SequencePlannerImpl
     if (plan->device_reservation_bytes != expected) {
         throw std::logic_error(
             "Qwen3.6 physical sequence layout is not affine in Main KV page capacity");
+    }
+    if(plan->workspace.mtp_window) {
+        const auto& mp=*plan->workspace.mtp_window;
+        const auto& pool=plan->persistent.decoder.mtp_kv->pool;
+        const auto logical=(plan->capacity+63U)/64U;
+        const auto extra=(plan->draft_window-1U+63U)/64U;
+        const std::size_t page_bytes=pool.payload_bytes()/mp.physical_pages;
+        const std::size_t old_payload=std::size_t(logical+extra)*page_bytes;
+        const std::size_t saved=old_payload-pool.payload_bytes();
+        const auto new_floor=planner->curve.minimum_device_reservation_bytes;
+        const auto old_floor=saved>=mp.bytes ? new_floor+(saved-mp.bytes) : new_floor-(mp.bytes-saved);
+        const auto stride=planner->curve.bytes_per_additional_main_page_group;
+        const bool feasible=expected>=old_floor;
+        const auto old_pages=!feasible ? 0U : (stride ? std::min<std::uint64_t>(
+            planner->curve.maximum_main_page_groups,planner->curve.minimum_main_page_groups+
+            (expected-old_floor)/stride) : planner->curve.minimum_main_page_groups);
+        std::clog << "[kvmem-mtp-budget] old_main_view_tokens_estimate=" << old_pages*64U
+                  << " old_budget_feasible=" << feasible
+                  << " new_main_view_tokens=" << main_page_groups*64U
+                  << " old_mtp_bytes=" << old_payload << " new_mtp_bytes=" << pool.payload_bytes()
+                  << " auxiliary_bytes=" << mp.bytes << " same_sequence_budget_bytes=" << expected << '\n';
     }
     return plan;
 }

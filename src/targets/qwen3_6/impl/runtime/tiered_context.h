@@ -22,7 +22,9 @@ public:
     [[nodiscard]] std::uint32_t view_pages() const noexcept;
     [[nodiscard]] std::uint32_t frontier() const noexcept;
     void bind_pages(std::span<const std::int32_t> lease_ids);
-    void begin_block(std::uint32_t base, std::uint32_t count, cudaStream_t stream);
+    enum class ExecutionPhase { Prefill, Decode };
+    void begin_block(std::uint32_t base, std::uint32_t count, cudaStream_t stream,
+                     ExecutionPhase phase = ExecutionPhase::Prefill);
     [[nodiscard]] PagedKVLayerView resident_layer(std::uint32_t layer) const;
     void attention(std::uint32_t layer, const Tensor& q, const Tensor& k, const Tensor& v,
                    const Tensor& positions, float scale, Tensor& out, cudaStream_t stream);

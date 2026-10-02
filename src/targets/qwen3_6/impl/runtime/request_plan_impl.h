@@ -109,7 +109,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
             capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
-        base->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
+        base->backend_kv_page_entitlement = mtp_window ? mtp_window->physical_pages() : pages_for_tokens(mtp_tokens);
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }

@@ -4,7 +4,7 @@
 
 ## 待用户决定的问题
 
-第 4 步门禁与完整构建/CTest 已通过。用户决定不改 dense，262K 仅按事后批准的独立 FP64 判据评估；三个最大误差层 7、6、8 的完整末段块均满足 tiered/FP64 相对 L2 不超过 dense/FP64，32K/128K 仍满足原 1e-3，门禁 B 与两档 INT8 性能通过。本轮没有新的 D1–D15 冲突；按授权整理提交并 push 后停在本步审阅点，不开始第 5 步。
+第 4 步已审阅通过（提交 `6466a166`、`d33157a9`、`f5da0049` 已推送）。本轮按用户授权继续阶段 3 第 5、6 步，第 6 步完成后停下等审阅，不开始第 7 步。D11 的 sink 语义已由用户再次确认：固定 MTP 窗口包含 sink，剩余环容量留给最近页；没有修订为仅近期页。本轮没有尚待决定的问题；第 5、6 步的门禁和全量验证尚未完成。
 
 ## 阶段 0′：基线
 
@@ -452,3 +452,32 @@ rk4v4-e8 的 32K/8K 视图影子第一次运行在首全注意力层、frontier=
 | 2026-10-01 | D1，用户授权例外 | 仅修复已知的 dense 量化 small-T 注意力共享内存竞争，独立修复分支合入后重录九组金标准，旧数据保留；Q5 和 dense 分派不改 | 原版 racecheck 64 hazards，修复后 0；12 组各 64 次逐位一致且 FP64 oracle 通过，详见修复记录 | 是，本轮用户明确要求现在修复，并限定文件与两处 barrier |
 | 2026-10-01 | D1 与门禁 A | 262K RK4 的新路径与当前 dense 在 146432 token 处相对 L2 0.0010094，固定输入消融确认 dense prefill alpha 的 FMA 舍入累积；照搬它会破坏现有 FP64 公共 logit 测试。保持门禁和正确新路径，是否另行修 dense 须用户决定 | 固定输入 dense/partial 重算均逐位一致；临时 alpha-only FMA 将两者误差降到 0.0000645685，但独立数值测试失败，未修改 dense 的均匀参考直接出现大误差/非有限输出，详见上文 | 已决定不修 dense；262K 门禁 A 后续按 FP64 修订见下一行，原失败保留 |
 | 2026-10-02 | 门禁 A，D1 保持 | 32K/128K 的 tiered/dense 1e-3 不变；262K RK4 按影子误差选至少三个层（包括原超限层）的末段完整块，采用同一量化 KV 字节的 CPU FP64 oracle，要求逐层 tiered/FP64 相对 L2 不超过 dense/FP64；同时记录 tiered/dense 数值 | **在测得 0.0010094 之后**依据固定输入 alpha 消融作出的事后修订，保留原失败与所有数据；不修改 dense、不放宽任何其他门禁 | 是，用户明确同意；新判据实测通过 |
+
+## 阶段 3 第 5、6 步：实施中（2026-10-02）
+
+- 基线 `f5da0049`；实现清单见 [stage5-6-runtime-plan](stage5-6-runtime-plan.zh-CN.md)。本轮数据在仓库外 `D:/deeplearning/NInfer/logs/kvmem-stage5-6`。第 4 步生产二进制已归档为 `stage4-baseline-ninfer.exe`，SHA256 为 `e4f7e13433952b0a46f4b48e48b484e1b80239db9ba558d0fef1794c892442eb`。
+- 用户明确选择继续遵循 D11：默认 32768 token 的 MTP 物理页环预算包含 sink，近期页使用剩余容量。跨页临时草稿的保护页也在固定预算内，不能额外增加池大小。
+- 第 6 步 public Engine 短对话基线（尚未实现时）：追加与回滚均 `reused_prompt_tokens=0`，实际计算完整提示词，符合复用入口关闭的当前状态；输出回滚/冷启动 ID 相同，不能以此代替已实现复用。原始记录 `reuse-baseline-red.json/.log`。这份短提示词的后续回答没有重述 needle，故不算 needle 门禁通过，也不作为正式长上下文质量数据。
+- 第 5 步源代码接线完成，规格与代码质量审阅无阻塞项；dense 内核与分派未改。参数、预算、窗口页和 masked append 的回归先失败后通过。最终全量构建通过，CTest **105 项，101 通过、4 缺少其他模型制品跳过、0 失败，199.95 s**，见 `stage5-full-build-r3.log` / `stage5-full-ctest-r3.log`。
+- compute-sanitizer **13.0.85** 对 `ninfer_test_mtp_window` 三项复测：racecheck **0 hazards / 0 errors / 0 warnings**，synccheck、initcheck 各 **0 errors**。首轮 initcheck 指向测试整块 D2H 字节比较的未初始化空闲页/尾部；测试夹具改为在已有初始化同步之后、计算流上清零该存储，未修改生产算法。首轮失败日志及 r2 复测日志均保留在外部目录。最终 CLI SHA256 `b9712bdf9a50c12499ad619300004c7e0c114135ef7159adf33795430ef235bc`。
+- 正式 128K/262K 第 5 步门禁均通过；第 6 步尚未实施。配置：INT8-G64 归档、chunk 1024、贪心、无视觉、无 CUDA Graph、Main view 上限 131072、MTP-3 + optimized draft head；逐组串行执行，二进制相同。
+
+### 第 5 步：正式门禁与显存
+
+| 上下文 | 关闭 MTP prefill（s） | 窗口 MTP prefill（s） | 64 token ID | needle（双方） | 接受率 | 对第 4 步下降 | 窗口 ready prefill / decode（ms） |
+|---|---:|---:|---|---|---|---:|---:|
+| 128K | 83.292 | 84.301 | 完全相同 | 正确 | 47/47 = 100% | 0 个百分点 | 3.159360 / 0.764704 |
+| 262K | 222.939 | 224.297 | 完全相同 | 正确 | 47/47 = 100% | 0 个百分点 | 262.134150 / 6935.293000 |
+
+两档都生成完整 64 token，没有分歧，因此无需启用门禁 B 的并列例外。第 4 步完整 MTP 的两档接受率均为 47/47。关闭 MTP 的 ready 等待分别为 128K：3.331072 / 3.022752 ms，262K：128.994970 / 26442.340000 ms（prefill / decode）。各层明细保存在四份 stderr 和 `stage5-gates-summary.json`。
+
+| 上下文 | 原 full-MTP payload（MiB） | 窗口 payload（MiB） | 窗口 auxiliary（MiB） | 原二进制实际 Main view（token） | 窗口实际 Main view（token） | 增量（token） |
+|---|---:|---:|---:|---:|---:|---:|
+| 128K | 264.128906 | 66 | 1.551270 | 126272 | 131072 | 4800 |
+| 262K | 528.128906 | 66 | 1.559082 | 108800 | 124032 | 15232 |
+
+原二进制用相同 context/view/chunk/MTP/预算策略补测加载预算（`baseline-128k-budget`、`baseline-262k-budget`，短算术提示词），此处不把短提示词的时间当作长 prefill 基线。窗口启动日志中的同一已确定预算估算为 124544 / 108736 token，和跨运行实际值有区别，保留估算标签及两套原始数值，不能把它解释为固定桌面负载下的严格对照。
+
+128K 窗口 Main 4224 MiB、staging 64 MiB、partial 48.375 MiB、metadata/fixed 82688 B、general workspace 180953088 B；262K 分别为 Main 3997.125 MiB、staging 342.179688 MiB、partial 48.375 MiB、metadata/fixed 164608 B、general workspace 180953088 B。两档 pinned host archive 分别为 4429185024 / 8858370048 B。窗口测试的整卡峰值分别为 23761 / 23737 MiB，包含桌面及其他程序，不能当作进程独占占用。资源汇总见 `stage5-resource-summary.json`。
+
+复现：在外部目录使用 `run_full_checks_retry3.ps1 -Stage stage5`，随后 `python run_stage5_gates_r2.py`（三项 sanitizer → 四组正式模型测量 → 原版两组加载预算 → 门禁比较），`python summarize_stage5.py`。sanitizer 命令为版本 13.0.85 的 `compute-sanitizer --tool racecheck|synccheck|initcheck --error-exitcode 1 build-vision-integration/tests/ninfer_test_mtp_window.exe`，三项各自运行。临时代码、模型和测量数据均未进入仓库。

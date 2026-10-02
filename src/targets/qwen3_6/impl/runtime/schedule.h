@@ -41,6 +41,7 @@ struct ExecutionCore {
     ProposalHead proposal_head;
     float attn_scale = kAttentionScale;
     qwen3_6::detail::TieredContext* tiered = nullptr;
+    qwen3_6::detail::MtpWindow* mtp_window = nullptr;
 };
 
 

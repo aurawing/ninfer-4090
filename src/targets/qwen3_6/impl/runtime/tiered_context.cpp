@@ -37,7 +37,8 @@ struct TieredContext::Impl {
     std::vector<kvmem::HostKVTransferTicket> tickets;
     std::array<cudaEvent_t, 16> wait_start{}, wait_end{};
     std::array<bool, 16> measured{};
-    std::array<double, 16> wait_ms{}, enqueue_wait_ms{};
+    std::array<std::array<double, 16>, 2> wait_ms{}, enqueue_wait_ms{};
+    std::size_t execution_phase = 0;
     std::unique_ptr<PinnedHostBuffer> shadow_dense, shadow_tiered;
     std::uint32_t block_tokens = 0, current_frontier = 0, next_layer = 16;
     std::uint64_t blocks = 0, streamed_bytes = 0, partial_passes = 0;
@@ -128,7 +129,7 @@ struct TieredContext::Impl {
             CUDA_CHECK(cudaEventSynchronize(wait_end[layer]));
             float elapsed = 0;
             CUDA_CHECK(cudaEventElapsedTime(&elapsed, wait_start[layer], wait_end[layer]));
-            wait_ms[layer] += elapsed;
+            wait_ms[execution_phase][layer] += elapsed;
             measured[layer] = false;
         }
     }
@@ -218,7 +219,7 @@ struct TieredContext::Impl {
         }
     }
 
-    void begin(std::uint32_t base, std::uint32_t count, cudaStream_t stream) {
+    void begin(std::uint32_t base, std::uint32_t count, cudaStream_t stream, ExecutionPhase phase) {
         check_stream(stream);
         if (next_layer != 16) throw std::logic_error("tiered previous block has incomplete layers");
         if (!count || count > plan.max_query_tokens || base != current_frontier ||
@@ -231,6 +232,7 @@ struct TieredContext::Impl {
         // This is the physical-overwrite boundary: old source bytes must no longer belong to D2H.
         complete_writebacks();
         collect_times();
+        if (plan.measure_transfer_waits) execution_phase=phase==ExecutionPhase::Prefill ? 0 : 1;
         writes = table.begin_append(base, count);
         // Writeback archives entire page planes, including an unused suffix.
         // Initialize newly assigned logical pages on the producer stream;
@@ -302,7 +304,7 @@ struct TieredContext::Impl {
                                                        : std::chrono::steady_clock::time_point{};
         for (auto ticket : tickets) transfer.wait(ticket, compute);
         if (plan.measure_transfer_waits) {
-            enqueue_wait_ms[layer] +=
+            enqueue_wait_ms[execution_phase][layer] +=
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                     .count();
             CUDA_CHECK(cudaEventRecord(wait_end[layer], compute));
@@ -389,8 +391,8 @@ void TieredContext::bind_pages(std::span<const std::int32_t> ids) {
     impl_->lease_ids.assign(ids.begin(), ids.end());
 }
 
-void TieredContext::begin_block(std::uint32_t base, std::uint32_t count, cudaStream_t stream) {
-    impl_->begin(base, count, stream);
+void TieredContext::begin_block(std::uint32_t base, std::uint32_t count, cudaStream_t stream, ExecutionPhase phase) {
+    impl_->begin(base, count, stream, phase);
 }
 
 PagedKVLayerView TieredContext::resident_layer(std::uint32_t layer) const {
@@ -495,9 +497,11 @@ void TieredContext::log_stats() {
                       << " max_relative_l2=" << i.shadow_relative[layer]
                       << " max_abs=" << i.shadow_absolute[layer] << '\n';
     if (i.plan.measure_transfer_waits)
-        for (std::size_t layer = 0; layer < 16; ++layer)
-            std::clog << "[kvmem-transfer] layer=" << layer << " gpu_wait_ms=" << i.wait_ms[layer]
-                      << " cpu_enqueue_wait_ms=" << i.enqueue_wait_ms[layer] << '\n';
+        for (std::size_t phase = 0; phase < 2; ++phase)
+            for (std::size_t layer = 0; layer < 16; ++layer)
+                std::clog << "[kvmem-transfer] phase=" << (phase==0 ? "prefill" : "decode")
+                          << " layer=" << layer << " gpu_wait_ms=" << i.wait_ms[phase][layer]
+                          << " cpu_enqueue_wait_ms=" << i.enqueue_wait_ms[phase][layer] << '\n';
 }
 
 } // namespace ninfer::targets::qwen3_6::detail

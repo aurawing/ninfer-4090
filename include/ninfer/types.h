@@ -38,6 +38,7 @@ enum class HostKVArchiveMode : std::uint8_t { Auto, Pinned, Pageable };
 struct TieredKVOptions {
     std::uint32_t view_tokens = 131072;
     std::uint32_t sink_tokens = 256;
+    std::uint32_t mtp_window_tokens = 32768;
     HostKVArchiveMode host_archive = HostKVArchiveMode::Auto;
     std::size_t staging_capacity_bytes = 0;
     std::size_t partial_budget_bytes = 100ULL * 1024 * 1024;

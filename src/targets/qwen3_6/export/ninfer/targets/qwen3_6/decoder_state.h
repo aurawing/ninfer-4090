@@ -31,6 +31,7 @@ struct DecoderStateSpec {
     std::uint32_t text_physical_page_groups = 0;
     std::uint32_t mtp_physical_page_groups  = 0;
     bool allow_tiered_text_pages            = false;
+    bool allow_tiered_mtp_pages             = false;
     LinearAttentionStatePoolSpec linear_attention;
 };
 

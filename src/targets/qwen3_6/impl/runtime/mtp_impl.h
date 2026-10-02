@@ -87,11 +87,18 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                          &state.text_cache, &state.mtp_cache);
         card.set_attn_scale(state.execution.attn_scale);
         card.set_tiered_context(state.execution.tiered);
+        card.set_mtp_window(state.execution.mtp_window);
+        if (state.execution.mtp_window) {
+            const auto base=static_cast<std::uint32_t>(state.host_ingress.base_frontiers[0]);
+            const auto extent=std::min(state.execution.mtp_window->plan().capacity-base,
+                static_cast<std::uint32_t>(state.host_ingress.current_extents[0])+k);
+            state.execution.mtp_window->begin_transaction(base,extent,state.execution.device.stream);
+        }
         if (state.execution.tiered) {
             state.execution.tiered->begin_block(
                 static_cast<std::uint32_t>(state.host_ingress.base_frontiers[0]),
                 static_cast<std::uint32_t>(state.host_ingress.current_extents[0]) + 1,
-                state.execution.device.stream);
+                state.execution.device.stream, qwen3_6::detail::TieredContext::ExecutionPhase::Decode);
         }
 
         Tensor anchors           = frame.anchors.slice(0, 0, batch_size);

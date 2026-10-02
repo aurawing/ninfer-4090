@@ -74,6 +74,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/gqa_attention_decode.cu
   ops/launcher/gqa_attention_partial.cu
   ops/launcher/gqa_attention_prefill.cu
+  ops/launcher/gqa_kv_append_masked.cu
   ops/launcher/kv_cache_append_prefix.cu
   ops/launcher/l2norm.cu
   ops/launcher/layer_norm.cu

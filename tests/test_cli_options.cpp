@@ -43,6 +43,9 @@ bool rejects(const std::vector<std::string>& flags) {
 
 int main() {
     int failures = 0;
+    failures += check(accepts({"--kv-mode", "tiered-exact", "--kvmem-mtp-window", "32768"}).has_value(),
+                      "CLI must accept a fixed MTP window");
+    failures += check(rejects({"--kvmem-mtp-window", "0"}), "MTP window zero must be rejected");
     const auto named_tiered = parse({"--kv-mode", "tiered-exact", "--kv-dtype", "int8",
                                     "--kvmem-view-tokens", "16384", "--kvmem-sink-tokens", "0"});
     failures += check(named_tiered.kv_mode == ninfer::KvMode::TieredExact &&
@@ -63,6 +66,8 @@ int main() {
                           engine_defaults.vision_cpu_memory_mib == 4096,
                       "Engine Vision defaults mismatch");
     const auto defaults = parse({});
+    failures += check(defaults.kvmem.mtp_window_tokens==32768 && engine_defaults.kvmem.mtp_window_tokens==32768,"MTP window defaults mismatch");
+    failures += check(parse({"--kvmem-mtp-window","8192"}).kvmem.mtp_window_tokens==8192,"MTP window value lost");
     failures += check(engine_defaults.vision_cpu_cache_mib == 128 && defaults.vision_cpu_cache_mib == 128,
                       "CPU cache must default to 128 MiB");
     failures += check(parse({"--vision-mmproj", "mmproj.gguf", "--vision-cpu-cache-mib", "0"}).vision_cpu_cache_mib == 0,

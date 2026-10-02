@@ -8,6 +8,7 @@
 #include "core/layout.h"
 #include "core/tensor.h"
 #include "targets/qwen3_6/impl/runtime/tiered_plan.h"
+#include "targets/qwen3_6/impl/runtime/mtp_window_plan.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/startup_features.h>
@@ -60,6 +61,7 @@ struct WorkspacePlan {
     std::size_t capacity       = 0;
     std::size_t general_capacity = 0;
     std::optional<qwen3_6::detail::TieredRuntimePlan> tiered;
+    std::optional<qwen3_6::detail::MtpWindowPlan> mtp_window;
 };
 
 struct SequencePlanningInputs {
