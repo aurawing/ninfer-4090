@@ -27,7 +27,7 @@ Op 的状态效果、kernel 寻址约束和性能准入条件。具体 allocator
 
 ### 1.1 Non-goals
 
-- request preemption、swap、KV offload 或跨 GPU storage；
+- request preemption、通用 swap 和跨 GPU storage；默认 dense 模式不提供 KV offload。Qwen27B 的 opt-in `tiered-exact` 在 C=1 下使用主机归档、独立视图表和流式注意力；它保留原始逻辑页号，不改变 dense 页池、注意力分派和金标准。相关所有权、预算和恢复契约见 `docs/kvmem/stage3-view-design.zh-CN.md`。稀疏 `kvmem` 模式须待阶段 4 完成后开放；
 - active requests 之间共享可写 prefix、page reference counting 或 copy-on-write branching；
 - arbitrary longest-common-prefix reuse；
 - 用一个 universal raw-byte allocator 在 serving 期间动态重分不同 KV layouts 的显存；

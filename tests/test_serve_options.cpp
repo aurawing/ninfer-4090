@@ -46,6 +46,16 @@ bool rejects_vision_options(const std::vector<std::string>& flags) {
 
 int main() {
     int failures = 0;
+    failures += check(!accepts({"ninfer-serve", "model.ninfer", "--kv-mode", "kvmem"}), "sparse decode must remain unavailable before stage 4");
+    failures += check(accepts({"ninfer-serve", "model.ninfer", "--kv-mode", "tiered-exact", "--kvmem-prefill", "exact"}).has_value(), "exact prefill missing");
+    failures += check(rejects_vision_options({"--kvmem-prefill", "window"}) && rejects_vision_options({"--kvmem-prefill", "invalid"}), "inexact prefill accepted");
+    failures += check(accepts({"ninfer-serve", "model.ninfer", "--kv-mode", "tiered-exact", "--kvmem-host-archive", "pageable", "--kvmem-lock-archive"}).has_value(), "pageable VirtualLock missing");
+    const auto locked_archive = accepts({"ninfer-serve", "model.ninfer", "--kvmem-lock-archive", "--kv-mode", "tiered-exact"});
+    failures += check(locked_archive && locked_archive->kvmem.lock_archive, "serve OS-lock value or option order lost");
+    failures += check(rejects_vision_options({"--kv-mode", "tiered-exact", "--max-concurrency", "2"}), "tiered C>1 accepted");
+    failures += check(rejects_vision_options({"--kv-mode", "tiered-exact", "--kvmem-host-archive", "pinned", "--kvmem-lock-archive"}), "CUDA pin and VirtualLock conflict accepted");
+    for (const char* text : {"--kvmem-prefill", "--kvmem-lock-archive", "verification", "CUDA Graph"})
+        failures += check(serve_usage_text("ninfer-serve").find(text) != std::string::npos, "tiered help incomplete");
     const auto mtp_window=accepts({"ninfer-serve","model.ninfer","--kvmem-mtp-window","8192"});
     failures += check(mtp_window && mtp_window->kvmem.mtp_window_tokens==8192,"serve MTP window option lost");
     const auto named_tiered = parse({"ninfer-serve", "model.ninfer", "--kv-mode", "tiered-exact",

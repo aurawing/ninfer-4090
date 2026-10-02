@@ -46,7 +46,7 @@ void check_host_archive_admission(std::size_t archive_bytes, std::uint64_t avail
 // A writeback event covers every plane of a layer; only completed writes are readable.
 class HostKVArchive {
 public:
-    explicit HostKVArchive(HostKVArchiveLayout layout, HostArchiveMode requested);
+    explicit HostKVArchive(HostKVArchiveLayout layout, HostArchiveMode requested, bool lock_pageable = false);
     ~HostKVArchive();
     HostKVArchive(const HostKVArchive&) = delete;
     HostKVArchive& operator=(const HostKVArchive&) = delete;
@@ -54,6 +54,7 @@ public:
     [[nodiscard]] const HostKVArchiveLayout& layout() const noexcept;
     [[nodiscard]] HostArchiveMode mode() const noexcept;
     [[nodiscard]] std::size_t committed_bytes() const noexcept;
+    [[nodiscard]] bool os_locked() const noexcept;
     [[nodiscard]] std::uint64_t generation() const noexcept;
     [[nodiscard]] std::uint32_t frontier(std::size_t layer);
 

@@ -40,6 +40,7 @@ struct TieredRuntimePlan {
     KvMode mode                         = KvMode::TieredExact;
     bool shadow_validate                = false;
     bool measure_transfer_waits         = false;
+    bool lock_archive                   = false;
     std::uint32_t logical_tokens        = 0;
     std::uint32_t view_pages            = 0;
     std::uint32_t sink_pages            = 0;
@@ -138,6 +139,9 @@ inline TieredRuntimePlan plan_tiered_runtime(const PagedKVPoolLayout& main_pool,
     out.logical_tokens         = logical_tokens;
     out.view_pages             = view_pages;
     out.max_query_tokens       = max_query_tokens;
+    out.lock_archive           = options.lock_archive;
+    if (options.lock_archive && options.host_archive == HostKVArchiveMode::Pinned)
+        throw std::invalid_argument("VirtualLock applies only to auto/pageable archives");
     switch (options.host_archive) {
     case HostKVArchiveMode::Auto:
         out.archive_mode = kvmem::HostArchiveMode::Auto;

@@ -63,7 +63,9 @@ void check_host_archive_admission(std::size_t bytes, std::uint64_t available) {
     if (available < kHostArchivePhysicalHeadroom ||
         bytes > available - kHostArchivePhysicalHeadroom) {
         throw std::runtime_error("host KV archive needs its full capacity plus 4 GiB physical "
-                                 "headroom; reduce context or KV precision");
+                                 "headroom; shrink --max-context or use a smaller --kv-dtype "
+                                 "(BF16 -> int8 -> rk4v4-e8). --kvmem-host-archive pageable "
+                                 "avoids CUDA pin limits but does not waive physical admission");
     }
 }
 bool keep_pinned_archive(bool succeeded, std::uint64_t after) noexcept {
@@ -138,6 +140,12 @@ struct HostKVArchive::Impl {
     std::vector<bool> pending, reading;
     std::vector<std::shared_future<void>> external_done;
     void* transfer_owner = nullptr;
+    bool os_locked = false;
+#if defined(_WIN32)
+    SIZE_T previous_min = 0, previous_max = 0;
+    DWORD previous_flags = 0;
+    bool working_set_changed = false;
+#endif
 
     ~Impl() {
         for (auto& completion : external_done) {
@@ -157,8 +165,13 @@ struct HostKVArchive::Impl {
         if (mode == HostArchiveMode::Pinned) { (void)cudaFreeHost(data); }
         else {
 #if defined(_WIN32)
+            if (os_locked) (void)VirtualUnlock(data, layout.bytes);
             (void)VirtualFree(data, 0, MEM_RELEASE);
+            if (working_set_changed)
+                (void)SetProcessWorkingSetSizeEx(GetCurrentProcess(), previous_min,
+                                                 previous_max, previous_flags);
 #else
+            if (os_locked) (void)munlock(data, layout.bytes);
             (void)munmap(data, layout.bytes);
 #endif
         }
@@ -167,7 +180,7 @@ struct HostKVArchive::Impl {
         return static_cast<std::byte*>(data) + plane.offset + plane.page_bytes * first;
     }
     void ensure_committed(std::size_t layer, std::size_t plane, std::uint32_t end_page) {
-        if (mode == HostArchiveMode::Pinned) { return; }
+        if (mode == HostArchiveMode::Pinned || os_locked) { return; }
         const auto& spec = layout.layers.at(layer).at(plane);
         auto& old = committed.at(layer).at(plane);
         const auto end = rounded(spec.page_bytes * end_page, layout.os_page_bytes);
@@ -203,12 +216,15 @@ struct HostKVArchive::Impl {
     }
 };
 
-HostKVArchive::HostKVArchive(HostKVArchiveLayout layout, HostArchiveMode requested)
+HostKVArchive::HostKVArchive(HostKVArchiveLayout layout, HostArchiveMode requested, bool lock_pageable)
     : impl_(std::make_unique<Impl>()) {
     if (requested != HostArchiveMode::Auto && requested != HostArchiveMode::Pinned &&
         requested != HostArchiveMode::Pageable) {
         throw std::invalid_argument("invalid host KV archive mode");
     }
+    if (lock_pageable && requested == HostArchiveMode::Pinned)
+        throw std::invalid_argument("VirtualLock conflicts with CUDA pinned archive; use pageable");
+    if (lock_pageable) requested = HostArchiveMode::Pageable;
     if (layout.layers.empty() || layout.max_context == 0 ||
         layout.logical_pages != page_count(layout.max_context) ||
         layout.os_page_bytes != os_page_bytes()) {
@@ -268,7 +284,8 @@ HostKVArchive::HostKVArchive(HostKVArchiveLayout layout, HostArchiveMode request
             if (error != cudaSuccess) { (void)cudaGetLastError(); }
             if (requested == HostArchiveMode::Pinned) {
                 throw std::runtime_error("explicit pinned KV archive could not pin full capacity "
-                                         "with 4 GiB physical headroom");
+                                         "with 4 GiB physical headroom; use --kvmem-host-archive pageable, "
+                                         "shrink --max-context or use a smaller --kv-dtype");
             }
             reason = error == cudaSuccess ? "auto fallback: physical headroom < 4 GiB"
                                            : "auto fallback: whole archive pin failed";
@@ -286,13 +303,44 @@ HostKVArchive::HostKVArchive(HostKVArchiveLayout layout, HostArchiveMode request
         }
 #endif
     }
+    if (lock_pageable) {
+        // Explicit residency protection commits/locks the full archive at loading.
+        // Ordinary pageable archives continue to commit on demand.
+        for (std::size_t layer = 0; layer < layers; ++layer)
+            for (std::size_t plane = 0; plane < state.layout.layers[layer].size(); ++plane)
+                state.ensure_committed(layer, plane, state.layout.logical_pages);
+#if defined(_WIN32)
+        const auto process = GetCurrentProcess();
+        if (!GetProcessWorkingSetSizeEx(process, &state.previous_min, &state.previous_max,
+                                       &state.previous_flags))
+            throw std::runtime_error("cannot query working set for --kvmem-lock-archive");
+        const auto minimum = checked_add(state.previous_min, state.layout.bytes);
+        const auto maximum = std::max<std::size_t>(state.previous_max, checked_add(minimum, 64ULL << 20));
+        if (!SetProcessWorkingSetSizeEx(process, minimum, maximum, state.previous_flags))
+            throw std::runtime_error("cannot raise working set for --kvmem-lock-archive; disable it, use pageable, shrink --max-context or use smaller KV");
+        state.working_set_changed = true;
+        if (!VirtualLock(state.data, state.layout.bytes))
+            throw std::runtime_error("VirtualLock failed for --kvmem-lock-archive; disable it, use pageable, shrink --max-context or use smaller KV");
+#else
+        if (mlock(state.data, state.layout.bytes) != 0)
+            throw std::runtime_error("OS archive lock failed; disable --kvmem-lock-archive or shrink context/KV");
+#endif
+        state.os_locked = true;
+        if (available_physical_memory_bytes() < kHostArchivePhysicalHeadroom)
+            throw std::runtime_error("OS archive lock left less than 4 GiB; shrink --max-context or use smaller KV");
+        reason = "explicit OS lock, pageable transfers through fixed ring";
+    }
     std::clog << "[kvmem] host_archive="
               << (state.mode == HostArchiveMode::Pinned ? "pinned" : "pageable")
-              << " capacity_bytes=" << state.layout.bytes << " reason=" << reason << '\n';
+              << " capacity_bytes=" << state.layout.bytes << " os_locked=" << state.os_locked
+              << " available_physical_after_bytes=" << available_physical_memory_bytes()
+              << " required_headroom_bytes=" << kHostArchivePhysicalHeadroom
+              << " reason=" << reason << '\n';
 }
 HostKVArchive::~HostKVArchive() = default;
 const HostKVArchiveLayout& HostKVArchive::layout() const noexcept { return impl_->layout; }
 HostArchiveMode HostKVArchive::mode() const noexcept { return impl_->mode; }
+bool HostKVArchive::os_locked() const noexcept { return impl_->os_locked; }
 std::uint64_t HostKVArchive::generation() const noexcept { return impl_->generation; }
 std::size_t HostKVArchive::committed_bytes() const noexcept {
     if (impl_->mode == HostArchiveMode::Pinned) { return impl_->layout.bytes; }
@@ -446,7 +494,7 @@ void HostKVArchive::trim_owned(std::uint32_t frontier) {
             const auto& plane = state.layout.layers[layer][p];
             const auto kept = rounded(plane.page_bytes * page_count(frontier),
                                         state.layout.os_page_bytes);
-            if (state.mode == HostArchiveMode::Pageable && old > kept) {
+            if (state.mode == HostArchiveMode::Pageable && !state.os_locked && old > kept) {
                 auto* begin = static_cast<std::byte*>(state.data) + plane.offset + kept;
 #if defined(_WIN32)
                 if (!VirtualFree(begin, old - kept, MEM_DECOMMIT)) {

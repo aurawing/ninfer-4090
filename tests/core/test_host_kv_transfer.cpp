@@ -30,7 +30,7 @@ std::vector<std::byte> pattern(std::size_t size, unsigned plane, unsigned page, 
     return result;
 }
 
-void roundtrip(HostArchiveMode mode, PagedKVPlaneOrder order) {
+void roundtrip(HostArchiveMode mode, PagedKVPlaneOrder order, bool os_lock = false) {
     LayoutBuilder builder;
     PagedKVPoolSpec spec{8, 8, 1, order, {}};
     for (int layer = 0; layer < 2; ++layer) {
@@ -45,10 +45,12 @@ void roundtrip(HostArchiveMode mode, PagedKVPlaneOrder order) {
             "archive layer/page shape");
     require(archive_layout.layers[0][3].offset < archive_layout.layers[1][0].offset,
             "archive must use layer then plane then page order");
-    HostKVArchive archive(archive_layout, mode);
+    HostKVArchive archive(archive_layout, mode, os_lock);
+    require(archive.os_locked() == os_lock, "explicit OS lock status");
     if (mode != HostArchiveMode::Auto) { require(archive.mode() == mode, "explicit archive mode"); }
     require(archive.frontier(0) == 0, "new archive frontier");
-    if (archive.mode() == HostArchiveMode::Pageable) {
+    if (os_lock) require(archive.committed_bytes() == archive_layout.bytes, "OS lock commits full archive during loading");
+    if (archive.mode() == HostArchiveMode::Pageable && !os_lock) {
         require(archive.committed_bytes() == 0, "pageable archive must initially reserve only");
     }
     DeviceContext device;
@@ -115,14 +117,15 @@ void roundtrip(HostArchiveMode mode, PagedKVPlaneOrder order) {
     auto retained = archive.pages(0, 0, 2, 1);
     const auto expected = pattern(retained.size(), 0, 2, 1);
     require(std::equal(retained.begin(), retained.end(), expected.begin()), "retain partial page");
-    if (archive.mode() == HostArchiveMode::Pageable) {
+    if (archive.mode() == HostArchiveMode::Pageable && !os_lock) {
         require(archive.committed_bytes() < full_commit, "trim decommits full trailing OS pages");
     }
     // Trim must drain an outstanding writeback before releasing its destination.
     archive.writeback(pool, 0, 2, update, 130, device.stream);
     archive.trim(0);
     require(archive.frontier(0) == 0, "empty trim");
-    if (archive.mode() == HostArchiveMode::Pageable) {
+    if (os_lock) require(archive.committed_bytes() == archive_layout.bytes, "trim must preserve OS locked allocation");
+    if (archive.mode() == HostArchiveMode::Pageable && !os_lock) {
         require(archive.committed_bytes() == 0, "empty trim decommits all pageable storage");
     }
     rejects([&] { archive.writeback(pool, 0, 1, update, 128, device.stream); },
@@ -151,10 +154,21 @@ int main() {
                 "failed pin must fall back");
         rejects([] { check_host_archive_admission(1024, std::uint64_t{4} << 30); },
                 "initial admission includes archive plus 4 GiB");
+        check_host_archive_admission(1024, (std::uint64_t{4} << 30) + 1024);
+        try { check_host_archive_admission(1024, std::uint64_t{4} << 30); }
+        catch (const std::runtime_error& error) {
+            const std::string message = error.what();
+            require(message.find("--max-context") != std::string::npos &&
+                    message.find("--kv-dtype") != std::string::npos &&
+                    message.find("pageable") != std::string::npos, "admission lacks actionable remedies");
+        }
         for (auto mode : {HostArchiveMode::Pinned, HostArchiveMode::Pageable, HostArchiveMode::Auto}) {
             roundtrip(mode, PagedKVPlaneOrder::PageMajor);
             roundtrip(mode, PagedKVPlaneOrder::HeadMajor);
         }
+        roundtrip(HostArchiveMode::Pageable, PagedKVPlaneOrder::PageMajor, true);
+        roundtrip(HostArchiveMode::Auto, PagedKVPlaneOrder::HeadMajor, true);
+        rejects([] { HostKVArchive archive({}, HostArchiveMode::Pinned, true); }, "CUDA pin and OS lock must conflict");
         std::cout << "PASS host KV archive modes, byte roundtrip, writeback and trim\n";
         return 0;
     } catch (const std::exception& error) {

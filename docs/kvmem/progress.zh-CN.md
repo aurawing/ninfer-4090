@@ -4,7 +4,7 @@
 
 ## 待用户决定的问题
 
-第 4 步已审阅通过（提交 `6466a166`、`d33157a9`、`f5da0049` 已推送）。本轮按用户授权完成阶段 3 第 5、6 步，停在第 6 步审阅点，不开始第 7 步。D11 的 sink 语义已由用户再次确认：固定 MTP 窗口包含 sink，剩余环容量留给最近页；没有修订为仅近期页。第 5 步独立提交/push `4da637a4`；第 6 步源码、规格/质量审阅、128K/262K 正式门禁、最终全量构建/CTest 和 sanitizer 均通过，随本步独立提交发布。本轮没有尚待决定的问题。
+第 5、6 步（`4da637a4`、`db8e9641`）已由用户审阅通过。本轮按授权完成阶段 3 第 7、8 步，之后只起草阶段 4 设计，不实现稀疏 decode。第 7 步已通过构建、CTest 和独立规格/质量审阅，独立提交发布；第 8 步与设计文档待继续。本轮尚无需要用户决定的 D1–D15 冲突。
 
 ## 阶段 0′：基线
 
@@ -540,3 +540,13 @@ compute-sanitizer **13.0.85** 分别对 `ninfer_test_mtp_window` 和 `ninfer_tes
 产品 CLI `build-vision-integration/apps/ninfer.exe` SHA256 **093c014acb6899cc3628f1970ac97e64aad7f278da0e8e2e817eaaf00d791adf**，外部另保留 `stage6-product-ninfer.exe`。规格与代码质量独立审阅通过；源码无临时 trace/capture 钩子，`git diff --check` 无错误。实施、测试和文档以 `feat(kvmem): restore tiered resume and turn checkpoints` 独立提交并推送 `origin/feat/kvmem`；磁盘状态缓存仍关闭，没有新增 pinned 申请或第三个工作线程，没有进入第 7 步。
 
 正式门禁复现：外部 `run_stage6_gates.py` 顺序执行六组测量（使用归档诊断程序），`check_stage6_logits.py` 验算 rollback/cold 包络与 token，`check_stage6_append_logits.py` 检查 append/cold，`summarize_stage6.py` 汇总预算、各 phase 时间、MTP 接受率与等待。原源码备份/SHA 在 `stage6-trace-source-backup`，`manage_stage6_trace.py` 的撤回结果已核对；这些诊断辅助工具没有进入生产源码。
+
+## 阶段 3 第 7 步：准入与 CLI（2026-10-02）
+
+基于 `db8e9641`。CLI/serve 共用 kvmem 参数语义：解析时拒绝 `--kv-mode kvmem`，说明阶段 4 Mean-K/选块/稀疏 decode 未完成；`--kvmem-prefill` 只接受 exact，window 明确拒绝。serve 的 tiered C>1 在启动前拒绝。Engine API 仍有相应目标校验。
+
+增加 `--kvmem-lock-archive`：明确要求 pageable 传输，auto 在该开关下选择 pageable，pinned 冲突报错；加载期整份提交、提高 Windows 工作集并 VirtualLock，trim 保留全份锁定容量，析构/异常释放并恢复原工作集。它不是 cudaMallocHost 的 pinned 模式，仍用既有四槽环和两线程。默认普通 pageable 的按需提交/trim decommit 不变，运行期不新增锁页申请。主机物理准入与 pinned 失败消息分别给出 pageable、max-context 和更小 KV 的建议，同时说明 pageable 不能绕过容量加 4 GiB 的物理准入。
+
+日志补全实际 Main view tokens/payload、staging、partial、访问列表与其他固定元数据、一般 workspace、MTP 窗口/pool、请求归档模式/容量；归档实际选择、OS lock 和加载后可用物理内存/4 GiB 余量单独打印。新增使用者文档 `tiered-exact.zh-CN.md`，改写 maintainer 的 offload non-goal，明确 dense 契约不变、C=1、BF16 仅功能、Graph/disk 关闭、decode 仅验证。
+
+实测验证（仓库外 `D:\deeplearning\NInfer\logs\kvmem-stage7-8`）：选项 RED 两项均因缺失功能失败，GREEN 2/2 通过；完整构建退出 0（298 更新动作），全量 **106 项：102 通过、4 制品相关跳过、0 失败，251.04 s**。额外补强 parsed lock/order 和准入提示测试后，三项定向 CTest **3/3，0.76 s**，覆盖 pageable/auto OS lock、逐字节往返、回写、trim 保留锁定提交以及普通 pageable decommit。原四项 skip 与前一步一致，没有把跳过计为执行通过。构建/RED/GREEN/full CTest 原始日志均保留；MSVC 的既有 /Ob2→/Ob3 warning 不影响退出码。独立规格与质量审阅均 approve。dense 内核与分派无改动，九组 dense 金标准按第 8 步在终版重跑。

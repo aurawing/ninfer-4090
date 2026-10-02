@@ -121,13 +121,17 @@ std::string serve_usage_text(const char* argv0) {
            "  --disk-cache-dir <DIR>            Directory path for prompt cache (default: %LOCALAPPDATA%/ninfer/cache/<profile>)\n"
            "  --disk-cache-gb <N>               Disk cache storage quota limit in GiB (default: 30)\n\n"
            "Quantization & Storage Layouts:\n"
-           "  --kv-mode <mode>            dense (default), tiered-exact (C=1); kvmem is reserved\n"
+           "  --kv-mode <mode>            dense (default), tiered-exact (C=1); kvmem requires stage 4 sparse decode\n"
            "  --kvmem-view-tokens <N>    Resident view ceiling (default 131072; budget may reduce)\n"
            "                              Alias: --kvmem-view; tiered replaces dense --kv-capacity\n"
            "  --kvmem-sink-tokens <N>    Always-resident prefix (default 256; alias --kvmem-sink)\n"
            "  --kvmem-mtp-window <N>    MTP total physical window including sink (default 32768)\n"
            "  --kvmem-host-archive <m>   auto (default), pinned, pageable; fixed at loading\n"
            "  --kvmem-staging-mib <N>    Loading-time staging capacity override\n"
+           "  --kvmem-prefill exact     Exact prefill only; window is unavailable\n"
+           "  --kvmem-lock-archive      OS VirtualLock for auto/pageable archive (not CUDA pin)\n"
+           "                            Tiered: C=1, CUDA Graph and disk cache disabled;\n"
+           "                            BF16 functional only; decode for verification only\n"
            "                            Tiered supports BF16, INT8, rk4v4-e8. BF16 guarantees\n"
            "                            functionality only; large-T performance is not guaranteed.\n"
            "  --kv-dtype <dtype>          KV cache storage data type and quantization layout:\n"
@@ -229,6 +233,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (!options.kvmem.mtp_window_tokens) throw std::invalid_argument("kvmem-mtp-window must be positive");
         } else if (arg == "--kvmem-host-archive") {
             options.kvmem.host_archive = product::parse_host_archive_mode(require_value("--kvmem-host-archive"));
+        } else if (arg == "--kvmem-prefill") {
+            product::validate_kvmem_prefill(require_value("--kvmem-prefill"));
+        } else if (arg == "--kvmem-lock-archive") {
+            options.kvmem.lock_archive = true;
         } else if (arg == "--kvmem-staging-mib") {
             options.kvmem.staging_capacity_bytes = std::size_t(parse_positive_u32(require_value("--kvmem-staging-mib"), "kvmem-staging-mib")) << 20;
         } else if (arg == "--max-concurrency") {
@@ -424,6 +432,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
+    product::validate_kvmem_options(options.kv_mode, options.kvmem, options.max_concurrency);
     product::validate_speculative_cli_options(options.speculative);
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
         throw std::invalid_argument("--spec dflash cannot be combined with --vision");

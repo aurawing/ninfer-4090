@@ -42,6 +42,7 @@ struct TieredKVOptions {
     HostKVArchiveMode host_archive = HostKVArchiveMode::Auto;
     std::size_t staging_capacity_bytes = 0;
     std::size_t partial_budget_bytes = 100ULL * 1024 * 1024;
+    bool lock_archive = false; // OS residency lock for pageable archive; not CUDA registration.
 };
 
 inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;

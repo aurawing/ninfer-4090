@@ -43,6 +43,15 @@ bool rejects(const std::vector<std::string>& flags) {
 
 int main() {
     int failures = 0;
+    failures += check(rejects({"--kv-mode", "kvmem"}), "sparse decode must remain unavailable before stage 4");
+    failures += check(accepts({"--kv-mode", "tiered-exact", "--kvmem-prefill", "exact"}).has_value(), "exact prefill missing");
+    failures += check(rejects({"--kvmem-prefill", "window"}) && rejects({"--kvmem-prefill", "invalid"}), "inexact prefill accepted");
+    failures += check(accepts({"--kv-mode", "tiered-exact", "--kvmem-host-archive", "pageable", "--kvmem-lock-archive"}).has_value(), "pageable VirtualLock missing");
+    const auto locked_archive = accepts({"--kvmem-lock-archive", "--kv-mode", "tiered-exact"});
+    failures += check(locked_archive && locked_archive->kvmem.lock_archive, "CLI OS-lock value or option order lost");
+    failures += check(rejects({"--kv-mode", "tiered-exact", "--kvmem-host-archive", "pinned", "--kvmem-lock-archive"}), "CUDA pin and VirtualLock conflict accepted");
+    for (const char* text : {"--kvmem-prefill", "--kvmem-lock-archive", "verification", "CUDA Graph"})
+        failures += check(ninfer::cli::usage_text("ninfer").find(text) != std::string::npos, "tiered help incomplete");
     failures += check(accepts({"--kv-mode", "tiered-exact", "--kvmem-mtp-window", "32768"}).has_value(),
                       "CLI must accept a fixed MTP window");
     failures += check(rejects({"--kvmem-mtp-window", "0"}), "MTP window zero must be rejected");

@@ -54,7 +54,7 @@ struct TieredContext::Impl {
     Impl(const TieredRuntimePlan& p, PagedKVCache& m, DeviceSpan b, cudaStream_t stream)
         : plan(p), main(m), backing(b), compute(stream),
           table(p.logical_tokens, p.view_pages, p.sink_pages, 16),
-          archive(p.archive, p.archive_mode),
+          archive(p.archive, p.archive_mode, p.lock_archive),
           transfer(archive, p.staging_region.bind(b), p.staging) {
         if (m.layers() != 16 || b.bytes < p.bytes ||
             p.staging_plane_regions.size() != p.archive.layers.front().size() ||

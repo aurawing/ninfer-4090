@@ -574,12 +574,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
 void validate_target_options(DeviceContext& device, const EngineOptions& options) {
     if (options.kv_mode == KvMode::KVMem) {
-        throw std::invalid_argument("kv-mode kvmem is not implemented; use tiered-exact");
+        throw std::invalid_argument("kv-mode kvmem requires stage 4 Mean-K scoring and sparse decode; use tiered-exact");
     }
     if (options.kv_mode != KvMode::Dense && options.kv_mode != KvMode::TieredExact) {
         throw std::invalid_argument("unknown kv-mode");
     }
     const bool tiered = options.kv_mode == KvMode::TieredExact;
+    if (options.kvmem.lock_archive && (!tiered || options.kvmem.host_archive == HostKVArchiveMode::Pinned))
+        throw std::invalid_argument("kvmem-lock-archive requires tiered-exact auto/pageable archive");
     const char* shadow_env = std::getenv("NINFER_KVMEM_SHADOW");
     const bool shadow = tiered && shadow_env && std::string_view(shadow_env) == "1";
     if (tiered) {
@@ -862,6 +864,21 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_6::detail::SequencePlannerImpl
     if (plan->device_reservation_bytes != expected) {
         throw std::logic_error(
             "Qwen3.6 physical sequence layout is not affine in Main KV page capacity");
+    }
+    if (plan->workspace.tiered) {
+        const auto& t = *plan->workspace.tiered;
+        const auto metadata = t.bytes - t.staging.capacity_bytes - t.partial.bytes;
+        std::clog << "[kvmem-plan] view_tokens=" << main_page_groups * 64U
+                  << " main_view_bytes=" << plan->persistent.decoder.text_kv.pool.payload_bytes()
+                  << " staging_bytes=" << t.staging.capacity_bytes
+                  << " partial_bytes=" << t.partial.bytes << " access_and_metadata_bytes=" << metadata
+                  << " general_workspace_bytes=" << plan->workspace.general_capacity
+                  << " mtp_window_tokens=" << plan->kvmem.mtp_window_tokens
+                  << " mtp_pool_bytes=" << (plan->persistent.decoder.mtp_kv ? plan->persistent.decoder.mtp_kv->pool.payload_bytes() : 0)
+                  << " archive_capacity_bytes=" << t.archive.bytes
+                  << " archive_requested=" << (t.archive_mode == kvmem::HostArchiveMode::Auto ? "auto" : t.archive_mode == kvmem::HostArchiveMode::Pinned ? "pinned" : "pageable")
+                  << " os_lock_requested=" << t.lock_archive
+                  << " prefill_chunk=" << plan->prefill_chunk << '\n';
     }
     if(plan->workspace.mtp_window) {
         const auto& mp=*plan->workspace.mtp_window;
