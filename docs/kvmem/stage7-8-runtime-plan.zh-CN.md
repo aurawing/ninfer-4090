@@ -7,7 +7,7 @@
 - [x] 第 8 步：自动分块先试 2048 的完整预算，预算不可行退 1024；显式设置与 dense 默认不变。恢复视图保留目标前缀仍存活的页，固定旧物理槽，只换入缺失页；generation 正常递增，旧 tickets 拒绝。
 - [x] 新恢复 CPU/GPU CTest、262K 改动前后时间和实际调度传输字节；262K INT8 摘要生成 1024 token 比较 MTP 32768/262144 的接受率与 decode tok/s。完整结果及长生成未验证的输出一致性见 progress。
 - [x] 终版九组 dense 首轮8/9的失败保留；用户事后批准的三项组合验收均通过：36次完整logits逐位零差异、九例生产计划一致且默认1024、生产算法六次的并列与L2包络均通过。阶段3关闭，未来各阶段沿用组合判据；证据见progress和dense-combined-gate-summary.json。
-- [ ] 第 8 步全量构建与 CTest，审阅，单独提交并 push。
-- [ ] 编写 stage4-sparse-decode-design.zh-CN.md，只设计 Mean-K/Q、CPU 打分、选块/diff、图像跨度、gen reserve、Graph、参考移植/许可和质量门禁；不写阶段 4 代码，停下等审阅。
+- [x] 第 8 步全量构建与 CTest、实现审阅、三项 dense 补验收通过；`c4f145e5` 单独提交并已 push。
+- [x] 编写 stage4-sparse-decode-design.zh-CN.md，核对已发布的第8步接口，只设计 Mean-K/Q、CPU 打分、选块/diff、图像跨度、gen reserve、Graph、参考移植/许可和质量门禁；本纯文档提交后停下等审阅，不写阶段4代码。
 
 模型与 GGUF 沿用 README，本轮所有测量、构建/测试日志及临时 harness 在仓库外 `D:\deeplearning\NInfer\logs\kvmem-stage7-8`，失败记录也保留。GPU 测量串行；构建不与性能测量重叠。

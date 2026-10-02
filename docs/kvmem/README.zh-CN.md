@@ -217,6 +217,8 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
 
 ### 阶段 4：稀疏 decode（2.5–3.5 周）
 
+设计草案见 [stage4-sparse-decode-design.zh-CN.md](stage4-sparse-decode-design.zh-CN.md)，以阶段 3 收尾提交 `c4f145e5` 核对现有接口；本轮只发布文档，等待审阅后再实施。
+
 步骤：
 
 1. Mean-K 累加，与 `ops::rope` 相邻或融合进去。
