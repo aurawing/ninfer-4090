@@ -57,6 +57,8 @@
 - `trim(F')` 先在执行边界等待所有仍可能访问旧页的 H2D、注意力与回写事件；把旧 generation 的异步完成通知标记为不可再发布，然后丢弃逻辑页号 `>= ceil(F'/64)` 的页映射和归档提交。若 `F'` 落在页内，保留该页及 `[0,F'%64)` 的有效字节，尾部标记无效并在续写前覆盖；Main、MTP 各按自己的 frontier 截断，不能把部分页当成完整 checkpoint。
 - retained resume 和 turn checkpoint 只引用同一份独占 KV bundle。`restore` 先按 checkpoint 的精确 frontier 截断主机归档和设备视图，恢复对应的 GDN/MTP/hidden/position 状态，再把下一步必需的 sink、近期页及当前写入页换入，发布新块表和列表后才继续。前缀中未驻留的页仍有原始逻辑号；没有完整 continuation state 的任意短前缀仍是 miss。主机归档需保证 checkpoint 覆盖页的回写已完成；同页无效尾部不作为可读 key。
 - `snapshot` 记录精确 frontier、页状态/映射 generation 和完整 target continuation state；turn checkpoint 只保存一个，不复制整份 KV。阶段 3 的 kvmem/tiered 模式关闭现有磁盘状态缓存路径，避免其按连续 `page_ids()` 序号 restore/snapshot；dense 的磁盘路径不变。任何 trim/restore 必须使旧 staging 列表和旧传输事件失效。
+- 第 6 步的 Main 快照只持有 bundle 身份、归档 frontier/generation、视图 frontier/generation 及有效性引用，不保存可能已被覆盖的物理页映射。恢复时重新规划 sink 和最近页的驻留槽，从归档按连续逻辑页范围换入；可分页和锁页归档复用同一传输引擎及加载期的 64 MiB 额外 staging 块，不在运行期新申请锁页内存。传输排空后再切换 generation，不能用 generation 标签代替 DMA 生命周期管理。
+- Program 在精确 checkpoint 分块完成时捕获 Main 元数据及已有的 GDN/hidden 状态；MTP 保存 `F−1` 的逻辑 frontier 和页标签，为下一段桥接 token 的重写留出位置。retained resume 保存已提交的 continuation frontier 与真实 RoPE 坐标。恢复 MTP 时只保留快照与当前标签交集，缺失页不补算；重复恢复同一有效 checkpoint 合法，reset 或截断到 checkpoint 之前则永久使它失效。
 
 ## 5. 同一次运行的影子验证
 

@@ -116,9 +116,17 @@ enum class Lifecycle : std::uint8_t {
 struct TurnCheckpoint {
     bool valid             = false;
     std::uint32_t frontier = 0;
+    bool captured = false;
+    std::uint64_t bundle_identity = 0;
+    std::uint32_t text_frontier = 0, mtp_frontier = 0;
+    std::int32_t rope_delta = 0;
+    std::array<std::int32_t, 3> previous_rope_position{};
+    std::optional<qwen3_6::detail::TieredSnapshot> main;
+    std::optional<qwen3_6::detail::MtpWindowSnapshot> mtp;
 };
 
 struct SequenceKVBundle {
+    std::uint64_t identity = 0;
     PagedKVAllocation text;
     std::optional<PagedKVAllocation> backend;
 };
@@ -156,6 +164,7 @@ struct SequenceState {
     std::vector<TokenId> ledger;
     qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
     std::int32_t rope_delta               = 0;
+    std::array<std::int32_t, 3> previous_rope_position{};
     std::uint32_t text_kv_valid           = 0;
     std::uint32_t mtp_kv_valid            = 0;
     std::uint32_t dflash_context_frontier = 0;
@@ -164,6 +173,7 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool retained                 = false;
     TurnCheckpoint turn_checkpoint;
+    TurnCheckpoint resume;
     std::uint32_t last_disk_snapshot_tokens = 0;
 };
 
@@ -401,6 +411,8 @@ public:
 private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
+    void retain_sequence(SequenceState& sequence);
+    void restore_continuation(SequenceState& sequence, const TurnCheckpoint& saved, std::uint32_t base);
     void prepare_graphs();
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);

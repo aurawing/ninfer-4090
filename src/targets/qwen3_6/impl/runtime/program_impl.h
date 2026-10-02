@@ -347,7 +347,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                       << " guard_pages=" << mp.guard_pages
                       << " main_view_tokens=" << workspace_plan.tiered->view_pages*64U << '\n';
         }
-        std::clog << "[kvmem] tiered-exact disables turn checkpoints and retained resume until stage 3 step 6\n";
+        std::clog << "[kvmem] tiered-exact supports retained resume and turn checkpoints; disk snapshots remain disabled\n";
         if (kv_dtype == DType::BF16) {
             std::clog << "[kvmem] BF16 tiered is functional only; large-T performance is not guaranteed\n";
         }
@@ -768,6 +768,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                        sequence.dflash_context_frontier != base) {
                 throw std::logic_error("resident DFlash context is not at the append frontier");
             }
+            if (tiered) {
+                const auto& saved = request_plan.reuse == ReusePath::AppendAtFrontier
+                                        ? sequence.resume : sequence.turn_checkpoint;
+                restore_continuation(sequence, saved, base);
+            }
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
             resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
                                            request_plan.backend_kv_page_entitlement);
@@ -792,6 +797,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 dflash->restore_turn_checkpoint(static_cast<std::int32_t>(sequence.lane),
                                                 device.stream);
                 sequence.dflash_context_frontier = base;
+            }
+            if (tiered) {
+                const auto& saved = request_plan.reuse == ReusePath::AppendAtFrontier
+                                        ? sequence.resume : sequence.turn_checkpoint;
+                restore_continuation(sequence, saved, base);
             }
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
             resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
@@ -1053,6 +1063,8 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
             sequence.prefix_identity.append_generated(committed, sequence.rope_delta);
             sequence.execution_frontier = pending.base_E + committed;
+            if (tiered) sequence.previous_rope_position.fill(
+                checked_i32(sequence.execution_frontier - 1, "committed previous position") + sequence.rope_delta);
             sequence.ledger_frontier    = pending.base_S + committed;
             sequence.text_kv_valid      = sequence.execution_frontier;
             sequence.tail_hidden_valid  = true;
@@ -1088,7 +1100,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             if (terminal[row]) {
                 release_sequence_growth_entitlement(sequence);
                 unbind_sequence_kv(sequence);
-                sequence.retained = !tiered;
+                retain_sequence(sequence);
                 request.lifecycle = Lifecycle::Complete;
             } else {
                 request.lifecycle = Lifecycle::Active;
@@ -1162,6 +1174,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
     sequence.turn_checkpoint         = {};
+    sequence.resume                  = {};
     request.pending                  = {};
 }
 
@@ -1207,7 +1220,9 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
 
     std::vector<PagedKVAllocation> allocations =
         reserve_paged_kv_bundle(std::span<const PagedKVReservation>(reservations.data(), count));
+    static std::atomic<std::uint64_t> next_bundle_identity{1};
     SequenceKVBundle bundle;
+    bundle.identity = next_bundle_identity.fetch_add(1);
     bundle.text = std::move(allocations[0]);
     if (count == 2) { bundle.backend.emplace(std::move(allocations[1])); }
     sequence.kv.emplace(std::move(bundle));
@@ -1294,6 +1309,8 @@ void ProgramImplCore::trim_sequence_kv(SequenceState& sequence, std::uint32_t ma
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV trim requested without an allocation");
     }
+    if (tiered && sequence.turn_checkpoint.valid && main_tokens < sequence.turn_checkpoint.frontier)
+        sequence.turn_checkpoint = {};
     if (tiered && main_tokens < tiered->frontier()) { tiered->trim(main_tokens, device.stream); }
     if (!tiered || tiered->shadow()) { sequence.kv->text.trim_tokens(main_tokens); }
     if (mtp_window) mtp_window->trim(backend_tokens,device.stream);
@@ -1324,7 +1341,49 @@ void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
         cudaMemcpyAsync(tensor.data, &value, sizeof(value), cudaMemcpyHostToDevice, device.stream));
 }
 
+void ProgramImplCore::restore_continuation(SequenceState& sequence, const TurnCheckpoint& saved,
+                                           std::uint32_t base) {
+    if (!tiered || !sequence.kv || !saved.valid || saved.bundle_identity != sequence.kv->identity ||
+        !saved.main || saved.frontier != base || saved.text_frontier != base)
+        throw std::logic_error("reusable continuation belongs to a stale KV bundle");
+    if (mtp_window && (!saved.mtp || saved.mtp_frontier < sequence.mtp_kv_valid))
+        throw std::logic_error("reusable MTP continuation metadata unavailable");
+    tiered->restore(*saved.main, device.stream);
+    if (mtp_window) mtp_window->restore(*saved.mtp, sequence.mtp_kv_valid, device.stream);
+    sequence.rope_delta = saved.rope_delta;
+    sequence.previous_rope_position = saved.previous_rope_position;
+    sequence.execution_frontier = saved.frontier;
+    sequence.ledger_frontier = saved.frontier;
+    set_device_i32(io.pos, checked_i32(base, "restored position"));
+    set_device_i32(io.rope_pos, checked_i32(base, "restored rope position") + saved.rope_delta);
+    if (io.mtp)
+        set_device_i32(io.mtp->position, checked_i32(sequence.mtp_kv_valid, "restored MTP position"));
+}
+
+void ProgramImplCore::retain_sequence(SequenceState& sequence) {
+    if (tiered) {
+        if (!sequence.kv || sequence.text_kv_valid != sequence.execution_frontier ||
+            !sequence.tail_hidden_valid)
+            throw std::logic_error("retained continuation has no exact Main frontier or hidden");
+        sequence.resume = {};
+        sequence.resume.frontier = sequence.execution_frontier;
+        sequence.resume.text_frontier = sequence.text_kv_valid;
+        sequence.resume.mtp_frontier = sequence.mtp_kv_valid;
+        sequence.resume.bundle_identity = sequence.kv->identity;
+        sequence.resume.rope_delta = sequence.rope_delta;
+        sequence.resume.previous_rope_position = sequence.previous_rope_position;
+        sequence.resume.main = tiered->capture();
+        if (sequence.resume.main->frontier != sequence.execution_frontier)
+            throw std::logic_error("retained archive and continuation frontiers disagree");
+        if (mtp_window) sequence.resume.mtp = mtp_window->capture(sequence.mtp_kv_valid, device.stream);
+        sequence.resume.captured = true;
+        sequence.resume.valid = true;
+    }
+    sequence.retained = true;
+}
+
 void ProgramImplCore::ordered_reset(SequenceState& sequence) {
+    sequence.resume = {};
     if(mtp_window) mtp_window->reset(device.stream);
     decoder->linear_attention.zero_slot(
         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), device.stream);
@@ -1860,7 +1919,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             const schedule::MtpBridgeInput bridge{
                 .previous_hidden = &previous_hidden,
                 .position        = checked_i32(staged.base - 1, "MTP bridge position"),
-                .rope_position   = prompt_rope_position(staged.prompt, staged.base - 1),
+                .rope_position   = tiered ? sequence.previous_rope_position
+                                         : prompt_rope_position(staged.prompt, staged.base - 1),
             };
             if (staged.vision) {
                 schedule::mtp_bridge_multimodal(schedule_state, staged.prompt, *staged.vision,
@@ -1907,6 +1967,24 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             staged.cursor += result.processed_tokens;
             sequence.text_kv_valid = staged.cursor;
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
+            if (tiered && staged.turn_checkpoint_capture_frontier &&
+                staged.cursor == *staged.turn_checkpoint_capture_frontier) {
+                if (!sequence.kv) throw std::logic_error("checkpoint capture has no KV bundle");
+                auto& checkpoint = sequence.turn_checkpoint;
+                checkpoint = {};
+                checkpoint.frontier = staged.cursor;
+                checkpoint.text_frontier = staged.cursor;
+                // The bridge at F-1 uses the new suffix token; that KV is intentionally rewritten.
+                checkpoint.mtp_frontier = staged.prepare_mtp ? staged.cursor - 1 : 0;
+                checkpoint.bundle_identity = sequence.kv->identity;
+                checkpoint.rope_delta = sequence.rope_delta;
+                checkpoint.previous_rope_position = prompt_rope_position(staged.prompt, staged.cursor - 1);
+                checkpoint.main = tiered->capture();
+                if (checkpoint.main->frontier != checkpoint.frontier)
+                    throw std::logic_error("checkpoint capture missed exact Main chunk boundary");
+                if (mtp_window) checkpoint.mtp = mtp_window->capture(checkpoint.mtp_frontier, device.stream);
+                checkpoint.captured = true;
+            }
             if (speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = staged.cursor;
             }
@@ -1942,8 +2020,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                     throw std::logic_error("zero-suffix MTP reuse has no exact-hit bridge");
                 }
                 mark_workspace_usage(workspace_plan.mtp_prefill);
-                const auto bridge_rope =
-                    prompt_rope_position(staged.prompt, staged.prompt_tokens - 1);
+                const auto bridge_rope = tiered ? sequence.previous_rope_position
+                                               : prompt_rope_position(staged.prompt, staged.prompt_tokens - 1);
                 schedule::mtp_bridge_and_propose(
                     schedule_state, io.token, sequence.tail_hidden,
                     checked_i32(staged.prompt_tokens - 1, "MTP full-prefix bridge position"),
@@ -1986,6 +2064,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
         }
         sequence.tail_hidden_valid      = true;
+        if (tiered) sequence.previous_rope_position = prompt_rope_position(staged.prompt, prompt_tokens - 1);
         request.timings.vision_seconds  = vision_seconds;
         request.cpu_vision_cache = staged.vision ? staged.vision->cpu_vision_cache_stats()
                                                  : CpuVisionCacheStats{};
@@ -2004,7 +2083,12 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                  sequence.dflash_context_frontier < frontier)) {
                 throw std::logic_error("turn checkpoint has no complete DFlash prefix");
             }
-            sequence.turn_checkpoint = TurnCheckpoint{.valid = true, .frontier = frontier};
+            if (tiered) {
+                if (!sequence.turn_checkpoint.captured || sequence.turn_checkpoint.frontier != frontier ||
+                    !sequence.turn_checkpoint.main || sequence.turn_checkpoint.main->frontier != frontier)
+                    throw std::logic_error("turn checkpoint metadata was not captured at its chunk boundary");
+                sequence.turn_checkpoint.valid = true;
+            } else sequence.turn_checkpoint = TurnCheckpoint{.valid = true, .frontier = frontier};
         }
 
         if (!staged.prompt.patches.empty()) {
@@ -2508,6 +2592,8 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
         break;
     case PendingKind::Ordinary:
         sequence.execution_frontier = request.pending.base_E + request.pending.produced;
+        if (tiered) sequence.previous_rope_position.fill(
+            checked_i32(sequence.execution_frontier - 1, "committed previous position") + sequence.rope_delta);
         sequence.ledger_frontier    = request.pending.base_S + request.pending.produced;
         break;
     case PendingKind::Speculative:
@@ -2524,7 +2610,7 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
         sequence.mtp_draft_count = 0;
         release_sequence_growth_entitlement(sequence);
         unbind_sequence_kv(sequence);
-        sequence.retained = !tiered;
+        retain_sequence(sequence);
     }
     request.lifecycle = terminal ? Lifecycle::Complete : Lifecycle::Active;
     request.pending   = {};

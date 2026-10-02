@@ -4,7 +4,7 @@
 
 ## 待用户决定的问题
 
-第 4 步已审阅通过（提交 `6466a166`、`d33157a9`、`f5da0049` 已推送）。本轮按用户授权继续阶段 3 第 5、6 步，第 6 步完成后停下等审阅，不开始第 7 步。D11 的 sink 语义已由用户再次确认：固定 MTP 窗口包含 sink，剩余环容量留给最近页；没有修订为仅近期页。本轮没有尚待决定的问题；第 5、6 步的门禁和全量验证尚未完成。
+第 4 步已审阅通过（提交 `6466a166`、`d33157a9`、`f5da0049` 已推送）。本轮按用户授权完成阶段 3 第 5、6 步，停在第 6 步审阅点，不开始第 7 步。D11 的 sink 语义已由用户再次确认：固定 MTP 窗口包含 sink，剩余环容量留给最近页；没有修订为仅近期页。第 5 步独立提交/push `4da637a4`；第 6 步源码、规格/质量审阅、128K/262K 正式门禁、最终全量构建/CTest 和 sanitizer 均通过，随本步独立提交发布。本轮没有尚待决定的问题。
 
 ## 阶段 0′：基线
 
@@ -453,14 +453,14 @@ rk4v4-e8 的 32K/8K 视图影子第一次运行在首全注意力层、frontier=
 | 2026-10-01 | D1 与门禁 A | 262K RK4 的新路径与当前 dense 在 146432 token 处相对 L2 0.0010094，固定输入消融确认 dense prefill alpha 的 FMA 舍入累积；照搬它会破坏现有 FP64 公共 logit 测试。保持门禁和正确新路径，是否另行修 dense 须用户决定 | 固定输入 dense/partial 重算均逐位一致；临时 alpha-only FMA 将两者误差降到 0.0000645685，但独立数值测试失败，未修改 dense 的均匀参考直接出现大误差/非有限输出，详见上文 | 已决定不修 dense；262K 门禁 A 后续按 FP64 修订见下一行，原失败保留 |
 | 2026-10-02 | 门禁 A，D1 保持 | 32K/128K 的 tiered/dense 1e-3 不变；262K RK4 按影子误差选至少三个层（包括原超限层）的末段完整块，采用同一量化 KV 字节的 CPU FP64 oracle，要求逐层 tiered/FP64 相对 L2 不超过 dense/FP64；同时记录 tiered/dense 数值 | **在测得 0.0010094 之后**依据固定输入 alpha 消融作出的事后修订，保留原失败与所有数据；不修改 dense、不放宽任何其他门禁 | 是，用户明确同意；新判据实测通过 |
 
-## 阶段 3 第 5、6 步：实施中（2026-10-02）
+## 阶段 3 第 5、6 步：已完成，停在审阅点（2026-10-02）
 
 - 基线 `f5da0049`；实现清单见 [stage5-6-runtime-plan](stage5-6-runtime-plan.zh-CN.md)。本轮数据在仓库外 `D:/deeplearning/NInfer/logs/kvmem-stage5-6`。第 4 步生产二进制已归档为 `stage4-baseline-ninfer.exe`，SHA256 为 `e4f7e13433952b0a46f4b48e48b484e1b80239db9ba558d0fef1794c892442eb`。
 - 用户明确选择继续遵循 D11：默认 32768 token 的 MTP 物理页环预算包含 sink，近期页使用剩余容量。跨页临时草稿的保护页也在固定预算内，不能额外增加池大小。
 - 第 6 步 public Engine 短对话基线（尚未实现时）：追加与回滚均 `reused_prompt_tokens=0`，实际计算完整提示词，符合复用入口关闭的当前状态；输出回滚/冷启动 ID 相同，不能以此代替已实现复用。原始记录 `reuse-baseline-red.json/.log`。这份短提示词的后续回答没有重述 needle，故不算 needle 门禁通过，也不作为正式长上下文质量数据。
 - 第 5 步源代码接线完成，规格与代码质量审阅无阻塞项；dense 内核与分派未改。参数、预算、窗口页和 masked append 的回归先失败后通过。最终全量构建通过，CTest **105 项，101 通过、4 缺少其他模型制品跳过、0 失败，199.95 s**，见 `stage5-full-build-r3.log` / `stage5-full-ctest-r3.log`。
 - compute-sanitizer **13.0.85** 对 `ninfer_test_mtp_window` 三项复测：racecheck **0 hazards / 0 errors / 0 warnings**，synccheck、initcheck 各 **0 errors**。首轮 initcheck 指向测试整块 D2H 字节比较的未初始化空闲页/尾部；测试夹具改为在已有初始化同步之后、计算流上清零该存储，未修改生产算法。首轮失败日志及 r2 复测日志均保留在外部目录。最终 CLI SHA256 `b9712bdf9a50c12499ad619300004c7e0c114135ef7159adf33795430ef235bc`。
-- 正式 128K/262K 第 5 步门禁均通过；第 6 步尚未实施。配置：INT8-G64 归档、chunk 1024、贪心、无视觉、无 CUDA Graph、Main view 上限 131072、MTP-3 + optimized draft head；逐组串行执行，二进制相同。
+- 正式 128K/262K 第 5 步门禁均通过；该步提交时第 6 步尚未实施，后续结果见下文。配置：INT8-G64 归档、chunk 1024、贪心、无视觉、无 CUDA Graph、Main view 上限 131072、MTP-3 + optimized draft head；逐组串行执行，二进制相同。
 
 ### 第 5 步：正式门禁与显存
 
@@ -481,3 +481,62 @@ rk4v4-e8 的 32K/8K 视图影子第一次运行在首全注意力层、frontier=
 128K 窗口 Main 4224 MiB、staging 64 MiB、partial 48.375 MiB、metadata/fixed 82688 B、general workspace 180953088 B；262K 分别为 Main 3997.125 MiB、staging 342.179688 MiB、partial 48.375 MiB、metadata/fixed 164608 B、general workspace 180953088 B。两档 pinned host archive 分别为 4429185024 / 8858370048 B。窗口测试的整卡峰值分别为 23761 / 23737 MiB，包含桌面及其他程序，不能当作进程独占占用。资源汇总见 `stage5-resource-summary.json`。
 
 复现：在外部目录使用 `run_full_checks_retry3.ps1 -Stage stage5`，随后 `python run_stage5_gates_r2.py`（三项 sanitizer → 四组正式模型测量 → 原版两组加载预算 → 门禁比较），`python summarize_stage5.py`。sanitizer 命令为版本 13.0.85 的 `compute-sanitizer --tool racecheck|synccheck|initcheck --error-exitcode 1 build-vision-integration/tests/ninfer_test_mtp_window.exe`，三项各自运行。临时代码、模型和测量数据均未进入仓库。
+
+第 5 步独立提交并 push：`4da637a4`（`feat(kvmem): window MTP cache within a fixed sink and recent ring`）。第 6 步随后按精确 frontier 与 generation 恢复契约完成，正式结果如下；不开始第 7 步。
+
+### 第 6 步：实现与验证记录（已完成）
+
+Main 快照只持有 bundle 身份、精确 archive/view frontier 和 generation、有效性引用，不复制 KV，也不保存过时的物理槽映射。实际 checkpoint 分块结束时捕获 Main 元数据与已有的 GDN/hidden 状态，MTP 保存 `F−1` 的桥接边界及标签；retained resume 保存已提交 continuation 与真实 RoPE 坐标。restore 排空两条传输流和两个 worker、截断归档/视图、重新换入 sink/recent/当前部分页，最后发布新的块表、访问列表和前缀和。MTP 只取快照标签与存活标签交集，丢失历史不补算，日志明确 `replay=0`。磁盘状态缓存继续关闭。
+
+定向 6 项 CTest **全部通过、0 失败、无跳过，34.25 s**（`step6-targeted-green-r2.log`），实际 Engine 测试 29.97 s，覆盖可分页+MTP、锁页+MTP、可分页无 MTP 的追加、重复 checkpoint 恢复、冷启动 ID 比较和单输出 token exact-hit；其他测试覆盖精确 `F=129`、部分页续写、非连续 lease、foreign bundle、reset/trim-below 后重新增长仍拒绝旧快照、旧 wait/staged/release ticket 拒绝及活跃 MTP guard。初始 CPU/Main/MTP RED/GREEN 的原始执行未重定向到文件，只有工具输出观察记录，见 `step6-tdd-observed.txt`；Program 有实际 RED 日志 `step6-program-red-r2.log`。最早 `step6-program-red.log` 是无效 chunk 配置失败，不作为功能 RED 证据。配置问题及历次 GREEN 失败日志保留，未覆盖。
+
+聊天测试显式 `preserve_thinking=true`：现有模板在非 thinking 生成头中仍包含空 thinking 块；默认 false 会在后续轮删除历史块、改变缓存前缀，因而选旧 checkpoint 而非 retained append。没有改模板或 dense。仓库外首次 4K smoke 的原「access code」输入还触发第二轮拒答，needle 失败，回滚/冷启动轨迹也不同（`stage6-smoke-clean.*`）；这不是通过的质量数据。正式测试把合成数据字段改成「reference number」，数字仍为 `73184269`，原 fixture、失败记录和新旧 SHA 均保留于 `stage6-fixture-manifest.json`。中性数字 fixture 的 4K smoke（`stage6-smoke-reference.*`）追加、checkpoint、needle 和回滚/冷启动完整 64 token ID 全部通过。
+
+128K/262K 正式 fixture 在原合成 archive 的末段少放 640 个 filler token，给两轮输入和 64 输出留出容量；实际 token 数以测量结果为准，不把容量配置误写成提示词恰好等于容量。配置为 INT8-G64、MTP-3 optimized head、chunk 2048、无视觉/无 CUDA Graph、无磁盘缓存、贪心、`preserve_thinking=true`。每组顺序执行 first（16 输出）、append（64）、checkpoint rollback（64）、相同聊天输入的 cold reset（64）。两档各三组抓取完整 BF16 词表 logits，按共同前缀包络及并列规则验算；cold 是同精度 tiered-exact 从头计算，在 262K 不用无法放下的 dense INT8 替代参考。正式数据已完成，判定如下，不以定向 CTest 或 smoke 代替门禁。
+
+**128K 正式复用门禁通过。** 三组 first 输入各 130375 token；第二轮各 130441 token，retained append 复用 130390，只计算 51；checkpoint 回滚复用 130437，只计算 4；cold 从头计算 130441。first 的最后一个已输出 token 尚未反馈进入 Main 执行 frontier，因此 retained frontier 是 `130375+15`，追加后缀也包含这个待处理 token，没有把未计算的 KV 计入命中数。三组 append/checkpoint 都命中正确路径，needle 全正确，9 个 rollback/cold 配对 64 token ID 全部相同。三次 cold 两两最大相对 L2 **0.3351892057014107**，按既定门禁得到包络 **0.6703784114028214**；完整词表比较通过，不声称 logits 逐位一致。完整逐步误差见 `stage6-128k-gates-summary.json`，没有分歧点，无需并列例外。
+
+| 128K 组 | first prefill（s） | append prefill（s） | rollback prefill（s） | cold prefill（s） | ready prefill（ms） | ready decode（ms） |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 73.080866 | 0.598555 | 0.428131 | 74.024215 | 3.590368 | 8.785344 |
+| 2 | 74.552613 | 0.640813 | 0.426275 | 75.093473 | 3.595552 | 8.350210 |
+| 3 | 75.112074 | 0.601518 | 0.428285 | 75.653568 | 3.371264 | 6.385118 |
+
+ready 为每个 Engine 的四次调用（first/append/rollback/cold）在 16 层上的累计 GPU 等待，prefill/decode 分别统计，不是单次请求值；各层 CPU 下发等待也保存在 stderr 与资源 JSON。三组四阶段的 MTP draft/accepted 分别均为 first 11/11，其余各 47/47（全部 100%）。原始 `stage6-128k-{1,2,3}.*`、输入 SHA、二进制 SHA 和整卡采样保存在仓库外，三组整卡峰值均为 23607 MiB，含桌面占用。
+
+**262K 正式复用门禁通过。** 三组 first 输入各 261447 token；第二轮各 261513 token，append 复用 261462、只计算 51；checkpoint 回滚复用 261509、只计算 4；cold 从头计算 261513。needle 四阶段每次均正确；9 个 rollback/cold 配对的 64 token ID 全部相同。三次 cold 两两最大相对 L2 **0.21513618054751757**，门禁包络 **0.43027236109503514**，rollback/cold 九配对最大 **0.40204128237988074**，通过。128K 九配对最大为 **0.3417149724698084**，也通过其 0.6703784114028214 包络。两档都没有分歧点，不使用并列例外；不能把这些结论写成固定 1e-3 或 logits 逐位一致。完整有效词表为 248077 项，逐步数据保存在 `stage6-gates-summary.json`。
+
+另用同一批抓取核对 retained append：两档各 9 个 append/cold 配对也都是 64 token 相同，最大相对 L2 分别 **0.3238738598588876 / 0.2951652530896267**，都在同一个已确定包络内，见 `stage6-append-gates-summary.json`；没有增加 GPU 运行、扩大参考样本或重算更宽的包络。
+
+| 262K 组 | first prefill（s） | append prefill（s） | rollback prefill（s） | cold prefill（s） | ready prefill（ms） | ready decode（ms） |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 196.288366 | 1.530497 | 0.807864 | 196.284459 | 1983.223100 | 22673.410000 |
+| 2 | 223.591163 | 1.601274 | 0.955930 | 223.911307 | 2144.800200 | 24299.730000 |
+| 3 | 223.315711 | 1.614789 | 0.910472 | 218.000986 | 2127.249900 | 22432.670000 |
+
+同样是四次调用的 phase 累计等待，不将它冒充单次请求或隐藏比例。262K 三组 first 均为 draft/accepted 11/11，其余阶段各 47/47，接受率全部 **100%**。rollback 日志各记录 **510** 个 surviving pages、**1** 个 missing snapshot page，`draft_history=reduced acceptance_may_decline=1 replay=0`；缺页没有触发 MTP KV 补算。三组整卡峰值 **23832 / 23904 / 23540 MiB**，包含 WDDM 桌面与其他程序。后两组 prefill 比首组慢，原始数字全部保留，不选最快结果代替重复数据。
+
+**本次 chunk 2048 的实测加载预算。** 两档各三组计划相同；与第 5 步 chunk 1024 的实际视图不同，不能混用。MTP payload 均 66 MiB，固定 512 页仍含 sink 4/recent 507/guard 1；旧完整 MTP payload 分别 264.128906 / 528.128906 MiB。
+
+| 项目 | 128K | 262K |
+|---|---:|---:|
+| Main 视图（token） | 125120 | 116416 |
+| Main payload（MiB） | 4032.187500 | 3751.687500 |
+| staging（MiB） | 75.988281 | 357.519531 |
+| partial workspace（MiB） | 96.750000 | 96.750000 |
+| block/access/prefix 等 metadata 与 fixed（B） | 82688 | 164608 |
+| general workspace（B） | 361906176 | 361906176 |
+| MTP auxiliary（B） | 1626624 | 1634816 |
+| CUDA pinned archive（B） | 4429185024 | 8858370048 |
+
+资源、各层 GPU/CPU 等待和分阶段时间汇总 `stage6-resource-summary.json`，两条归档路径的恢复回归见定向 CTest；长测 auto 实际选 pinned，没有把锁页长测当成可分页长测。正式测量没有并行模型/测试/构建；桌面仍接 4090，系统占用会漂移。时间是带临时完整 logits 读回的 Engine 报告，不替代第 4 步产品性能门禁。
+
+外部测量程序 `stage6-diagnostic-reuse-measure.exe` SHA256 **5ab214fb6657179270c60ab0cf9df0e635c01e33adbbf9b630de1f073be34dc3**；同时归档的诊断 CLI 为 `stage6-diagnostic-ninfer.exe`，SHA256 **9955499396e7aee15245a06dbe8a010c9664fdd005f73ae6bba39748ba106124**。临时 header 和三处 logits 钩子已按 SHA 清单恢复生产源码原始字节、移除临时文件，随后才进行最终产品构建。抓取/验算脚本、输入 SHA、原始完整词表数据都留在仓库外，没有提交临时代码或模型。
+
+**最终产品验证与交付。** 完整构建退出 **0**（207 个更新动作），随后全量 CTest **106 项：102 通过、4 缺少其他模型制品跳过、0 失败，230.25 s**，`-j 1`，真实 Qwen3.8-27B 和视觉 GGUF 环境路径已设置。日志为 `stage6-full-build.log`、`stage6-full-ctest.log`，复现 `run_full_checks.ps1 -Stage stage6`。跳过的是 Qwen3.6-27B prefix real、35B-A3B real、35B-A3B DFlash real 和 DFlash load-plan，不计为通过。既有 dense 算子/前缀相关 CTest 通过；本步没有重新录制九组 dense 基线，dense 注意力内核和原 launcher/wrapper 分派没有修改。
+
+compute-sanitizer **13.0.85** 分别对 `ninfer_test_mtp_window` 和 `ninfer_test_tiered_runtime` 运行 racecheck、synccheck、initcheck，六项均退出 **0**；两组 racecheck 都 **0 hazards / 0 errors / 0 warnings**，其余四项各 **0 errors**。后者包含可分页 BF16/INT8、锁页 INT8、影子 BF16 与延迟生产者的十六层回写。原始六份 `stage6-ninfer_test_{mtp_window,tiered_runtime}-{racecheck,synccheck,initcheck}.log` 和 driver 日志保留在外部目录。命令是版本 13.0.85 的 `compute-sanitizer --tool <racecheck|synccheck|initcheck> --error-exitcode 1 build-vision-integration/tests/<ninfer_test_mtp_window|ninfer_test_tiered_runtime>.exe`，按测试与工具逐项运行；复现脚本 `run_stage6_sanitizers.py`。
+
+产品 CLI `build-vision-integration/apps/ninfer.exe` SHA256 **093c014acb6899cc3628f1970ac97e64aad7f278da0e8e2e817eaaf00d791adf**，外部另保留 `stage6-product-ninfer.exe`。规格与代码质量独立审阅通过；源码无临时 trace/capture 钩子，`git diff --check` 无错误。实施、测试和文档以 `feat(kvmem): restore tiered resume and turn checkpoints` 独立提交并推送 `origin/feat/kvmem`；磁盘状态缓存仍关闭，没有新增 pinned 申请或第三个工作线程，没有进入第 7 步。
+
+正式门禁复现：外部 `run_stage6_gates.py` 顺序执行六组测量（使用归档诊断程序），`check_stage6_logits.py` 验算 rollback/cold 包络与 token，`check_stage6_append_logits.py` 检查 append/cold，`summarize_stage6.py` 汇总预算、各 phase 时间、MTP 接受率与等待。原源码备份/SHA 在 `stage6-trace-source-backup`，`manage_stage6_trace.py` 的撤回结果已核对；这些诊断辅助工具没有进入生产源码。

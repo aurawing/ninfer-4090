@@ -1,12 +1,26 @@
 #pragma once
 
 #include "targets/qwen3_6/impl/runtime/tiered_plan.h"
+#include "core/kvmem/kv_view_table.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 
 #include <memory>
 #include <span>
 
 namespace ninfer::targets::qwen3_6::detail {
+
+struct TieredSnapshotLifetime {
+    std::uint32_t frontier = 0;
+    bool valid = true;
+};
+struct TieredSnapshot {
+    std::uint64_t bundle_identity = 0;
+    std::uint64_t archive_generation = 0;
+    std::uint32_t archive_frontier = 0;
+    std::uint32_t frontier = 0;
+    std::uint64_t view_generation = 0;
+    std::shared_ptr<TieredSnapshotLifetime> lifetime;
+};
 
 // Serialized C=1 owner. Main cache, backing and compute stream outlive this object.
 // The backing is the exact, fixed load-time TieredRuntimePlan allocation.
@@ -31,6 +45,9 @@ public:
     // Dense A1 already appended Main; preserves dense_out and compares a separate output.
     void shadow_attention(std::uint32_t layer, const Tensor& q, const Tensor& positions,
                           float scale, const Tensor& dense_out, cudaStream_t stream);
+    [[nodiscard]] TieredSnapshot capture();
+    [[nodiscard]] kvmem::KVViewSnapshot current_view() const;
+    void restore(const TieredSnapshot&, cudaStream_t stream);
     void trim(std::uint32_t frontier, cudaStream_t stream);
     void reset(cudaStream_t stream);
     void drain();

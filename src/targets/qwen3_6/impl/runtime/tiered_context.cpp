@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -17,10 +18,14 @@ namespace ninfer::targets::qwen3_6::detail {
 namespace {
 std::uint32_t page_count(std::uint32_t tokens) { return tokens / 64 + (tokens % 64 != 0); }
 
+std::atomic<std::uint64_t> next_bundle_identity{1};
+
 float bf16_float(std::uint16_t bits) { return std::bit_cast<float>(std::uint32_t(bits) << 16); }
 } // namespace
 
 struct TieredContext::Impl {
+    std::uint64_t bundle_identity = next_bundle_identity.fetch_add(1);
+    std::vector<std::weak_ptr<TieredSnapshotLifetime>> captures;
     TieredRuntimePlan plan;
     PagedKVCache& main;
     DeviceSpan backing;
@@ -219,6 +224,87 @@ struct TieredContext::Impl {
         }
     }
 
+    void invalidate_captures(std::uint32_t frontier) {
+        std::erase_if(captures, [frontier](const auto& weak) {
+            const auto capture = weak.lock();
+            if (!capture) return true;
+            if (capture->frontier > frontier) capture->valid = false;
+            return !capture->valid;
+        });
+    }
+
+    void publish() {
+        std::fill(block_table.begin(), block_table.end(), -1);
+        access.clear();
+        std::size_t host = 0;
+        for (std::uint32_t logical = 0; logical < snapshot.blocktable.size(); ++logical) {
+            const auto slot = snapshot.blocktable[logical];
+            const auto actual =
+                slot < 0 ? -1 : lease_ids.at(plan.shadow_validate ? logical : std::uint32_t(slot));
+            block_table[logical] = actual;
+            const auto mixed =
+                actual < 0 ? main.pool().page_group_count() + host++ : std::uint32_t(actual);
+            if (mixed > std::uint32_t(std::numeric_limits<std::int32_t>::max()))
+                throw std::overflow_error("tiered physical access ID exceeds int32");
+            access.push_back(
+                {static_cast<std::int32_t>(logical), static_cast<std::int32_t>(mixed)});
+        }
+        prefix =
+            ops::attention_access_prefix(access, current_frontier, main.pool().page_group_count(),
+                                         static_cast<std::uint32_t>(snapshot.host_only.size()));
+        CUDA_CHECK(cudaMemcpyAsync(plan.block_table.bind(backing).data, block_table.data(),
+                                   block_table.size() * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, compute));
+        CUDA_CHECK(cudaMemcpyAsync(plan.access[0].bind(backing).data, access.data(),
+                                   access.size() * sizeof(ops::AttentionPageAccess),
+                                   cudaMemcpyHostToDevice, compute));
+        CUDA_CHECK(cudaMemcpyAsync(plan.prefix[0].bind(backing).data, prefix.data(),
+                                   prefix.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                                   compute));
+    }
+
+    void hydrate(const kvmem::KVViewSnapshot& restored) {
+        const auto offset = plan.staging.maximum_layer_stream_bytes;
+        for (std::uint32_t layer = 0; layer < 16; ++layer)
+            for (std::size_t plane = 0; plane < plan.archive.layers[layer].size(); ++plane) {
+                const auto& spec = plan.archive.layers[layer][plane];
+                const auto tile_pages = kvmem::kHostKVTransferTileBytes / spec.page_bytes;
+                const auto& tensor = main.pool().plane(spec.pool_plane);
+                for (std::size_t first = 0; first < restored.resident.size();) {
+                    std::size_t count = 1;
+                    while (first + count < restored.resident.size() && count < tile_pages &&
+                           restored.resident[first + count].logical_page ==
+                               restored.resident[first].logical_page + count) ++count;
+                    auto ticket = transfer.prefetch_completed(layer, plane,
+                        restored.resident[first].logical_page, static_cast<std::uint32_t>(count), offset);
+                    transfer.wait(ticket, compute);
+                    const auto staged = transfer.staged(ticket);
+                    // Logical host ranges are coalesced. Lease IDs may be noncontiguous.
+                    for (std::size_t j = 0; j < count;) {
+                        const auto& page = restored.resident[first + j];
+                        const auto physical_id = lease_ids.at(plan.shadow_validate ? page.logical_page :
+                                                              std::uint32_t(page.physical_slot));
+                        std::size_t run = 1;
+                        if (tensor.nb[3] == spec.page_bytes)
+                            while (j + run < count) {
+                                const auto& next = restored.resident[first + j + run];
+                                if (lease_ids.at(plan.shadow_validate ? next.logical_page :
+                                                 std::uint32_t(next.physical_slot)) != physical_id + run) break;
+                                ++run;
+                            }
+                        auto* target = static_cast<std::byte*>(tensor.data) + physical_id * tensor.nb[3];
+                        CUDA_CHECK(cudaMemcpyAsync(target, static_cast<const std::byte*>(staged.data) +
+                            j * spec.page_bytes, run * spec.page_bytes, cudaMemcpyDeviceToDevice, compute));
+                        j += run;
+                    }
+                    transfer.release(ticket, compute);
+                    first += count;
+                }
+            }
+        CUDA_CHECK(cudaStreamSynchronize(compute));
+        transfer.synchronize();
+    }
+
     void begin(std::uint32_t base, std::uint32_t count, cudaStream_t stream, ExecutionPhase phase) {
         check_stream(stream);
         if (next_layer != 16) throw std::logic_error("tiered previous block has incomplete layers");
@@ -254,33 +340,7 @@ struct TieredContext::Impl {
         block_tokens     = count;
         write_ids.clear();
         for (const auto& write : writes) write_ids.push_back(physical(write));
-        std::fill(block_table.begin(), block_table.end(), -1);
-        access.clear();
-        std::size_t host = 0;
-        for (std::uint32_t logical = 0; logical < snapshot.blocktable.size(); ++logical) {
-            const auto slot = snapshot.blocktable[logical];
-            const auto actual =
-                slot < 0 ? -1 : lease_ids.at(plan.shadow_validate ? logical : std::uint32_t(slot));
-            block_table[logical] = actual;
-            const auto mixed =
-                actual < 0 ? main.pool().page_group_count() + host++ : std::uint32_t(actual);
-            if (mixed > std::uint32_t(std::numeric_limits<std::int32_t>::max()))
-                throw std::overflow_error("tiered physical access ID exceeds int32");
-            access.push_back(
-                {static_cast<std::int32_t>(logical), static_cast<std::int32_t>(mixed)});
-        }
-        prefix =
-            ops::attention_access_prefix(access, current_frontier, main.pool().page_group_count(),
-                                         static_cast<std::uint32_t>(snapshot.host_only.size()));
-        CUDA_CHECK(cudaMemcpyAsync(plan.block_table.bind(backing).data, block_table.data(),
-                                   block_table.size() * sizeof(std::int32_t),
-                                   cudaMemcpyHostToDevice, compute));
-        CUDA_CHECK(cudaMemcpyAsync(plan.access[0].bind(backing).data, access.data(),
-                                   access.size() * sizeof(ops::AttentionPageAccess),
-                                   cudaMemcpyHostToDevice, compute));
-        CUDA_CHECK(cudaMemcpyAsync(plan.prefix[0].bind(backing).data, prefix.data(),
-                                   prefix.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
-                                   compute));
+        publish();
         next_layer = 0;
         ++blocks;
         // Queued before the model's initial GDN layers to overlap their compute.
@@ -460,6 +520,48 @@ void TieredContext::shadow_attention(std::uint32_t layer, const Tensor& q, const
     }
 }
 
+TieredSnapshot TieredContext::capture() {
+    auto& i = *impl_;
+    if (i.next_layer != 16) throw std::logic_error("snapshot requires a complete Main block");
+    i.drain();
+    auto view = i.table.snapshot();
+    for (std::uint32_t layer = 0; layer < 16; ++layer)
+        if (i.archive.frontier(layer) != view.frontier)
+            throw std::logic_error("snapshot archive/view frontiers disagree");
+    i.invalidate_captures(i.current_frontier);
+    auto lifetime = std::make_shared<TieredSnapshotLifetime>();
+    lifetime->frontier = view.frontier;
+    i.captures.push_back(lifetime);
+    return {i.bundle_identity, i.archive.generation(), view.frontier, view.frontier, view.generation, std::move(lifetime)};
+}
+kvmem::KVViewSnapshot TieredContext::current_view() const { return impl_->table.snapshot(); }
+
+void TieredContext::restore(const TieredSnapshot& saved, cudaStream_t stream) {
+    auto& i = *impl_;
+    i.check_stream(stream);
+    if (saved.bundle_identity != i.bundle_identity || !saved.lifetime || !saved.lifetime->valid ||
+        saved.lifetime->frontier != saved.frontier || saved.archive_frontier != saved.frontier ||
+        saved.frontier > i.current_frontier || saved.view_generation > i.table.snapshot().generation ||
+        saved.archive_generation > i.archive.generation())
+        throw std::logic_error("Main snapshot is stale or belongs to a different bundle");
+    // Borrowed host/device pointers stay live until both workers and consumers are drained.
+    i.drain();
+    const auto restored = i.table.plan_restore(saved.frontier);
+    i.transfer.trim(saved.frontier);
+    i.invalidate_captures(saved.frontier);
+    i.writes.clear();
+    i.write_ids.clear();
+    i.tickets.clear();
+    i.hydrate(restored);
+    i.table.install_restore(restored);
+    i.snapshot = i.table.snapshot();
+    i.current_frontier = restored.frontier;
+    i.block_tokens = 0;
+    i.next_layer = 16;
+    i.publish();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 void TieredContext::trim(std::uint32_t frontier, cudaStream_t stream) {
     auto& i = *impl_;
     i.check_stream(stream);
@@ -468,14 +570,24 @@ void TieredContext::trim(std::uint32_t frontier, cudaStream_t stream) {
     i.drain();
     i.transfer.trim(frontier);
     i.table.trim(frontier);
+    i.invalidate_captures(frontier);
+    i.snapshot = i.table.snapshot();
     i.current_frontier = frontier;
     i.writes.clear();
     i.write_ids.clear();
     i.tickets.clear();
     i.next_layer = 16;
+    i.publish();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
-void TieredContext::reset(cudaStream_t stream) { trim(0, stream); }
+void TieredContext::reset(cudaStream_t stream) {
+    trim(0, stream);
+    for (const auto& weak : impl_->captures)
+        if (auto capture = weak.lock()) capture->valid = false;
+    impl_->captures.clear();
+    impl_->bundle_identity = next_bundle_identity.fetch_add(1);
+}
 
 void TieredContext::drain() { impl_->drain(); }
 

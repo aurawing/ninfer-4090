@@ -243,6 +243,45 @@ void masked_append_preserves_bytes(DType type, bool packed = false) {
     require(crossing_tags == f.tags(),
             "masked append published invalid columns' next logical page");
 }
+void metadata_checkpoint_keeps_live_intersection(DType type, bool packed = false) {
+    Fixture f(type, packed);
+    for (int base = 0; base < 448; base += 64) f.append(base, 64);
+    const auto checkpoint = f.owner->capture(447, f.device.stream);
+    for (int base = 448; base < 640; base += 64) f.append(base, 64);
+    const auto before = f.all_bytes();
+    const auto live = f.tags();
+    auto wrong_bundle = checkpoint;
+    ++wrong_bundle.bundle_identity;
+    bool wrong_rejected = false;
+    try { f.owner->restore(wrong_bundle, 447, f.device.stream); }
+    catch (const std::exception&) { wrong_rejected = true; }
+    require(wrong_rejected && f.tags() == live, "foreign MTP bundle restore must reject before tag mutation");
+    f.owner->restore(checkpoint, 447, f.device.stream);
+    require(f.all_bytes() == before, "MTP metadata restore must not copy or recompute KV");
+    const auto restored = f.tags();
+    for (std::size_t slot = 0; slot < live.size(); ++slot) {
+        const auto expected = live[slot] == checkpoint.page_tags[slot] && live[slot] >= 0 &&
+                              live[slot] * 64 < 447 ? live[slot] : -1;
+        require(restored[slot] == expected, "MTP restore must intersect captured/live original tags");
+    }
+    require(restored[f.lease.page_ids()[0]] == 0, "MTP restore must keep fixed-budget sink");
+    f.query(446, 1);
+    const auto first_restore = f.owner->capture(447, f.device.stream);
+    f.owner->restore(checkpoint, 447, f.device.stream);
+    require(f.owner->capture(447, f.device.stream).generation > first_restore.generation,
+            "MTP repeated restore must advance generation");
+    f.owner->trim(128, f.device.stream);
+    bool trimmed_rejected = false;
+    try { f.owner->restore(checkpoint, 447, f.device.stream); }
+    catch (const std::exception&) { trimmed_rejected = true; }
+    require(trimmed_rejected, "MTP trim below capture invalidates snapshot");
+    f.owner->reset(f.device.stream);
+    bool rejected = false;
+    try { f.owner->restore(checkpoint, 447, f.device.stream); }
+    catch (const std::exception&) { rejected = true; }
+    require(rejected, "MTP reset must invalidate old bundle snapshot");
+}
+
 void ring_and_provisional(DType type, bool packed = false) {
     Fixture f(type, packed);
     f.append(0, 64);
@@ -253,10 +292,11 @@ void ring_and_provisional(DType type, bool packed = false) {
         f.append(base, 64);
     const auto before      = f.all_bytes();
     const auto tags_before = f.tags();
+    const auto checkpoint = f.owner->capture(447, f.device.stream);
     f.owner->begin_transaction(447, 3, f.device.stream);
     f.query(447, 1, 1, true);
     f.query(448, 2, 2, true);
-    f.owner->trim(448, f.device.stream);
+    f.owner->restore(checkpoint, 447, f.device.stream);
     f.device.synchronize();
     const auto after  = f.all_bytes();
     const auto plane  = f.cache->batch_layer_view(0).v_pages;
@@ -289,9 +329,11 @@ int main() {
         for (auto type : {DType::BF16, DType::I8}) {
             masked_append_preserves_bytes(type);
             ring_and_provisional(type);
+            metadata_checkpoint_keeps_live_intersection(type);
         }
         masked_append_preserves_bytes(DType::I8, true);
         ring_and_provisional(DType::I8, true);
+        metadata_checkpoint_keeps_live_intersection(DType::I8, true);
         std::cout << "MTP sink/recent/guard, far positions, masks and FP64 oracle passed\n";
         return 0;
     } catch (const std::exception& e) {

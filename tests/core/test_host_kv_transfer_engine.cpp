@@ -276,6 +276,8 @@ void exercise(HostArchiveMode mode, PagedKVPlaneOrder order) {
     rejects([&] { archive.trim(128); }, "attached archive mutations must go through transfer owner");
     engine.trim(130);
     rejects([&] { engine.wait(stale, device.stream); }, "trim invalidates prior transfer tickets");
+    rejects([&] { (void)engine.staged(stale); }, "trim invalidates staged access");
+    rejects([&] { engine.release(stale, device.stream); }, "trim invalidates consumed-event release");
     require(archive.frontier(0) == 130 && archive.frontier(1) == 130, "engine trim frontier");
 }
 }

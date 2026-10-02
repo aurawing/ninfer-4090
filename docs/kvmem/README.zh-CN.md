@@ -187,6 +187,10 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
    - 原始逻辑页标签构造访问列表，复用部分注意力内核；节省的 MTP 存储通过统一预算增加 Main 视图。启动打印新旧 MTP 字节及视图变化；旧视图估算明确标为 `old_main_view_tokens_estimate`，使用同一已确定显存预算。
    - 128K、262K INT8 各比较窗口 MTP 与关闭 MTP 的贪心输出，分歧按门禁 B 判定；needle 正确，接受率相对第 4 步完整池下降不超过 5 个百分点。`NINFER_KVMEM_TRANSFER_TIMING=1` 按 prefill/decode 分别累计每层 ready 等待。
 6. **两个复用点**（D12）。
+   - `tiered-exact` 恢复 retained resume 和 turn checkpoint。快照只记录 bundle 身份、精确 frontier、归档/视图 generation 以及 GDN、MTP、hidden、position continuation，不复制 KV 字节。checkpoint 在其实际 prefill 分块边界捕获；Main 与 MTP 各保存自己的 frontier，MTP 为后续桥接保留 `F−1` 边界。
+   - restore 先排空旧传输，截断归档和视图，递增 generation；从归档重新换入 sink、最近页及当前部分写入页，再在同一执行边界发布块表、访问列表和前缀和。旧 ticket、staging 列表和异步完成通知不可再使用。
+   - MTP 只保留快照标签与当前仍存活页的交集。被覆盖的历史不补算，日志说明可能影响草稿质量和接受率；Main 的完整历史仍由归档提供。磁盘状态缓存继续关闭。
+   - 128K 和 262K 两轮对话记录 `reused_prompt_tokens` 与实际新增 prefill 数；checkpoint 回滚对相同输入的冷启动按门禁 B 判断。复用测试显式设 `preserve_thinking=true`，避免聊天模板删除历史 thinking 区域而改写已缓存前缀；前缀确实变化时继续由原有匹配规则选 checkpoint 或重算。
 7. **准入与 CLI**（D13、D14），同时改写 `paged-kv-cache.md` 里的 non-goal 条款。
 8. **性能**：262K int8 的 `tiered-exact` prefill。
 
@@ -240,7 +244,7 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
 | `test_kvmem_scoring` | 全局 softmax 打分与 top-k，包括必选页和图像跨度，与参考实现一致 |
 | `test_kvmem_view_table` | 视图构建、计划差分、页状态机、只允许驱逐 Both 状态的页，不需要 GPU |
 | `test_kvmem_mtp_window` | 窗口边界、页回收、provisional 草稿位置；贪心输出与关闭 MTP 时相同 |
-| `test_kvmem_resume_checkpoint` | 同会话追加、回滚、归档截断，与冷启动的 logits 相对误差不超过 1e-3 |
+| `test_kvmem_resume_checkpoint` | snapshot/restore 的 frontier/generation 一致、旧状态拒绝、追加只计算新增 token；回滚对冷启动的完整 logits 在独立端到端测量中按门禁 B 判定 |
 | `test_host_archive_admission` | 内存不足时拒绝启动；提交量随 frontier 增长 |
 | e2e `tiered_exact_vs_dense` | 同一 KV 精度，最长到 262K |
 | 回归 | 全量 CTest 以及阶段 0′ 的 dense 金标准保持不变 |

@@ -75,6 +75,9 @@ ninfer_add_op_test(ninfer_test_tiered_runtime
 target_include_directories(ninfer_test_tiered_runtime PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 
+ninfer_add_op_test(ninfer_test_kvmem_resume_checkpoint
+  SOURCES targets/qwen3_6/test_kvmem_resume_checkpoint.cpp LIBRARIES ninfer_engine)
+
 ninfer_add_test(ninfer_concurrent_executor_cancel_test
   SOURCES test_concurrent_executor_cancel.cpp
   LIBRARIES ninfer_engine)

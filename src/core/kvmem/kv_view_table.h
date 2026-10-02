@@ -60,6 +60,10 @@ public:
     // Cancels old-generation notifications and pending partial layer completions.
     void trim(std::uint32_t frontier);
     void reset();
+    // Plan fresh sink/recent slots after all archive writes have completed.
+    // Caller hydrates every resident plane before installation; captured slots are never reused.
+    [[nodiscard]] KVViewSnapshot plan_restore(std::uint32_t frontier) const;
+    void install_restore(const KVViewSnapshot& restored);
 
     [[nodiscard]] std::optional<KVViewPage> page(std::uint32_t logical_page) const noexcept;
     // Lists are in ascending original logical page order and share one exact boundary.

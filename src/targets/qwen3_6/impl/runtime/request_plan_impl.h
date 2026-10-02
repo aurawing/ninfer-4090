@@ -97,7 +97,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_alignment    = 1;
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
-    base->allow_prefix_reuse             = options.allow_prefix_reuse && !tiered;
+    base->allow_prefix_reuse             = options.allow_prefix_reuse;
     base->token_mask                     = options.token_mask;
     base->disable_speculation            = options.disable_speculation;
     const std::uint32_t reserved_context_tokens =
@@ -162,7 +162,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         base->vision_control         = std::move(control);
     }
 
-    if (!tiered && prompt.identity.turn_rewrite_boundary) {
+    if (prompt.identity.turn_rewrite_boundary) {
         const std::uint32_t candidate = *prompt.identity.turn_rewrite_boundary;
         if (candidate == 0 || candidate >= base->summary.prompt_tokens) {
             throw std::invalid_argument("turn rewrite boundary must lie inside the prompt");
@@ -217,7 +217,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                 plan->reuse_base = sequence.turn_checkpoint.frontier;
             }
         }
-        if (plan->reuse == ReusePath::FullReset && disk_state_cache && disk_state_cache->enabled()) {
+        if (!tiered && plan->reuse == ReusePath::FullReset && disk_state_cache && disk_state_cache->enabled()) {
             const std::uint64_t model_hash = model_identity_hash();
             auto disk_match = disk_state_cache->find_longest_matching_prefix(model_hash, prompt.token_ids);
             if (disk_match && disk_match->matched_tokens > 0 &&
@@ -234,10 +234,14 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         const bool append_ready =
             plan->reuse == ReusePath::AppendAtFrontier && sequence.tail_hidden_valid &&
             decoder->mtp_cache() != nullptr &&
-            (plan->reuse_base == 0 || sequence.mtp_kv_valid >= plan->reuse_base - 1);
+            (plan->reuse_base == 0 || (mtp_window
+                ? sequence.resume.mtp && sequence.resume.mtp->frontier >= plan->reuse_base - 1
+                : sequence.mtp_kv_valid >= plan->reuse_base - 1));
         const bool checkpoint_ready =
             (plan->reuse == ReusePath::RestoreTurnCheckpoint && decoder->mtp_cache() != nullptr &&
-             sequence.mtp_kv_valid >= plan->reuse_base - 1) ||
+             (mtp_window ? sequence.turn_checkpoint.mtp &&
+                               sequence.turn_checkpoint.mtp->frontier == plan->reuse_base - 1
+                         : sequence.mtp_kv_valid >= plan->reuse_base - 1)) ||
             is_disk_restore;
         if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
             plan->reuse              = ReusePath::FullReset;

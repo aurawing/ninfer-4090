@@ -36,7 +36,7 @@ double oracle(std::uint32_t position, std::uint32_t layer) {
     return sum / (position + 1);
 }
 
-void exercise(bool shadow, DType dtype) {
+void exercise(bool shadow, DType dtype, HostKVArchiveMode mode = HostKVArchiveMode::Pageable) {
     DeviceContext device;
     LayoutBuilder pool_builder;
     DecoderStateSpec spec;
@@ -58,7 +58,7 @@ void exercise(bool shadow, DType dtype) {
     TieredKVOptions options;
     options.sink_tokens  = 64;
     options.view_tokens  = 192;
-    options.host_archive = HostKVArchiveMode::Pageable;
+    options.host_archive = mode;
     const auto plan      = plan_tiered_runtime(layout.pool, 320, 3, 64, options, shadow, true);
     DeviceBuffer runtime_memory(plan.bytes);
     DeviceBuffer q_memory(256 * 24 * 64 * 2), k_memory(256 * 4 * 64 * 2), v_memory(k_memory.bytes),
@@ -67,7 +67,9 @@ void exercise(bool shadow, DType dtype) {
     k_memory.fill();
     CUDA_CHECK(cudaDeviceSynchronize());
     TieredContext owner(plan, cache, {runtime_memory.p, runtime_memory.bytes}, device.stream);
-    owner.bind_pages(lease.page_ids());
+    auto bound_ids = std::vector<std::int32_t>(lease.page_ids().begin(), lease.page_ids().end());
+    if (!shadow) std::rotate(bound_ids.begin(), bound_ids.begin() + 1, bound_ids.end());
+    owner.bind_pages(bound_ids);
     auto run = [&](std::uint32_t base, std::uint32_t count) {
         const auto width = !shadow && count == 1 ? 4U : count;
         std::vector<std::int32_t> positions(width, 0);
@@ -119,12 +121,49 @@ void exercise(bool shadow, DType dtype) {
         require(owner.frontier() == base + count,
                 "runtime frontier must commit the actual token count");
     };
-    for (std::uint32_t base = 0; base < 256; base += 64) run(base, 64);
+    run(0, 64);
+    run(64, 64);
+    run(128, 1);
+    const auto checkpoint = owner.capture();
+    require(checkpoint.frontier == 129 && checkpoint.archive_frontier == 129,
+            "capture must preserve exact boundary before later prefill chunks");
+    run(129, 63);
+    run(192, 64);
+    run(256, 1);
+    auto wrong_bundle = checkpoint;
+    ++wrong_bundle.bundle_identity;
+    bool wrong_rejected = false;
+    try { owner.restore(wrong_bundle, device.stream); }
+    catch (const std::exception&) { wrong_rejected = true; }
+    require(wrong_rejected && owner.frontier() == 257, "foreign bundle restore must be rejected before mutation");
+    owner.restore(checkpoint, device.stream);
+    const auto restored = owner.capture();
+    require(restored.view_generation > checkpoint.view_generation &&
+                restored.archive_frontier == 129 && owner.current_view().resident.size() == 3,
+            "restore must hydrate sink/recent/partial page and advance generation");
+    for (std::uint32_t logical = 0; logical < 3; ++logical)
+        require(owner.current_view().resident[logical].logical_page == logical,
+                "restore must replace later eviction mapping");
+    owner.restore(checkpoint, device.stream);
+    require(owner.capture().view_generation > restored.view_generation,
+            "repeated restore must not roll generation backwards");
+    run(129, 1);
+    run(130, 62);
+    run(192, 64);
     run(256, 1); // Both host pages must be streamed into the single-pass decode.
     owner.trim(129, device.stream);
     run(129, 1); // Page 2 was HostOnly: its retained prefix must be restored before A2.
+    owner.trim(128, device.stream);
+    run(128, 1);
+    bool trimmed_rejected = false;
+    try { owner.restore(checkpoint, device.stream); }
+    catch (const std::exception&) { trimmed_rejected = true; }
+    require(trimmed_rejected, "trim below captured frontier must invalidate snapshot even after regrowth");
     owner.reset(device.stream);
     require(owner.frontier() == 0, "reset frontier");
+    bool rejected = false;
+    try { owner.restore(checkpoint, device.stream); } catch (const std::exception&) { rejected = true; }
+    require(rejected, "reset must invalidate snapshots");
     run(0, 4); // Reuse the fixed backing and transfer owner after generation change.
     owner.drain();
     // Whole-page archival includes the unused suffix. A newly assigned logical
@@ -135,7 +174,7 @@ void exercise(bool shadow, DType dtype) {
             std::vector<std::byte> page(spec.page_bytes);
             CUDA_CHECK(cudaMemcpy(page.data(),
                                   static_cast<const std::byte*>(tensor.data) +
-                                      lease.page_ids()[0] * tensor.nb[3],
+                                      bound_ids[0] * tensor.nb[3],
                                   page.size(), cudaMemcpyDeviceToHost));
             for (int head = 0; head < 4; ++head)
                 for (int token = 4; token < 64; ++token)
@@ -239,6 +278,7 @@ int main() {
     try {
         exercise(false, DType::BF16);
         exercise(false, DType::I8);
+        exercise(false, DType::I8, HostKVArchiveMode::Pinned);
         exercise(true, DType::BF16);
         exercise_queued_writeback_fences();
         std::cout << "tiered runtime uniform-attention oracle, trim restore and shadow passed\n";

@@ -75,6 +75,7 @@ void all_layers_gate_eviction() {
     }
     require(table.page(0)->state == KVViewState::DeviceOnly, "15 layers cannot publish Both");
     const auto before = table.snapshot();
+    rejects([&] { (void)table.plan_restore(128); }, "restore cannot publish unarchived DeviceOnly pages");
     rejects([&] { (void)table.begin_append(128, 64); }, "DeviceOnly page must not be evicted");
     equal_snapshot(before, table.snapshot());
     require(table.complete_writeback(15, 0, writes[0].epoch), "last layer completion");
@@ -214,6 +215,44 @@ void original_logical_number_survives_many_evictions() {
     validate_snapshot(snapshot, 3);
 }
 
+void restore_rebuilds_sink_recent_and_partial_frontier() {
+    KVViewTable table(1024, 3, 1, 1);
+    std::vector<KVViewWrite> old;
+    for (std::uint32_t base = 0; base < 384; base += 64) {
+        old = table.begin_append(base, 64);
+        complete(table, old[0], 1);
+    }
+    const auto captured_generation = table.snapshot().generation;
+    const auto before = table.snapshot();
+    const auto longer = table.plan_restore(321);
+    require(longer.resident.size() == 3 && longer.resident[0].logical_page == 0 &&
+                longer.resident[1].logical_page == 4 && longer.resident[2].logical_page == 5 &&
+                longer.host_only == std::vector<std::uint32_t>({1, 2, 3}),
+            "restore must retain sink and recent partial tail, with older original pages host-only");
+    const auto plan = table.plan_restore(129);
+    require(plan.frontier == 129 && plan.generation == captured_generation + 1,
+            "restore plan exact partial frontier and fresh generation");
+    require(plan.resident.size() == 3 && plan.resident[0].logical_page == 0 &&
+                plan.resident[1].logical_page == 1 && plan.resident[2].logical_page == 2,
+            "restore must hydrate checkpoint sink/recent/current page, not final live mapping");
+    equal_snapshot(before, table.snapshot());
+    table.install_restore(plan);
+    validate_snapshot(table.snapshot(), 3);
+    require(!table.complete_writeback(0, old[0].logical_page, old[0].epoch),
+            "restore rejects stale writeback");
+    const auto repeated = table.plan_restore(129);
+    table.install_restore(repeated);
+    require(table.snapshot().generation == captured_generation + 2,
+            "equal frontier restore advances generation");
+    rejects([&] { table.install_restore(plan); }, "stale restore plan rejected");
+    rejects([&] { (void)table.plan_restore(130); }, "restore cannot grow archive frontier");
+    const auto append = table.begin_append(129, 1);
+    require(!append[0].restore_from_host, "restored partial tail already resident");
+    complete(table, append[0], 1);
+    table.reset();
+    rejects([&] { table.install_restore(repeated); }, "reset invalidates restore plan");
+}
+
 void reset_and_invalid_inputs() {
     rejects([] { KVViewTable table(0, 1, 0); }, "zero context rejected");
     rejects([] { KVViewTable table(64, 0, 0); }, "zero view rejected");
@@ -283,9 +322,10 @@ int main() {
         trim_invalidates_epochs_and_reuses_tail_slots();
         host_only_partial_page_requires_restore();
         original_logical_number_survives_many_evictions();
+        restore_rebuilds_sink_recent_and_partial_frontier();
         reset_and_invalid_inputs();
         partial_admission_failure_preserves_all_descriptors();
-        std::cout << "PASS: CPU KV view table (9 cases)\n";
+        std::cout << "PASS: CPU KV view table (10 cases)\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

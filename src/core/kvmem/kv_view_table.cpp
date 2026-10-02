@@ -156,6 +156,56 @@ void KVViewTable::trim(std::uint32_t frontier) {
 
 void KVViewTable::reset() { trim(0); }
 
+KVViewSnapshot KVViewTable::plan_restore(std::uint32_t frontier) const {
+    if (frontier > frontier_) throw std::out_of_range("KV restore cannot grow frontier");
+    if (generation_ == std::numeric_limits<std::uint64_t>::max())
+        throw std::overflow_error("KV restore generation exhausted");
+    const auto end = page_count(frontier);
+    for (std::uint32_t logical = 0; logical < end; ++logical)
+        if (pages_[logical].state == KVViewState::DeviceOnly)
+            throw std::logic_error("KV restore requires completed archive writebacks");
+    KVViewSnapshot result;
+    result.frontier = frontier;
+    result.generation = generation_ + 1;
+    result.blocktable.assign(end, -1);
+    const auto sinks = std::min(sink_pages_, end);
+    const auto recent = static_cast<std::uint32_t>(slot_owners_.size()) - sinks;
+    const auto first_recent = std::max(sinks, end > recent ? end - recent : 0U);
+    for (std::uint32_t logical = 0; logical < end; ++logical) {
+        if (logical < sinks || logical >= first_recent) {
+            const auto slot = static_cast<std::int32_t>(result.resident.size());
+            result.blocktable[logical] = slot;
+            result.resident.push_back({logical, slot, KVViewState::Both,
+                                       {result.generation, pages_[logical].revision}});
+        } else result.host_only.push_back(logical);
+    }
+    return result;
+}
+
+void KVViewTable::install_restore(const KVViewSnapshot& restored) {
+    const auto expected = plan_restore(restored.frontier);
+    if (restored.generation != expected.generation ||
+        restored.blocktable != expected.blocktable || restored.resident != expected.resident ||
+        restored.host_only != expected.host_only)
+        throw std::logic_error("stale or invalid KV restoration plan");
+    std::fill(slot_owners_.begin(), slot_owners_.end(), -1);
+    std::fill(layer_completion_.begin(), layer_completion_.end(), std::uint8_t{0});
+    for (auto& descriptor : pages_) {
+        descriptor.physical_slot = -1;
+        descriptor.state = KVViewState::HostOnly;
+        descriptor.completed_layers = 0;
+    }
+    for (const auto& page : restored.resident) {
+        auto& descriptor = pages_[page.logical_page];
+        descriptor.physical_slot = page.physical_slot;
+        descriptor.state = KVViewState::Both;
+        descriptor.completed_layers = layers_;
+        slot_owners_[page.physical_slot] = static_cast<std::int32_t>(page.logical_page);
+    }
+    frontier_ = restored.frontier;
+    generation_ = restored.generation;
+}
+
 std::optional<KVViewPage> KVViewTable::page(std::uint32_t logical_page) const noexcept {
     if (logical_page >= page_count(frontier_)) { return {}; }
     const auto& descriptor = pages_[logical_page];

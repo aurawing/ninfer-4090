@@ -4,10 +4,14 @@
 #include <ninfer/ops/gqa_attention.h>
 #include <ninfer/ops/gqa_attention_partial.h>
 #include <algorithm>
+#include <atomic>
+#include <iostream>
 #include <stdexcept>
 
 namespace ninfer::targets::qwen3_6::detail {
 namespace {
+std::atomic<std::uint64_t> next_mtp_bundle_identity{1};
+
 // Padding entries are future logical pages with zero prefix contribution. The
 // partial operator clips them away through the same original-position mask.
 __global__ void window_tag_writes(const int* positions, const int* valid, int width, int column,
@@ -58,6 +62,7 @@ MtpWindow::MtpWindow(const MtpWindowPlan& p, PagedKVCache& cache, DeviceSpan bac
 void MtpWindow::bind_pages(std::span<const std::int32_t> ids, cudaStream_t stream) {
     if (ids.size() != plan_.physical_pages) throw std::invalid_argument("MTP ring lease capacity");
     if (std::equal(ids.begin(), ids.end(), leases_.begin(), leases_.end())) return;
+    if (!leases_.empty()) reset(stream);
     leases_.assign(ids.begin(), ids.end());
     for (std::size_t logical = 0; logical < mapping_.size(); ++logical)
         mapping_[logical] =
@@ -173,6 +178,8 @@ void MtpWindow::begin_transaction(std::uint32_t base, std::uint32_t extent, cuda
 void MtpWindow::trim(std::uint32_t frontier, cudaStream_t stream) {
     if (frontier > plan_.capacity)
         throw std::invalid_argument("MTP ring trim exceeds logical capacity");
+    ++generation_;
+    invalidate_captures(frontier);
     if (!backup_live_) return;
     if (frontier <= backup_new_page_ * 64) {
         const auto old = backup_new_page_ - plan_.recent_pages;
@@ -192,7 +199,73 @@ void MtpWindow::trim(std::uint32_t frontier, cudaStream_t stream) {
     }
     backup_live_ = false;
 }
+void MtpWindow::invalidate_captures(std::uint32_t frontier) {
+    std::erase_if(captures_, [frontier](const auto& weak) {
+        const auto capture = weak.lock();
+        if (!capture) return true;
+        if (capture->frontier > frontier) capture->valid = false;
+        return !capture->valid;
+    });
+}
+MtpWindowSnapshot MtpWindow::capture(std::uint32_t frontier, cudaStream_t stream) {
+    if (frontier > plan_.capacity || leases_.empty())
+        throw std::invalid_argument("MTP snapshot frontier or bundle unavailable");
+    MtpWindowSnapshot saved;
+    saved.bundle_identity = bundle_identity_;
+    saved.generation = generation_;
+    saved.frontier = frontier;
+    saved.page_tags.resize(plan_.physical_pages);
+    CUDA_CHECK(cudaMemcpyAsync(saved.page_tags.data(), page_tags().data, page_tags().bytes(),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (std::size_t slot = 0; slot < saved.page_tags.size(); ++slot) {
+        const auto logical = saved.page_tags[slot];
+        if (logical < 0 || std::uint64_t(logical) * 64 >= frontier ||
+            logical >= mapping_.size() || mapping_[logical] != slot) saved.page_tags[slot] = -1;
+    }
+    invalidate_captures(plan_.capacity);
+    saved.lifetime = std::make_shared<MtpSnapshotLifetime>();
+    saved.lifetime->frontier = frontier;
+    captures_.push_back(saved.lifetime);
+    return saved;
+}
+void MtpWindow::restore(const MtpWindowSnapshot& saved, std::uint32_t frontier, cudaStream_t stream) {
+    if (saved.bundle_identity != bundle_identity_ || saved.generation > generation_ ||
+        !saved.lifetime || !saved.lifetime->valid || saved.lifetime->frontier != saved.frontier ||
+        frontier > saved.frontier || saved.page_tags.size() != plan_.physical_pages)
+        throw std::logic_error("MTP snapshot is stale or belongs to a different bundle");
+    // Resolve a provisional guard before inspecting the current ring tags.
+    trim(frontier, stream);
+    std::vector<std::int32_t> tags(plan_.physical_pages);
+    CUDA_CHECK(cudaMemcpyAsync(tags.data(), page_tags().data, page_tags().bytes(),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::size_t missing = 0, retained = 0;
+    for (std::size_t slot = 0; slot < tags.size(); ++slot) {
+        const auto logical = saved.page_tags[slot];
+        const bool desired = logical >= 0 && std::uint64_t(logical) * 64 < frontier &&
+                             logical < mapping_.size() && mapping_[logical] == slot;
+        if (desired && tags[slot] == logical) ++retained;
+        else {
+            missing += desired;
+            tags[slot] = -1;
+        }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(page_tags().data, tags.data(), page_tags().bytes(),
+                               cudaMemcpyHostToDevice, stream));
+    // Metadata only. Missing historical KV is never replayed or reconstructed.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (missing)
+        std::clog << "[kvmem-mtp] restore_frontier=" << frontier << " surviving_pages=" << retained
+                  << " missing_snapshot_pages=" << missing
+                  << " draft_history=reduced acceptance_may_decline=1 replay=0\n";
+}
 void MtpWindow::reset(cudaStream_t stream) {
+    for (const auto& weak : captures_)
+        if (auto capture = weak.lock()) capture->valid = false;
+    captures_.clear();
+    bundle_identity_ = next_mtp_bundle_identity.fetch_add(1);
+    ++generation_;
     CUDA_CHECK(cudaMemsetAsync(page_tags().data, 0xff, page_tags().bytes(), stream));
     backup_live_ = false;
 }
