@@ -61,7 +61,7 @@
 | GPU | RTX 4060 Laptop（AD107，sm_89，24 SM，32 MB L2，8188 MiB GDDR6，实测可达带宽 249.6 GB/s） | 与 4090 同为 sm_89，代码可编；SM 数只有 4090 的 1/5 |
 | 显存占用 | 调研时已用 7289 MiB、空闲 668 MiB（ComfyUI 等进程），桌面显示在独显上 | 运行前需关闭 ComfyUI，并把桌面切到核显（Armoury Crate 的 MSHybrid/Optimus 模式） |
 | 总线 | PCIe 4.0 x8（理论 15.75 GB/s） | 锁页 H2D 预计 11–13 GB/s，待阶段 0 实测 |
-| CPU | i9-14900HX，8 个 P 核 + 16 个 E 核，AVX2（无 AVX-512） | ggml CPU 视觉和选块打分都够用；计算线程应绑定 P 核 |
+| CPU | i9-14900HX，8 个 P 核 + 16 个 E 核，AVX2（无 AVX-512） | 原4060研究环境；ggml CPU视觉，阶段4评分已改GPU |
 | 内存 | 64 GB DDR5-5200，不对称（48+16） | 前 32 GB 双通道，其余单通道；对 PCIe 级别的 KV 流量不构成瓶颈 |
 | 磁盘 | 两块 NVMe，D 盘空闲 339 GB | NVMe 层可选 |
 | 工具链 | 只有 CUDA 11.8；驱动 616.64 支持到 CUDA 13.4；VS 2022 17.9.6；已装 CMake；缺 Ninja、vcpkg | 需安装 CUDA 13.1+、Ninja、vcpkg；CUDA 13 对 VS 版本的要求要核对（JGamboa 用的是 VS 18 BuildTools） |
@@ -461,19 +461,20 @@ struct KvMemSequence {
 
 #### 5.6.5 Mean-K 索引
 
-- **写入**：在 K 做完 RMSNorm、还没做 RoPE 的位置（与 `ops::rope` 相邻，也可以融合进 rope 内核），按页、层、kv 头累加 FP32 和。每个未写满的页占 64 KiB 累加器。页写满后转成 FP16，D2H 到主机索引，每页 32 KiB，折合每 token 512 B；262K 共 128 MiB，全部放在主机。
-- **Q 捕获**：本轮用户输入最后 `--kvmem-query-tokens` 个 token 的 pre-RoPE Q，16 层 × 24 头 × 256 维，取回主机。
-- **打分**（CPU，AVX2 多线程）：按 KVMem 的全局 softmax 块打分——对每个（层、q 头、query token），在所有页上对 `q·meanK/√d` 做 softmax，然后按页累加概率质量。计算量：4096 页 × 16 层 × 24 头 × 16 个 query token × 256 维 ≈ 6.4e9 次乘加，约 50–150 ms。如果以后需要更快，可以把索引分块送到 GPU 上打分。
+- **写入**：在K做完RMSNorm、还没做RoPE的位置增加opt-in算子，与`ops::rope`相邻，不修改既有dense kernel/dispatch；按页、层、kv头累加FP32和。活动尾页跨16层sum占64 KiB。页写满后转FP16，D2H主机索引，每页32 KiB、每token 512 B；262K共128 MiB，持久索引放主机，评分时有界H2D到设备alias区。
+- **Q 捕获**：本轮用户文本最后 `--kvmem-query-tokens` 个 token 的 pre-RoPE Q，16层×24头×256维，使用有界三槽capture保存continuation；不是实际prefill delta的末几行。
+- **D8修订（2026-10-02，用户已批准）**：FP16 Mean-K主机索引固定最大stride；archive pinned时使用额外计入准入的cacheable pinned索引直接H2D，否则pageable索引经既有环。GPU确定性两遍global softmax：每个（layer、qhead、query token）先求全局max/denominator，再按固定顺序累加页概率，无atomic；设备输入/统计/score区加载期alias空闲staging/partial并以事件排空/交还，运行期不分配。CPU标量FP64仅作独立测试oracle，不建立AVX2 scorer、共享executor或暂停传输worker契约；D15仍只管最多两名传输worker。GPU score相对FP64的L2≤1e-4，selected集合一致，仅明确记录的FP64第k名阈值epsilon并列可互换。分别记录H2D bytes/时间和GPU两遍compute，原50–150ms CPU估算已被本修订替代。
+- **评分域审阅意见（设计范围，不另立D表）**：固定参考 `D:/deeplearning/NInfer/logs/kvmem-stage7-8/kvmem-qw3-reference@1cf3b2f83bfc071ada9c57491a7d121723051ac0` 的 `qwen_executor.cpp` 约23750与 `kernels_cuda.cu` 约5340：默认只在`nb>budget>0`且中间非空时mask sink `[0,sink)` /recent `[nb-recent,nb)`，参考`QW3_KVMEM_MASK_KEPT=0`恢复全页。本项目默认保留此语义，隐藏`NINFER_KVMEM_SCORE_ALL_PAGES=1`对照全部已提交页。query/current/image等其他hard页只要不在两段里仍在denominator，软化current页不能另行排除；非页齐时固定recent band与D9完整recent页可能不同。详见[阶段4设计§4](stage4-sparse-decode-design.zh-CN.md)。
 - **部分旋转**：Qwen3.8 只对 256 维里的 64 维做 RoPE，其余 192 维与位置无关，所以 pre-RoPE 的 Mean-K 保留了绝大部分检索信号。
 
 #### 5.6.6 每轮流程（`kvmem` 模式，默认 exact prefill）
 
 1. **新输入的精确 prefill**：GDN 处理全部新 token；注意力对完整历史做精确计算（见 5.6.7）；新写的页回写到主机，同时写入 Mean-K。
 2. **选块**：
-   - 必选：sink 页、最近 R 个 token、本轮用户输入所在的页、被引用的图像跨度。
+   - **D9修订（2026-10-02，用户已批准）**：hard为sink、最近R token完整页、实际query span及图像闭包，另计生成reserve/guard。全部本轮输入与hard闭包union若能放入`V-G-H`则全部hard；否则较早非hard本轮页与历史共同按score竞争，图像始终原子。记录`current_input_softened_pages`；hard闭包仍放不下则拒绝并打印sink/recent/query/current/image/reserve/guard等页数。
    - 其余预算按打分取 top-k，结果按原始顺序排列。
-   - 根据计划差分，只换入新增的页；32K int8 视图全量换入约 1.1 GB，耗时约 0.1 s。
-3. **稀疏 decode**：新 token 写进 gen_reserve 页并回写到主机。超出 reserve 后，先淘汰最早检索进来的非必选页（环形复用）；阶段 5 再加入按需重新选块。
+   - 根据计划差分，只换入新增的页；32K int8视图全量换入约1.1GB、0.1s是早期估算，实际时间/字节单独记录。既有单条长输入needle现在可按D9合法软化，另加结构化历史/本轮短query fixture，不改标签逃避协议边界。
+3. **稀疏 decode**：首版C=1、Graph=off，exact-prefill→capture→GPU score→CPU select→plan/diff→hydrate/publish→单列表sparse eager；新token写进gen_reserve并回写，超出reserve只淘汰Both且非hard/recent/provisional页。任意resident子集后的下一轮prefill仍看完整历史；DMA中途失败须poison并从归档恢复/重建，不能继续读已覆写旧mapping。4.4后停审，Graph及ordinary/MTP capture性能门禁下一轮；阶段5再加入按需重选。
 4. **不需要 query replay**：query 部分的 hidden state 在精确 prefill 时已经看过完整历史，是精确的。只有选择 `--kvmem-prefill window` 时，才需要在 query 边界保存 GDN 检查点（复用现有的 ReplaySSM 检查点槽），选块后回到边界，用视图重新 prefill query 尾部（阶段 5 的可选项）。
 
 #### 5.6.7 精确流式 prefill：分块注意力 + LSE 合并
@@ -496,6 +497,7 @@ struct KvMemSequence {
 #### 5.6.8 视觉原子跨度
 
 - 一张图的合并 token 会占用连续多页。这些页标上同一个 `span_id`，打分时取跨度内各页的最大值，选择时要么整张图全选，要么都不选。
+- 首版无“被引用历史图像”检测；历史图像为原子候选，本轮图像按D9硬保护/容量软化。共享边界页构成传递闭包，hard页触及图像即保留全闭包。协议引用识别留待后续，此范围意见只写设计，不新增D表决策。
 - 如果剩余预算装不下整张图，就放弃这张图（不做部分截断）。
 - 图像 token 的 M-RoPE 三维位置已经写进 K 里，不受影响。
 
@@ -507,7 +509,7 @@ struct KvMemSequence {
   - MTP 只负责生成草稿，由主模型验证，所以草稿注意力看到的上下文少一些，只会降低接受率，不会改变输出。贪心解码下，输出与关闭 MTP 时逐 token 相同。
   - 以后如果接受率下降明显，再让 MTP 窗口跟随主视图的选块结果。
 - kvmem 和 tiered-exact 模式在阶段 3–4 只支持 C=1。
-- CPU 视觉编码目前在 prefill 之前同步执行，与 KVMem 的主机侧工作（页拷贝、选块打分）在时间上不重叠，所以不争 CPU。以后如果把编码移到请求准备线程、与前一段文本的 prefill 并行，就要分核：视觉用 P 核，KVMem 的拷贝和打分线程用 E 核。
+- CPU视觉编码在prefill之前同步执行，不与最多两个页拷贝worker重叠；阶段4评分在GPU上，不设置CPU评分线程或暂停worker。未来异步视觉是否分核另行测量，不套用原CPU scorer设想。
 
 #### 5.6.10 NVMe 层（可选，阶段 5）
 
@@ -913,7 +915,7 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
    - 更短的任意前缀命中本来就不支持，不需要处理。
    - 约 3–5 天。原计划也要做这项，只是提前了。
 3. **并发固定为 1。** kvmem 和 tiered-exact 模式启动时如果 `--max-concurrency` 大于 1，直接报错。你的启动脚本本来就是单并发。
-4. **CPU 核数。** i5-10400 只有 6 核。CPU 视觉在 prefill 之前同步执行，与 KVMem 的主机侧工作不重叠，所以不冲突。KVMem 的拷贝和打分线程限制在 2 个以内。
+4. **CPU核数。** i5-10400只有6核。CPU视觉在prefill之前同步执行，不与KVMem最多2个传输worker重叠；2026-10-02 D8修订后评分在GPU，D15不承担CPU scorer/共享executor契约。
 
 #### 5.10.4 分支与移植
 

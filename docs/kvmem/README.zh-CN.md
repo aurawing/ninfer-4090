@@ -2,7 +2,7 @@
 
 本文是写给接手开发的 AI 助手的任务说明，内容自成一体。背景和推导见同目录的 [设计文档](design-4060-bonsai-kvmem.zh-CN.md)，与本任务直接相关的是 5.6、5.10、6、7、8 节。
 
-设计文档是在另一台机器（RTX 4060 Laptop）上写的，里面形如 `D:\VideCoding\NInfer_KVMem\...` 的本地路径在这台机器上不存在。需要参考资料时，一律使用第 9 节的公开链接。
+设计文档是在另一台机器（RTX 4060 Laptop）上写的，里面形如 `D:\VideCoding\NInfer_KVMem\...` 的本地路径在这台机器上不存在。一般参考资料使用第9节公开链接；阶段4指定源码使用本机固定checkout `D:/deeplearning/NInfer/logs/kvmem-stage7-8/kvmem-qw3-reference`，路径/精确HEAD见第9节与阶段4设计。
 
 ---
 
@@ -70,14 +70,14 @@
 | D5 | 页的状态机为 DeviceOnly → Both → HostOnly，只有 Both 状态的页可以驱逐。每个 prefill 分块结束、以及 decode 中每页写满时，都异步回写 | 5.6.3、5.6.4 |
 | D6 | `tiered-exact`：部分注意力输出 `(O, m, l)`，对双缓冲的 tile 做在线 LSE 合并。合并的数学可以复用 decode 已有的 split-K 合并 | 5.6.7 |
 | D7 | `kvmem`：精确 prefill，每轮选一次块，然后稀疏 decode。不做 query replay（`--kvmem-prefill window` 属于阶段 5，现在直接拒绝） | 5.6.6 |
-| D8 | Mean-K：在 RoPE 之前，按页、层、kv 头求 K 的均值，以 FP16 存在主机，每 token 512 B。打分在 CPU 上做，用 KVMem 的全局 softmax，取本轮用户输入的最后 16 个 query token | 5.6.5 |
-| D9 | 选块：sink、最近 R 个 token、本轮输入所在的页、被引用的图像跨度为必选，其余按打分取 top-k，按原始顺序排列，只换入差分部分。一张图的跨度要么整体入选，要么整体不选 | 5.6.6、5.6.8 |
+| D8 | **2026-10-02 用户批准修订**：pre-RoPE Mean-K 按页/层/kv头求均值，以 FP16 主机固定stride保存，每token 512 B；archive pinned 时使用cacheable pinned索引直传并计额外准入，否则pageable索引经既有环。GPU确定性两遍评分：每个layer/qhead/query token求全局max/denominator，再按固定顺序累加页概率，无atomic。设备评分区加载期alias空闲staging/partial，运行期不分配；独立标量FP64仅作测试oracle，取最后16个用户文本query token | 5.6.5；阶段4设计§2–4/8 |
+| D9 | **2026-10-02 用户批准修订**：sink、最近R token完整页、实际query span及图像闭包为hard，另预留生成reserve与guard。全部本轮输入与hard的闭包union若能放入`V-G-H`则全部hard，否则较早非hard本轮页与历史共同按分数竞争；图像始终原子。hard闭包超预算拒绝并打印各项页数，记录`current_input_softened_pages`；入选按原逻辑序排列，只换入差分 | 5.6.6、5.6.8；阶段4设计§5 |
 | D10 | 视图表独立于逻辑页表，由它生成现有的块表 | 5.6.3 |
 | D11 | MTP pool 不进归档，只保留 sink 加最近窗口（`--kvmem-mtp-window`，默认 32K）。贪心输出必须与关闭 MTP 时逐 token 相同 | 5.6.9、5.10.3 |
 | D12 | resume frontier 和 turn checkpoint 两个复用点从阶段 3 起就要支持：归档按逻辑 frontier 截断，GDN 状态沿用现有 checkpoint。磁盘状态缓存在 kvmem 模式下先关闭 | 5.10.3 |
 | D13 | kvmem 与 tiered-exact 模式只支持 C=1；`--max-concurrency` 大于 1 时启动报错 | 5.10.3 |
 | D14 | 归档精度等于 `--kv-dtype`，4090 上推荐 int8；bf16 只作为显式选项。启动时做主机内存准入：可用物理内存不少于"归档上限 + 4 GiB"，否则拒绝，并提示改用 int8 或 rk8v4。可选 `--kvmem-lock-archive`（`SetProcessWorkingSetSizeEx` 加 `VirtualLock`） | 5.10.2 |
-| D15 | 主机侧工作线程最多 2 个（CPU 只有 6 核）。CPU 视觉在 prefill 之前同步执行，与这些线程不重叠 | 5.10.3 |
+| D15 | 主机侧传输工作线程最多 2 个（CPU 只有 6 核）。CPU 视觉在 prefill 之前同步执行，与这些线程不重叠；阶段4 GPU评分不建立CPU scorer或共享executor/暂停worker契约 | 5.10.3 |
 
 `--kvmem-lock-archive` 是 D14 原有的 `VirtualLock` 选项，仅适用于可分页归档；它不等同于 D4 中可直接异步传输的 CUDA 锁页归档，不能与 `--kvmem-host-archive pinned` 同时使用。设备 staging 在加载期按「一个全注意力层每个 prefill 分块的最大流式量 + 64 MiB」求容量（int8、128K 视图约 264 + 64 MiB），由 `build_workspace_plan()` 从视图显存预算中让出；前面几个 GDN 层计算时预取下一全注意力层，不在切层时整层等待。split 划分和 LSE 合并顺序只由访问列表与 frontier 决定，不由传输完成先后决定。
 
@@ -217,12 +217,12 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
 
 ### 阶段 4：稀疏 decode（2.5–3.5 周）
 
-设计草案见 [stage4-sparse-decode-design.zh-CN.md](stage4-sparse-decode-design.zh-CN.md)，以阶段 3 收尾提交 `c4f145e5` 核对现有接口；本轮只发布文档，等待审阅后再实施。
+设计见 [stage4-sparse-decode-design.zh-CN.md](stage4-sparse-decode-design.zh-CN.md)，以阶段3收尾提交`c4f145e5`核对现有接口，文档修订基线`a78b533a`。2026-10-02批准的本轮范围为先完成全部文档，再顺序实现4.1–4.4；每步独立门禁/commit/push，4.4后停审。
 
 步骤：
 
-1. Mean-K 累加，与 `ops::rope` 相邻或融合进去。
-2. Q 捕获与 CPU 打分：主机侧逻辑可以从 kvmem-qw3 移植（`kvmem_store`、`kvmem_request_plan`、`pick_topk`）。
+1. Mean-K累加放在`ops::rope`之前的新opt-in算子，不修改既有dense kernel/dispatch。
+2. Q 捕获与确定性GPU两遍打分，CPU pure selector可参考固定commit的 `pick_topk_blocks`、`pick_semantic_groups`、`set_selection`，遵守阶段4设计§9.1来源/Apache许可要求。
 3. 视图表、计划差分与换入；页的状态机。
 4. 图像跨度。
 5. 稀疏 decode 与 gen_reserve 环。
@@ -239,7 +239,11 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
 | 主机内存 | 满窗期间硬页错误率不上升；内存不足时启动被明确拒绝 |
 | decode | 满窗 decode 不慢于现在的 dense rk4v4-e8 |
 
-质量评测集：needle 与多 needle 可以用脚本生成（放 `tools/`），深度覆盖 10%–90%。工具回放用的真实 agent 会话记录由用户提供（TODO）。
+阶段4按 [稀疏设计](stage4-sparse-decode-design.zh-CN.md) 和 [4.1–4.4实施清单](stage4-sparse-implementation-plan.zh-CN.md) 顺序执行。全部文档修订先于实现，每步新增CTest、全量CTest、更新证据，由主任务分别commit/push，4.4后停审。4.4范围为C=1、Graph=off的sparse eager；Graph及ordinary/MTP capture性能门禁下一轮。
+
+评分mask与首版图像范围只见阶段4设计：默认仅在超预算且中间非空时排除sink/recent两段，其他hard页仍参与denominator；`NINFER_KVMEM_SCORE_ALL_PAGES=1`作为全部已提交页对照。首版无历史图像引用检测，历史图像作为原子候选，本轮图像按D9；协议识别后续实现。这两项审阅意见不另立D表。
+
+合成矩阵为128K/262K contexts × 128K/32K views × 至少3位置 × 2 denominators × 3次独立运行，记录页统计、TTFT分解、Mean-K/Q H2D与GPU compute、hydrate字节、decode及MTP；128K视图对dense rk4，32K视图对tiered-exact INT8。既有单条长输入needle依D9合法软化，另加结构化历史/短query fixture。needle与多needle可由脚本生成，覆盖10%–90%。**真实多文件/工具矩阵未验收**，真实agent语料仍由用户提供；合成通过不表示阶段4全部验收。
 
 ---
 
@@ -252,7 +256,7 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
 | `test_host_kv_transfer` | 可分页 → 锁页 → 设备的往返、回写、并发，逐字节相等 |
 | `test_attention_partial_lse_merge` | 多种 tile 划分、T 和掩码，与 FP64 全量注意力的相对 L2 不超过 1/256 |
 | `test_meank_accumulate` | RoPE 之前的页内均值，包括不满的页，用 FP64 oracle |
-| `test_kvmem_scoring` | 全局 softmax 打分与 top-k，包括必选页和图像跨度，与参考实现一致 |
+| `test_kvmem_scoring` | GPU两遍global softmax对独立FP64相对L2≤1e-4；默认band-mask/all-pages两denominator；selected集合一致，仅明确FP64第k阈值epsilon并列例外；hard/current软化/图像闭包/tie |
 | `test_kvmem_view_table` | 视图构建、计划差分、页状态机、只允许驱逐 Both 状态的页，不需要 GPU |
 | `test_kvmem_mtp_window` | 窗口边界、页回收、provisional 草稿位置；贪心输出与关闭 MTP 时相同 |
 | `test_kvmem_resume_checkpoint` | snapshot/restore 的 frontier/generation 一致、旧状态拒绝、追加只计算新增 token；回滚对冷启动的完整 logits 在独立端到端测量中按门禁 B 判定 |
@@ -271,7 +275,7 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
   - 要改变 dense 路径的行为；
   - 要动第 4 节列出的三值合并敏感位置；
   - 要新增第三方依赖；
-  - 要 push 或 force-push。
+  - 未获授权的 push 或任何 force-push；本轮4.1–4.4已授权的逐步commit/push由主任务在对应门禁通过后执行。
 - 每完成一个小步骤，就更新 `docs/kvmem/progress.zh-CN.md`：写清完成了什么、实测数据、与设计的偏差和原因、需要用户决定的问题。数字要写明是实测还是估算。
 - 性能数据要记下命令行、提交号，以及当时是否有桌面负载。
 
@@ -294,6 +298,6 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
 
 - 完整设计文档：[design-4060-bonsai-kvmem.zh-CN.md](design-4060-bonsai-kvmem.zh-CN.md)
 - KVMem 论文：[arXiv 2609.04852](https://arxiv.org/abs/2609.04852)
-- KVMem 参考实现：[kvmem/kvmem-qw3](https://github.com/kvmem/kvmem-qw3)，提交 `1cf3b2f`，Apache-2.0。主机侧的 `kvmem_store`、`kvmem_request_plan`、`global_kv_page_pool`、`pinned_kv_tier` 可以借用；依赖 FlashInfer 和 Linux I/O 的部分要重写。
+- KVMem 参考实现：[kvmem/kvmem-qw3](https://github.com/kvmem/kvmem-qw3/tree/1cf3b2f83bfc071ada9c57491a7d121723051ac0)，固定HEAD `1cf3b2f83bfc071ada9c57491a7d121723051ac0`、Apache-2.0；本机路径 `D:/deeplearning/NInfer/logs/kvmem-stage7-8/kvmem-qw3-reference`，核对细节见阶段4设计§9。主机侧的 `kvmem_store`、`kvmem_request_plan`、`global_kv_page_pool`、`pinned_kv_tier` 可以参考；依赖FlashInfer和Linux I/O的部分要重写。
 - jonj20 的 KVMem 评估：[jonj20/ninfer-ada-ternary-4060](https://github.com/jonj20/ninfer-ada-ternary-4060) 的 `docs/kvmem/4060-ninfer-KMEM-评估.md`
 - WDDM 锁页的实测与限额：[iamwavecut/ninfer-all](https://github.com/iamwavecut/ninfer-all) 的 `src/core/host_kv_clamp.h`，以及 `src/models/qwen3_5/program/program_impl.cpp` 约 L363–387

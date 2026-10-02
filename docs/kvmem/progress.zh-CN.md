@@ -4,7 +4,7 @@
 
 ## 待用户决定的问题
 
-第 5、6 步（`4da637a4`、`db8e9641`）已由用户审阅通过；第 7 步已提交发布 `685cae7c`，第 8 步已提交发布 **`c4f145e5`**。dense 组合验收三项全部通过，阶段 3 的退出标准已逐条关闭。首轮严格金标准 **8/9** 的失败、后续四次匹配和用户在失败后批准的修订均保留，原金标准不替换。36 次确定性诊断的完整词表逐位差异为 0；生产计划一致、dense 默认1024；两版生产算法各三次的换行分歧和相对 L2 包络按原门禁 B 通过。阶段 4 设计文档在本次独立纯文档提交中发布，停下等待审阅；阶段 4 代码尚未开始。设计第11节列出待确认的 query/span、续接capture、图像引用和软时间预算等接口提案。
+第 5、6 步（`4da637a4`、`db8e9641`）已由用户审阅通过；第 7 步已提交发布 `685cae7c`，第 8 步已提交发布 **`c4f145e5`**。dense 组合验收三项全部通过，阶段 3 的退出标准已逐条关闭。首轮严格金标准 **8/9** 的失败、后续四次匹配和用户在失败后批准的修订均保留，原金标准不替换。36 次确定性诊断的完整词表逐位差异为 0；生产计划一致、dense 默认1024；两版生产算法各三次的换行分歧和相对 L2 包络按原门禁 B 通过。阶段4设计已按2026-10-02用户批准的D8/D9修订，新增顺序4.1–4.4实施清单；先完成全部文档再实现，每步新CTest/全量CTest及独立commit/push，4.4后停审。阶段4代码尚未开始；Graph/capture性能门禁及真实多文件/工具矩阵未验收，详情见本文末尾。
 
 ## 阶段 0′：基线
 
@@ -452,6 +452,8 @@ rk4v4-e8 的 32K/8K 视图影子第一次运行在首全注意力层、frontier=
 | 2026-10-01 | D1，用户授权例外 | 仅修复已知的 dense 量化 small-T 注意力共享内存竞争，独立修复分支合入后重录九组金标准，旧数据保留；Q5 和 dense 分派不改 | 原版 racecheck 64 hazards，修复后 0；12 组各 64 次逐位一致且 FP64 oracle 通过，详见修复记录 | 是，本轮用户明确要求现在修复，并限定文件与两处 barrier |
 | 2026-10-01 | D1 与门禁 A | 262K RK4 的新路径与当前 dense 在 146432 token 处相对 L2 0.0010094，固定输入消融确认 dense prefill alpha 的 FMA 舍入累积；照搬它会破坏现有 FP64 公共 logit 测试。保持门禁和正确新路径，是否另行修 dense 须用户决定 | 固定输入 dense/partial 重算均逐位一致；临时 alpha-only FMA 将两者误差降到 0.0000645685，但独立数值测试失败，未修改 dense 的均匀参考直接出现大误差/非有限输出，详见上文 | 已决定不修 dense；262K 门禁 A 后续按 FP64 修订见下一行，原失败保留 |
 | 2026-10-02 | 门禁 A，D1 保持 | 32K/128K 的 tiered/dense 1e-3 不变；262K RK4 按影子误差选至少三个层（包括原超限层）的末段完整块，采用同一量化 KV 字节的 CPU FP64 oracle，要求逐层 tiered/FP64 相对 L2 不超过 dense/FP64；同时记录 tiered/dense 数值 | **在测得 0.0010094 之后**依据固定输入 alpha 消融作出的事后修订，保留原失败与所有数据；不修改 dense、不放宽任何其他门禁 | 是，用户明确同意；新判据实测通过 |
+| 2026-10-02 | D8 | 将CPU/AVX2 scorer改为确定性GPU两遍：每个layer/qhead/query token全局max/denominator，再固定顺序累加页概率，无atomic；主机Mean-K固定stride，archive pinned时额外cacheable pinned索引计入准入并直传，否则pageable经既有环；设备alias空闲staging/partial，运行期不分配，标量FP64仅测试 | 用户批准阶段4架构修订；原50–150ms CPU值只是估算，无GPU实测通过声明。GPU相对FP64 L2≤1e-4，集合一致只允许明确FP64第k阈值epsilon并列；分别记H2D与compute | 是，用户明确同意，批准日期2026-10-02；仅文档已修订，实现未验收 |
+| 2026-10-02 | D9 | hard为sink/recent完整页/query span及图像闭包，另计reserve/guard；全部current闭包union若fits `V-G-H`则全部hard，否则较早非hard current页与历史同域评分竞争、图像原子；记录`current_input_softened_pages`，hard溢出拒绝并报告各项页数 | 用户批准容量规则修订，既有单条长input needle现在可合法软化，结构化历史/短query fixture为额外测试；不以文档修订冒充质量实测 | 是，用户明确同意，批准日期2026-10-02；仅文档已修订，实现未验收 |
 | 2026-10-02 | D1，阶段 3 dense 退出标准 | 首轮 8/9 匹配后，改为三项组合验收：同一确定性临时补丁下旧版/终版九例各两次完整 logits 逐位一致；dense 加载计划一致；生产算法分歧步通过既有门禁 B 的并列/包络规则。以后各阶段沿用 | **在看到 needle-262k-10 第 9 token 271→198 的失败之后作出的事后修订**。首次失败没有 logits，四次后续匹配不证明根因，原失败和严格汇总断言失败保留，不替换原金标准 | 用户已明确批准；三项都通过才提交第 8 步，诊断差异则定位并停下；dense 永久代码不修改 |
 
 ## 阶段 3 第 5、6 步：已完成，停在审阅点（2026-10-02）
@@ -707,4 +709,14 @@ before 字节按旧版“全部驻留页×全部层/plane”的实际规划及�
 
 第 8 步 **`c4f145e565eab32fb20a0cac38265e2c37211a30`**（`perf(kvmem): plan tiered chunks and restore missing pages`）已推送 `origin/feat/kvmem`，包括实现、CPU/GPU回归测试、全部验收证据索引和用户批准的 dense 组合判据。测试为106项：102通过、4制品缺失跳过、0失败；代码没有临时读回/确定性补丁，也没有 dense 内核/分派改动。
 
-阶段 4 草案已安装到 [stage4-sparse-decode-design.zh-CN.md](stage4-sparse-decode-design.zh-CN.md)，本次是独立纯文档提交。内容覆盖 pre-RoPE Mean-K/用户Q、部分页与snapshot、两线程全局softmax、hard mandatory与图像闭包、差分换入/reserve、动态Graph契约、参数与完整资源账本、指定 `kvmem-qw3@1cf3b2f` 文件/函数及许可边界、单元/质量门禁与用户工具日志JSONL格式。实际源码入口行号807/839、参考六个文件的blob及Apache许可已复核；JSONL示例经解析验证。CPU 150ms为软目标估算，真实工具语料尚需用户提供，阶段4实现/性能/质量未验收。到此停下等审阅，不开始阶段4代码。
+阶段4草案已安装到 [stage4-sparse-decode-design.zh-CN.md](stage4-sparse-decode-design.zh-CN.md)，原安装为独立纯文档提交 `a78b533a`。当时内容包括两线程CPU全局softmax、整段current hard、图像引用检测提案及动态Graph契约；这些是原草案记录，不再作为后续实施契约，D8/D9修订与本轮边界见下文。实际源码入口行号807/839、参考六个文件的blob及Apache许可已复核；原JSONL示例经解析验证。原CPU150ms只是软目标估算，未测量；真实工具语料仍需用户提供，阶段4实现/性能/质量未验收。
+
+## 阶段4文档修订与4.1–4.4实施入口
+
+2026-10-02用户批准D8/D9修订（执行日期进入2026-10-03，批准日期不改）：GPU确定性两遍评分取代CPU scorer；固定stride主机Mean-K按归档类型选择pinned直传或pageable经现有环，额外索引字节计入准入，设备评分alias空闲staging/partial；D9允许较早current页容量软化并与历史共同竞争，基础hard与图像闭包仍超预算拒绝。对应偏差表已记录，README与设计5.6.5/5.6.6同步。
+
+指定本地参考 `D:/deeplearning/NInfer/logs/kvmem-stage7-8/kvmem-qw3-reference` 的HEAD复核为 `1cf3b2f83bfc071ada9c57491a7d121723051ac0`。`src/qwen_executor.cpp`约23750–23790只在`nb>budget>0`且中间非空时mask sink/recent bands，`QW3_KVMEM_MASK_KEPT=0`恢复全页；评分kernel位于`src/kernels_cuda.cu`约5340。本项目默认保留仅两band语义，其他hard页仍参与denominator，软化current不另行排除；隐藏`NINFER_KVMEM_SCORE_ALL_PAGES=1`测试全部已提交页。非页齐hard recent覆盖可比固定recent band多一页。首版无历史图像引用检测，历史图像原子候选、本轮图像依D9，协议识别后续。这两项为设计审阅意见，不新增D表决策。
+
+新增 [stage4-sparse-implementation-plan.zh-CN.md](stage4-sparse-implementation-plan.zh-CN.md)：全部文档先于实现，4.1 Mean-K/FP64/部分prefix、4.2 GPU score/CPU selector、4.3 query span/三槽Q/Main snapshot、4.4完整exact-prefill到sparse eager。每步新CTest、当时全量CTest、progress和证据完成后，由主任务分别commit/push；4.4终版对新增GPU owner/kernel跑 compute-sanitizer 13.0.85 的 racecheck/synccheck/initcheck，并保持三项dense组合门禁。4.4仅C=1/Graph=off，完成后停审，Graph及ordinary/MTP capture性能门禁下一轮。
+
+4.4合成矩阵固定为128K/262K contexts×128K/32K views×至少3位置×2 denominators×3次独立运行；既有单条长input needle依D9合法soften，另加结构化历史/短query fixture，记录页统计、TTFT分解、H2D/compute、hydrate bytes、decode与MTP。128K视图对dense rk4，32K对tiered-exact INT8。**本轮目前只有文档修订，未开始阶段4代码/构建/GPU验收；真实多文件/工具矩阵未验收，Graph/capture性能门禁未验收，合成测试不能替代。**
