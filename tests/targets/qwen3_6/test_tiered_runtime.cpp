@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -40,20 +41,20 @@ void exercise(bool shadow, DType dtype, HostKVArchiveMode mode = HostKVArchiveMo
     DeviceContext device;
     LayoutBuilder pool_builder;
     DecoderStateSpec spec;
-    spec.capacity                  = 320;
+    spec.capacity                  = shadow ? 320 : 384;
     spec.full_attention_layers     = 16;
     spec.kv_heads                  = 4;
     spec.attention_head_dim        = 256;
     spec.kv_dtype                  = dtype;
     spec.kv_quant_group            = dtype == DType::I8 ? 64 : 0;
-    spec.text_physical_page_groups = shadow ? 5 : 3;
+    spec.text_physical_page_groups = shadow ? 5 : 6;
     spec.allow_tiered_text_pages   = true;
     spec.linear_attention          = {1, 1, 1, 1, 1, 1};
     const auto layout              = plan_decoder_state(pool_builder, spec).text_kv;
     DeviceBuffer pool_memory(pool_builder.finish(256));
     PagedKVCache cache({pool_memory.p, pool_memory.bytes}, layout);
-    auto lease = cache.pool().reserve(shadow ? 5 : 3);
-    lease.materialize_pages(shadow ? 5 : 3, device.stream);
+    auto lease = cache.pool().reserve(shadow ? 5 : 6);
+    lease.materialize_pages(shadow ? 5 : 6, device.stream);
     lease.bind_row(0, device.stream);
     TieredKVOptions options;
     options.sink_tokens  = 64;
@@ -68,8 +69,57 @@ void exercise(bool shadow, DType dtype, HostKVArchiveMode mode = HostKVArchiveMo
     CUDA_CHECK(cudaDeviceSynchronize());
     TieredContext owner(plan, cache, {runtime_memory.p, runtime_memory.bytes}, device.stream);
     auto bound_ids = std::vector<std::int32_t>(lease.page_ids().begin(), lease.page_ids().end());
-    if (!shadow) std::rotate(bound_ids.begin(), bound_ids.begin() + 1, bound_ids.end());
+    if (!shadow) bound_ids = {bound_ids[5], bound_ids[1], bound_ids[3]};
     owner.bind_pages(bound_ids);
+    struct ExpectedPage {
+        std::uint32_t logical, valid_tokens;
+        std::size_t pool_plane;
+        std::vector<std::byte> bytes;
+    };
+    const auto read_page = [&](std::uint32_t plane, std::uint32_t logical) {
+        const auto view = owner.current_view();
+        const auto slot = view.blocktable.at(logical);
+        require(slot >= 0, "test expected page must be resident");
+        const auto id = bound_ids.at(shadow ? logical : std::uint32_t(slot));
+        const auto& tensor = cache.pool().plane(plane);
+        std::vector<std::byte> bytes(tensor.nb[3]);
+        CUDA_CHECK(cudaMemcpy(bytes.data(), static_cast<const std::byte*>(tensor.data) + id * tensor.nb[3],
+                              bytes.size(), cudaMemcpyDeviceToHost));
+        return bytes;
+    };
+    const auto expected_pages = [&] {
+        std::vector<ExpectedPage> pages;
+        const auto view = owner.current_view();
+        for (const auto& layer : plan.archive.layers)
+            for (const auto& plane : layer)
+                for (const auto& page : view.resident)
+                    pages.push_back({page.logical_page,
+                        std::min(64U, view.frontier - page.logical_page * 64U), plane.pool_plane,
+                        read_page(plane.pool_plane, page.logical_page)});
+        return pages;
+    };
+    const auto check_prefix_bytes = [&](const std::vector<ExpectedPage>& pages) {
+        for (const auto& page : pages) {
+            const auto observed = read_page(page.pool_plane, page.logical);
+            const auto& tensor = cache.pool().plane(page.pool_plane);
+            for (int head = 0; head < 4; ++head)
+                for (std::uint32_t token = 0; token < page.valid_tokens; ++token)
+                    for (std::size_t n = 0; n < tensor.nb[1]; ++n) {
+                        const auto offset = head * tensor.nb[2] + token * tensor.nb[1] + n;
+                        require(observed[offset] == page.bytes[offset],
+                                "restored valid KV prefix must match every original layer and plane byte");
+                    }
+        }
+    };
+    const auto restore_log = [&](const TieredSnapshot& saved) {
+        std::ostringstream log;
+        auto* previous = std::clog.rdbuf(log.rdbuf());
+        try { owner.restore(saved, device.stream); }
+        catch (...) { std::clog.rdbuf(previous); throw; }
+        std::clog.rdbuf(previous);
+        std::clog << log.str();
+        return log.str();
+    };
     auto run = [&](std::uint32_t base, std::uint32_t count) {
         const auto width = !shadow && count == 1 ? 4U : count;
         std::vector<std::int32_t> positions(width, 0);
@@ -125,18 +175,40 @@ void exercise(bool shadow, DType dtype, HostKVArchiveMode mode = HostKVArchiveMo
     run(64, 64);
     run(128, 1);
     const auto checkpoint = owner.capture();
+    const auto checkpoint_bytes = expected_pages();
     require(checkpoint.frontier == 129 && checkpoint.archive_frontier == 129,
             "capture must preserve exact boundary before later prefill chunks");
     run(129, 63);
     run(192, 64);
     run(256, 1);
+    if (!shadow) {
+        const auto partial_checkpoint = owner.capture();
+        const auto partial_bytes = expected_pages();
+        const auto partial_view = owner.current_view();
+        run(257, 1);
+        require(restore_log(partial_checkpoint).find("missing_pages=0") != std::string::npos,
+                "surviving current partial page restore must schedule zero hydration");
+        require(owner.current_view().blocktable == partial_view.blocktable,
+                "partial prefix restore must preserve its physical slots");
+        check_prefix_bytes(partial_bytes);
+    }
     auto wrong_bundle = checkpoint;
     ++wrong_bundle.bundle_identity;
     bool wrong_rejected = false;
     try { owner.restore(wrong_bundle, device.stream); }
     catch (const std::exception&) { wrong_rejected = true; }
     require(wrong_rejected && owner.frontier() == 257, "foreign bundle restore must be rejected before mutation");
-    owner.restore(checkpoint, device.stream);
+    const auto rollback_log = restore_log(checkpoint);
+    if (!shadow) {
+        std::size_t bytes = 0;
+        for (const auto& layer : plan.archive.layers)
+            for (const auto& plane : layer) bytes += 2 * plane.page_bytes;
+        require(rollback_log.find("missing_pages=2") != std::string::npos &&
+                    rollback_log.find("retained_pages=1") != std::string::npos &&
+                    rollback_log.find("scheduled_h2d_bytes=" + std::to_string(bytes)) != std::string::npos,
+                "rollback must schedule only overwritten pages across all sixteen layers/planes");
+    }
+    check_prefix_bytes(checkpoint_bytes);
     const auto restored = owner.capture();
     require(restored.view_generation > checkpoint.view_generation &&
                 restored.archive_frontier == 129 && owner.current_view().resident.size() == 3,
@@ -144,7 +216,10 @@ void exercise(bool shadow, DType dtype, HostKVArchiveMode mode = HostKVArchiveMo
     for (std::uint32_t logical = 0; logical < 3; ++logical)
         require(owner.current_view().resident[logical].logical_page == logical,
                 "restore must replace later eviction mapping");
-    owner.restore(checkpoint, device.stream);
+    const auto repeated_log = restore_log(checkpoint);
+    require(repeated_log.find("missing_pages=0") != std::string::npos &&
+                repeated_log.find("scheduled_h2d_bytes=0") != std::string::npos,
+            "repeated restore must schedule no archive H2D copies");
     require(owner.capture().view_generation > restored.view_generation,
             "repeated restore must not roll generation backwards");
     run(129, 1);

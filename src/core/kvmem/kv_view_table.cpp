@@ -171,9 +171,29 @@ KVViewSnapshot KVViewTable::plan_restore(std::uint32_t frontier) const {
     const auto sinks = std::min(sink_pages_, end);
     const auto recent = static_cast<std::uint32_t>(slot_owners_.size()) - sinks;
     const auto first_recent = std::max(sinks, end > recent ? end - recent : 0U);
+    std::vector<bool> used(slot_owners_.size(), false);
+    // Preserve current ownership first, including the valid prefix of the
+    // partial frontier page. Later appends cannot alter earlier token bytes.
+    for (std::uint32_t logical = 0; logical < end; ++logical) {
+        if (logical >= sinks && logical < first_recent) continue;
+        const auto& descriptor = pages_[logical];
+        const auto slot = descriptor.physical_slot;
+        if (descriptor.state == KVViewState::Both && slot >= 0 &&
+            slot_owners_.at(slot) == static_cast<std::int32_t>(logical)) {
+            result.blocktable[logical] = slot;
+            used[slot] = true;
+        }
+    }
+    std::size_t next_slot = 0;
     for (std::uint32_t logical = 0; logical < end; ++logical) {
         if (logical < sinks || logical >= first_recent) {
-            const auto slot = static_cast<std::int32_t>(result.resident.size());
+            auto slot = result.blocktable[logical];
+            if (slot < 0) {
+                while (used.at(next_slot)) ++next_slot;
+                slot = static_cast<std::int32_t>(next_slot);
+                used[next_slot] = true;
+                result.hydration_pages.push_back(logical);
+            }
             result.blocktable[logical] = slot;
             result.resident.push_back({logical, slot, KVViewState::Both,
                                        {result.generation, pages_[logical].revision}});
@@ -186,7 +206,8 @@ void KVViewTable::install_restore(const KVViewSnapshot& restored) {
     const auto expected = plan_restore(restored.frontier);
     if (restored.generation != expected.generation ||
         restored.blocktable != expected.blocktable || restored.resident != expected.resident ||
-        restored.host_only != expected.host_only)
+        restored.host_only != expected.host_only ||
+        restored.hydration_pages != expected.hydration_pages)
         throw std::logic_error("stale or invalid KV restoration plan");
     std::fill(slot_owners_.begin(), slot_owners_.end(), -1);
     std::fill(layer_completion_.begin(), layer_completion_.end(), std::uint8_t{0});

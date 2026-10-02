@@ -76,6 +76,14 @@ int main() {
                       "server accepted invalid tiered configuration");
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(defaults.prefill_chunk == 1024 && !defaults.prefill_chunk_explicit,
+                      "server default chunk must remain implicit for runtime selection");
+    for (const char* chunk : {"1024", "2048"}) {
+        const auto explicit_chunk = parse({"ninfer-serve", "model.ninfer", "--prefill-chunk", chunk});
+        failures += check(explicit_chunk.prefill_chunk_explicit &&
+                              explicit_chunk.prefill_chunk == std::stoul(chunk),
+                          "server explicit chunk value and provenance must survive parsing");
+    }
     failures += check(defaults.vision_cpu_cache_mib == 128, "server CPU cache default mismatch");
     failures += check(parse({"ninfer-serve", "model.ninfer", "--vision-mmproj", "mmproj.gguf", "--vision-cpu-cache-mib", "0"}).vision_cpu_cache_mib == 0,
                       "server CPU cache zero must disable caching");

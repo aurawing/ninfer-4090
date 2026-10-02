@@ -100,6 +100,9 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Explicit 1024 opts out of tiered automatic selection. Nondefault values
+    // remain explicit for existing API callers even without this flag.
+    bool prefill_chunk_explicit        = false;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     KvMode kv_mode                     = KvMode::Dense;
     TieredKVOptions kvmem;
@@ -492,6 +495,7 @@ struct LoadSummary {
     std::uint64_t peak_staging_bytes   = 0;
     std::size_t tensor_count           = 0;
     std::size_t resource_count         = 0;
+    std::uint32_t prefill_chunk         = 0; // Actual planned chunk, capped by max_context.
 };
 
 } // namespace ninfer

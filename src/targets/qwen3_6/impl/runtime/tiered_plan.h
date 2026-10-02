@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/kvmem/host_kv_transfer.h"
+#include "core/kvmem/planning_error.h"
 #include <ninfer/ops/gqa_attention_partial.h>
 #include <ninfer/types.h>
 
@@ -30,7 +31,7 @@ inline TieredPageLimits tiered_page_limits(std::uint32_t logical_tokens,
     const auto minimum   = static_cast<std::uint32_t>(std::min<std::uint64_t>(logical, minimum64));
     const auto maximum   = std::min(logical, pages(options.view_tokens));
     if (minimum > maximum) {
-        throw std::invalid_argument(
+        throw kvmem::TieredPrefillCapacityError(
             "tiered view cannot fit sink, prefill chunk and replacement page");
     }
     return {minimum, maximum};
@@ -164,16 +165,16 @@ inline TieredRuntimePlan plan_tiered_runtime(const PagedKVPoolLayout& main_pool,
     out.maximum_stream_pages = out.archive.logical_pages - view_pages;
     out.staging =
         kvmem::plan_host_kv_staging(out.archive, view_pages, options.staging_capacity_bytes);
-    out.partial = ops::plan_attention_partial_workspace(static_cast<int>(max_query_tokens), 1,
-                                                        options.partial_budget_bytes);
     // Decode <=4 supports S64. Scratch and state planes are independently maximized.
     const auto scratch_tokens   = std::max<std::uint64_t>(max_query_tokens, 4ULL * 64);
     const auto state_tokens     = std::max<std::uint64_t>(max_query_tokens, 4);
     const auto required_partial = (scratch_tokens + state_tokens) * 258ULL * 24 * sizeof(float);
     if (required_partial > options.partial_budget_bytes) {
-        throw std::invalid_argument(
+        throw kvmem::TieredPrefillCapacityError(
             "tiered partial budget cannot fit prefill and four-query S64 decode");
     }
+    out.partial = ops::plan_attention_partial_workspace(static_cast<int>(max_query_tokens), 1,
+                                                        options.partial_budget_bytes);
     out.partial.bytes    = required_partial;
     const auto dimension = [](std::uint64_t elements) {
         if (elements > std::numeric_limits<std::int32_t>::max()) {

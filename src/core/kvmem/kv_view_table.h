@@ -38,6 +38,9 @@ struct KVViewSnapshot {
     std::vector<std::int32_t> blocktable;
     std::vector<KVViewPage> resident;
     std::vector<std::uint32_t> host_only;
+    // Restore-plan metadata only: target resident logical pages whose current
+    // slots do not contain the valid prefix. Ordinary captured snapshots omit it.
+    std::vector<std::uint32_t> hydration_pages;
 };
 
 // CPU-only metadata for one sequence. Callers serialize mutations and drain consumers
@@ -60,8 +63,9 @@ public:
     // Cancels old-generation notifications and pending partial layer completions.
     void trim(std::uint32_t frontier);
     void reset();
-    // Plan fresh sink/recent slots after all archive writes have completed.
-    // Caller hydrates every resident plane before installation; captured slots are never reused.
+    // Plan sink/recent pages after archive writes complete. Preserve current
+    // Both owners in their existing slots and hydrate only hydration_pages.
+    // Captured historical mappings never establish current device ownership.
     [[nodiscard]] KVViewSnapshot plan_restore(std::uint32_t frontier) const;
     void install_restore(const KVViewSnapshot& restored);
 

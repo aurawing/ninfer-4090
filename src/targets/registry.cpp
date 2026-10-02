@@ -121,8 +121,6 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
     artifact::Binder binder(reader);
     auto load_plan        = Target::plan_load(binder, options, weights_profile);
-    auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
-    const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
     const char* shadow_env = std::getenv("NINFER_KVMEM_SHADOW");
     const bool normal_tiered = options.kv_mode == KvMode::TieredExact &&
                                !(shadow_env && std::string_view(shadow_env) == "1");
@@ -132,10 +130,35 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         std::clog << "[kvmem] resident capacity uses --kvmem-view-tokens and available GPU budget; "
                      "--kv-capacity applies to dense mode, logical archive uses --max-context\n";
     }
-    const std::size_t preflight_runtime_bytes =
-        runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes,
-                                            options.wddm_evictable_budget);
-    (void)runtime::resolve_kv_capacity(effective_kv_policy, curve, preflight_runtime_bytes);
+    std::size_t preflight_runtime_bytes = 0;
+    std::uint32_t selected_chunk = options.prefill_chunk;
+    std::string fallback_reason;
+    auto sequence_planner = [&] {
+        if (!normal_tiered) return Target::make_sequence_planner(device, options, weights_profile);
+        preflight_runtime_bytes = runtime_bytes_after_planned_weights(
+            load_plan.materialization().device_capacity_bytes, options.wddm_evictable_budget);
+        auto selected = runtime::select_prefill_plan(options, false, preflight_runtime_bytes,
+            [&](const EngineOptions& candidate) {
+                return Target::make_sequence_planner(device, candidate, weights_profile);
+            });
+        selected_chunk = selected.prefill_chunk;
+        fallback_reason = std::move(selected.fallback_reason);
+        return std::move(selected.planner);
+    }();
+    const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
+    if (!normal_tiered) {
+        preflight_runtime_bytes = runtime_bytes_after_planned_weights(
+            load_plan.materialization().device_capacity_bytes, options.wddm_evictable_budget);
+        (void)runtime::resolve_kv_capacity(effective_kv_policy, curve, preflight_runtime_bytes);
+    }
+    if (normal_tiered) {
+        const bool explicit_chunk = options.prefill_chunk_explicit || options.prefill_chunk != 1024;
+        std::clog << "[kvmem] prefill_chunk=" << std::min(selected_chunk, options.max_context)
+                  << " selection=" << (explicit_chunk ? "explicit" :
+                      fallback_reason.empty() ? "automatic" : "fallback");
+        if (!fallback_reason.empty()) std::clog << " reason=" << fallback_reason;
+        std::clog << '\n';
+    }
 
     auto progress     = artifact_progress(options.load_progress);
     auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
@@ -171,6 +194,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     summary.peak_staging_bytes   = stats.peak_staging_bytes;
     summary.tensor_count         = stats.tensor_count;
     summary.resource_count       = stats.resource_count;
+    summary.prefill_chunk        = std::min(selected_chunk, options.max_context);
     return ConstructedTarget{.active            = ActiveTarget(std::move(instance)),
                              .load              = std::move(summary),
                              .sampling_defaults = sampling_defaults};

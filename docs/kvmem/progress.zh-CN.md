@@ -4,7 +4,7 @@
 
 ## 待用户决定的问题
 
-第 5、6 步（`4da637a4`、`db8e9641`）已由用户审阅通过。本轮按授权完成阶段 3 第 7、8 步，之后只起草阶段 4 设计，不实现稀疏 decode。第 7 步已通过构建、CTest 和独立规格/质量审阅，独立提交发布；第 8 步与设计文档待继续。本轮尚无需要用户决定的 D1–D15 冲突。
+第 5、6 步（`4da637a4`、`db8e9641`）已由用户审阅通过；第 7 步已提交发布 `685cae7c`。第 8 步 dense 组合验收三项已全部通过，阶段 3 的退出标准已逐条关闭。首轮严格金标准 **8/9** 的失败、后续四次匹配和用户在失败后批准的修订均保留，原金标准不替换。36 次确定性诊断的完整词表逐位差异为 0；生产计划一致、dense 默认1024；两版生产算法各三次的换行分歧和相对 L2 包络按原门禁 B 通过。本轮按授权提交并发布第 8 步，再单独发布阶段 4 设计文档，之后停下等审阅；阶段 4 代码尚未开始。
 
 ## 阶段 0′：基线
 
@@ -452,6 +452,7 @@ rk4v4-e8 的 32K/8K 视图影子第一次运行在首全注意力层、frontier=
 | 2026-10-01 | D1，用户授权例外 | 仅修复已知的 dense 量化 small-T 注意力共享内存竞争，独立修复分支合入后重录九组金标准，旧数据保留；Q5 和 dense 分派不改 | 原版 racecheck 64 hazards，修复后 0；12 组各 64 次逐位一致且 FP64 oracle 通过，详见修复记录 | 是，本轮用户明确要求现在修复，并限定文件与两处 barrier |
 | 2026-10-01 | D1 与门禁 A | 262K RK4 的新路径与当前 dense 在 146432 token 处相对 L2 0.0010094，固定输入消融确认 dense prefill alpha 的 FMA 舍入累积；照搬它会破坏现有 FP64 公共 logit 测试。保持门禁和正确新路径，是否另行修 dense 须用户决定 | 固定输入 dense/partial 重算均逐位一致；临时 alpha-only FMA 将两者误差降到 0.0000645685，但独立数值测试失败，未修改 dense 的均匀参考直接出现大误差/非有限输出，详见上文 | 已决定不修 dense；262K 门禁 A 后续按 FP64 修订见下一行，原失败保留 |
 | 2026-10-02 | 门禁 A，D1 保持 | 32K/128K 的 tiered/dense 1e-3 不变；262K RK4 按影子误差选至少三个层（包括原超限层）的末段完整块，采用同一量化 KV 字节的 CPU FP64 oracle，要求逐层 tiered/FP64 相对 L2 不超过 dense/FP64；同时记录 tiered/dense 数值 | **在测得 0.0010094 之后**依据固定输入 alpha 消融作出的事后修订，保留原失败与所有数据；不修改 dense、不放宽任何其他门禁 | 是，用户明确同意；新判据实测通过 |
+| 2026-10-02 | D1，阶段 3 dense 退出标准 | 首轮 8/9 匹配后，改为三项组合验收：同一确定性临时补丁下旧版/终版九例各两次完整 logits 逐位一致；dense 加载计划一致；生产算法分歧步通过既有门禁 B 的并列/包络规则。以后各阶段沿用 | **在看到 needle-262k-10 第 9 token 271→198 的失败之后作出的事后修订**。首次失败没有 logits，四次后续匹配不证明根因，原失败和严格汇总断言失败保留，不替换原金标准 | 用户已明确批准；三项都通过才提交第 8 步，诊断差异则定位并停下；dense 永久代码不修改 |
 
 ## 阶段 3 第 5、6 步：已完成，停在审阅点（2026-10-02）
 
@@ -550,3 +551,154 @@ compute-sanitizer **13.0.85** 分别对 `ninfer_test_mtp_window` 和 `ninfer_tes
 日志补全实际 Main view tokens/payload、staging、partial、访问列表与其他固定元数据、一般 workspace、MTP 窗口/pool、请求归档模式/容量；归档实际选择、OS lock 和加载后可用物理内存/4 GiB 余量单独打印。新增使用者文档 `tiered-exact.zh-CN.md`，改写 maintainer 的 offload non-goal，明确 dense 契约不变、C=1、BF16 仅功能、Graph/disk 关闭、decode 仅验证。
 
 实测验证（仓库外 `D:\deeplearning\NInfer\logs\kvmem-stage7-8`）：选项 RED 两项均因缺失功能失败，GREEN 2/2 通过；完整构建退出 0（298 更新动作），全量 **106 项：102 通过、4 制品相关跳过、0 失败，251.04 s**。额外补强 parsed lock/order 和准入提示测试后，三项定向 CTest **3/3，0.76 s**，覆盖 pageable/auto OS lock、逐字节往返、回写、trim 保留锁定提交以及普通 pageable decommit。原四项 skip 与前一步一致，没有把跳过计为执行通过。构建/RED/GREEN/full CTest 原始日志均保留；MSVC 的既有 /Ob2→/Ob3 warning 不影响退出码。独立规格与质量审阅均 approve。dense 内核与分派无改动，九组 dense 金标准按第 8 步在终版重跑。
+
+
+## 阶段 3 第 8 步：差异恢复与收尾（2026-10-02，dense 组合门禁通过）
+
+普通 tiered 自动分块先创建 2048 的完整 planner，包含 Main/MTP、workspace、staging、partial、列表与预算预留；仅容量相关 `TieredPrefillCapacityError` 回退 1024。显式 CLI/serve 值和 API 非默认值原样使用；API 显式 1024 可设置 `prefill_chunk_explicit=true`。dense 与 shadow 保持原默认 1024 和预算流程。启动打印实际选择及原因，LoadSummary 记录实际分块。
+
+Main 恢复按当前 Both 页与 slot owner 保留仍有效的目标前缀原物理槽，包括末页有效前缀；只为被覆盖或驱逐的目标页生成 hydration 列表。连续逻辑范围合并传输、设备非连续 lease 按真实 ID 分段复制；drain/归档 trim、generation 递增、旧 ticket 拒绝及原子发布保持。`[kvmem-restore]` 输出保留/缺失页、**实际调度 H2D 字节**和恢复耗时；该字节不是 PCIe 硬件计数器。MTP 缺页仍不补算，磁盘缓存和 CUDA Graph 仍关闭。
+
+源/测试从 `685cae7c` 开发，无 dense 内核/attention 分派改动。接口 RED 因不存在新 API 失败；运行时有效 RED 为 `stage8-red-runtime-test-r2.log` 的“surviving current partial page restore must schedule zero hydration”。初次测试 fixture 的 narrowing 与 pool entitlement/bad allocation 问题也保留记录，不算功能 RED。MSVC 在新 planner 转移所有权时暴露原默认 move ctor 缺链接符号（27B/35B）；仅改为显式移动 unique_ptr 的实现，增加 moved-from/moved-to 生命周期断言，不改 dense 算法。
+
+目标 GREEN **8/8、37.08 s**，覆盖 pinned/pageable、全部 16 层各 plane 有效前缀、非连续 lease、覆盖页重新换入、重复零 H2D、generation/stale plan，以及完整预算边界和不吞无关错误。完整构建 **189 更新动作，退出 0**；全量 CTest **106 项：102 通过、4 对应制品缺失跳过、0 失败，244.53 s**。日志为仓库外 `D:/deeplearning/NInfer/logs/kvmem-stage7-8/stage8-{full-build,full-ctest,green-target-test}.log`。规格、代码质量独立只读审阅通过；整模型测量结果随后补充，不以 CTest 代替质量/性能门禁。
+
+
+### 第 8 步：262K 差异恢复配对实测
+
+对照使用第 6 步正式聊天 fixture `kvmem-stage5-6/chat-262k-reference-user.txt`（SHA256 `6effaa5e1de5b1924b95b3d0c006c2fb2b804cc6dd8fe2ce693a5f3deec0436b`），262144 容量、INT8-G64、MTP-3 optimized、chunk 2048、无视觉/Graph/磁盘缓存、greedy、preserve_thinking=true。before 正式数据为 `stage8-before-262k-r3.*`，after 为 `stage8-after-262k.*`；两者串行且无重构建/其他 GPU 测试重叠。此前 r1 的 fixture 文件名错误和 r2 与构建重叠的探索记录保留，**不用于正式性能结论**。外部静态链接 harness 仅用 Engine API，before/after SHA256 分别为 `d24a890fb74a5a06b4c82ea0c4188fe0df47dbf6d122095cafe8fdc89344978f` / `133338b062640781096ed8be3c8cb9d3353e0aa163e38dde77ec0f99da8ea284`。
+
+两轮均为 first 261447 token、append/rollback/cold 261513 token；append 复用 261462、计算 51，rollback 复用 261509、计算 4。after 四次 needle 均正确；rollback/cold 全部 64 token 相同，before/after 四阶段 ID 也相同。本步未再导出完整 logits，不能将 token 相同声称为 logits 逐位相同；此前第 6 步完整词表三次包络证据仍保留。MTP first accepted/drafted 11/11，其余阶段各 47/47，全部 100%。
+
+| 恢复点 | prefill before s | prefill after s | 完整调用 before s | 完整调用 after s | 调度 H2D before B | 调度 H2D after B | after 保留/缺失页 | after Main restore ms |
+|---|---:|---:|---:|---:|---:|---:|---|---:|
+| retained append | 1.666338 | 1.207654 | 10.573266 | 9.623647 | 3933929472 | 0 | 1819 / 0 | 0.3990 |
+| turn checkpoint | 0.962624 | 0.546770 | 9.424440 | 9.397402 | 3933929472 | 2162688 | 1818 / 1 | 5.8729 |
+
+before 字节按旧版“全部驻留页×全部层/plane”的实际规划及旧无条件 hydrate 调用计算；after 字节由实际调度计数日志取得。两者均是**调度传输量而非硬件 PCIe counter**。3933929472 B≈3.664 GiB；新 rollback 2162688 B=2.0625 MiB。完整调用用相同外部 marker 观察器计时，轮询间隔 5 ms，包含 prepare/generate 与输出解码，不只恢复；after Main restore_ms 是内部计时，旧版无相同内部计数，不能把旧完整调用与新 restore_ms 直接比。append 完整调用约降 8.98%，rollback 仅约降 0.29%；该次 rollback decode 8.618 s 高于 before，抵消 prefill 收益。一次配对不是稳定性能保证；first prefill 222.768→209.451 s、cold 222.973→223.826 s 的波动不归因于恢复优化。
+
+两轮实际预算完全一致：Main view **116416 token / 3933929472 B**；staging **374886400 B**；partial **101449728 B**；访问列表/前缀/块表及对齐 **164608 B**；general workspace **361906176 B**；MTP window32768 pool **69206016 B**；CUDA pinned host archive **8858370048 B**，中转环0 B。这不含模型权重、桌面或整卡运行峰值。ready GPU 累计等待分 phase（四次调用累计，非单次或传输隐藏比例）：before prefill/decode **2326.4165 / 24645.5400 ms**，after **2210.3227 / 24707.0700 ms**，逐层日志与摘要 `stage8-reuse-summary.json` 保留。
+
+真实产品 CLI 自动选择验证也通过：32K 配置、view8192、无显式 chunk 选 **2048/automatic**；view2048 选 **1024/fallback**，明确日志 `tiered view cannot fit sink, prefill chunk and replacement page`，两次返回0。容量边界与显式值拒绝/保持规则另外由预算 CTest 覆盖。恢复 GPU 测试补跑 compute-sanitizer **13.0.85**：racecheck **0 hazards/0 errors/0 warnings**，synccheck/initcheck **0 errors**，全部退出0。命令：`compute-sanitizer.exe --tool racecheck|synccheck|initcheck --error-exitcode 99 build-vision-integration/tests/ninfer_test_tiered_runtime.exe`（三个独立串行进程）；原始日志 `stage8-restore-*.log`、精确命令 `stage8-restore-sanitizers.json`，均在仓库外。
+
+
+### 第 8 步：262K MTP 长生成（1024 token）
+
+同一固定摘要输入，262144 容量、INT8-G64归档、chunk2048、MTP-3 optimized、greedy、无视觉/Graph/磁盘缓存，两个独立进程顺序测量。任务为120个合成项目备忘录的交付/库存/复核/风险/建议摘要；实际 prompt **260768 token**，各生成完整 **1024 token**，内容连贯、无EOS后填充。测量请求关闭默认stop并按固定token预算截断；任务要求至少1500词以避免自然提前结束。decode速率定义为1024/result.timings.decode_seconds。
+
+首次fixture为261280 token、只剩864输出预算，外部harness在prefill之前拒绝并返回2；该失败 `stage8-long-32768.*`、原fixture与hash均保留。只额外移除512个filler token，120备忘录与问题不变，正式两轮使用同一 `summary-262k-user-v2.txt`，SHA256 `5a2902ead7b4c0db9a049f716984a6796bfcfd58254c81282d657e39959c6675`；校准/源fixture记录 `long-generation-fixture-v2.json`。该校准失败不计成1024生成或接受率通过，也不覆盖旧记录。
+
+| MTP物理窗口 | Main视图token | accepted/drafted | 接受率 | prefill s | decode s | decode tok/s | ready prefill ms | ready decode ms |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| 32768 | 116416 | 659/1089 | 60.514233% | 222.422207 | 186.987679 | 5.476297 | 565.521312 | 169722.7000 |
+| 262144（完整窗口） | 101120 | 648/1121 | 57.805531% | 222.622604 | 195.262946 | 5.244211 | 665.412580 | 177692.9000 |
+
+接受率下降定义为完整窗口减32768窗口：**−2.708702百分点≤5**，本轮长度/接受率门禁通过。一次对照不能声称短窗口稳定更好；两次target验证批/接受轨迹不同，未定位造成输出分歧的原因。**两次1024生成ID并非完全一致**：共同前缀54token，第55个token（0基54）32768为**561**、完整窗口为**19592**，之后生成轨迹不同。本轮未抓这一用例的完整logits，不能证明并列、包络通过或归因于Q5，也没有MTP-off的1024对照；不将接受率通过扩写成长生成贪心一致性通过。第5/6步已通过的64-token贪心/包络结果只对应既有needle/聊天fixture，不证明本摘要输入前64 token一致。本摘要输入的贪心一致性未验证，且已在第55 token观察到两窗口分歧，作为审阅项保留；不在本轮调整D11或数值判据。
+
+32768的预算与上述复用实测相同；完整窗口Main **3417047040 B**，staging **407191552 B**，MTP **553648128 B**，partial **101449728 B**，metadata **164608 B**，general workspace **361906176 B**，host archive仍 **8858370048 B**。完整窗口4096物理页=4sink+4092recent（无需单独guard页）；32768为4sink+507recent+1guard，共512页。统一预算确实将短MTP的空间给Main；旧完整dense MTP **553783296 B**的一个额外页不能与完整window4096页混为一谈。
+
+正式数据 `stage8-long-32768-r2.*` / `stage8-long-262144.*`；摘要 `stage8-long-generation-summary.json`，包含首分歧、命令/二进制/fixtureSHA及NVML采样。外部harness **stage8-long-generation.exe SHA256 d69fe15a783d309bcd4e082442443b07bc725adf7431aaeb0d51929ad37de7af**，只有Engine公开API与fixture容量预检，源码/构建日志均在仓库外，不提交临时测量代码。ready累计GPU事件时间按prefill/decode分开，是一层层等待之和，不等同于端到端停顿或PCIe传输隐藏比例。Nsight未补测：此前计数器权限限制未解除，不以NVML替代tensor/occupancy profile。
+
+### 第 8 步：终版 dense 九例重录（门禁暂未通过）
+
+原金标准是 `1fff2bb6` 提交留存、修复合入后的 `b68009f7` 未插桩实测，保留在仓库外 `kvmem-stage3-attention/baseline`；本轮新目录 `kvmem-stage7-8/dense-final` 不覆盖旧数据。终版产品二进制 SHA256 **fb00037aae6c83d21e4ef561e1edba45f8f42c7007a937267f53fd158e7754e0**，全部用原 fixture 和命令，rk4v4-e8、chunk1024、MTP-3、greedy、CPU vision 参数，CUDA Graph 沿用金标准默认值；关闭临时诊断环境变量。每项记录输入/金标准/二进制哈希、命令、源码 patch 身份、整卡显存和原始 stdout/stderr。
+
+| 用例 | prefill s | decode tok/s | 金标准 token 比较 | needle |
+|---|---:|---:|---|---|
+| synthetic-32k | 14.958 | 149.58 | 64/64 相同 | — |
+| needle-32k-10 | 15.200 | 144.45 | 64/64 相同 | 正确 |
+| needle-32k-90 | 14.959 | 147.87 | 64/64 相同 | 正确 |
+| synthetic-128k | 81.557 | 131.10 | 64/64 相同 | — |
+| needle-128k-10 | 90.408 | 117.17 | 64/64 相同 | 正确 |
+| needle-128k-90 | 91.011 | 118.64 | 64/64 相同 | 正确 |
+| synthetic-262k | 244.387 | 103.27 | 64/64 相同 | — |
+| needle-262k-10 | 244.889 | 102.91 | 第 9 token 271→198，其余 63 相同 | 正确 |
+| needle-262k-90 | 231.552 | 119.39 | 64/64 相同 | 正确 |
+
+九项都退出 0、生成 64 token，MTP 接受率均 100%，六项 needle 均正确，但这些不能代替 **9/9 金标准一致**。第 9 token（0 基 step8）的实际文本是答案后的双换行变为单换行，后续 token 再次一致。当前没有该失败运行的 logits，不能宣称门禁 B 并列或包络通过。历史 `kvmem-stage3-attention/diagnostic/needle-262k-10.top8.json` 的另一运行在此步 top-2 是 271/198、logits23.75/23.625，相差 0.125（该量级一个 BF16 ulp）；旧诊断禁用 Graph 并有读回同步，**不能将其作为本次分歧的 logits 或证实原因**。
+
+性能限制：本轮较旧 dense prefill 数字偏慢，测量期间曾观察到 GPU 软件温度降频标志 Active。仓库外 `dense-thermal-observation.json` 保存了 86°C、2535 MHz、388.55 W 的时间点采样；没有同时间序列的旧基线温度数据，不能将所有差异归因于降频，也不能据本次时间宣称 dense 性能不变。未调整风扇、频率、功率或桌面设置。
+
+源代码 `src/ops` 无 diff。复测采用原第 6 步二进制 **093c014acb6899cc3628f1970ac97e64aad7f278da0e8e2e817eaaf00d791adf** 与终版交替各两次，相同 fixture/参数，目录 `dense-repeat-control`。
+
+| 交替次序 | 二进制 | prefill s | decode tok/s | 64 token 与金标准 |
+|---|---|---:|---:|---|
+| 1 | 第 6 步原版 | 206.852 | 120.47 | 完全一致 |
+| 2 | 第 8 步终版 | 210.235 | 120.35 | 完全一致 |
+| 3 | 第 6 步原版 | 212.606 | 120.21 | 完全一致 |
+| 4 | 第 8 步终版 | 217.006 | 119.63 | 完全一致 |
+
+四次均退出 0、needle 正确、MTP 接受率 100%。这证明同一终版产品二进制在相同参数下有一次分歧、两次匹配，不证明原版也会出现分歧，或本次唯一原因就是 Q5；原版仅复测两次不足以排除第 8 步改动对运行时序/非确定性分布的影响。测试未增加插桩，均未抓分歧步 logits。时间顺序及温度不同，此四次不能作为独立的密集性能回归通过证明。
+
+门禁摘要 `dense-final-gate-result.json` 明确记录 `dense_exit_passed=false`；严格聚合脚本在金标准断言处退出 1，保留 `stage8-summary-gate-failure.log`，没有绕过断言或生成全通过摘要。在这一项解决前，第 8 步不提交/push，阶段 3 不宣告完成；阶段 4 草稿仅保存在仓库外 `stage4-sparse-decode-design.draft.zh-CN.md`，已核对参考 commit/许可、实际接口和 JSONL 格式，尚未安装或编写代码。
+
+### 用户批准后的 dense 组合补验收（2026-10-02，三项均通过）
+
+以上 `dense_exit_passed=false` 和首次 8/9 是原严格判据的历史失败，保留不覆盖。用户随后明确批准三项组合判据，README 已写入以后各阶段沿用的要求；这是看到失败后的事后修订，不是原标准已经通过。
+
+**构建身份与恢复。** 旧版是实际录制金标准的 `b68009f7952741e4d52fa538de51fcd769cf96a3`，终版是父提交 `685cae7c` 加当前第 8 步实现。诊断两边均仅将 Q5 `launch_residual_exact` 的 `kSplits` 从 2 改为 1，并加入相同的完整 logits 读回和计划日志；原 INT8 同步修复本来就在两版中，不重复修改。历史上修复后的 512-token 确定性试验也只需这项 Q5 补丁。两版诊断补丁逻辑 SHA256 均为 `5f044c89afacd7f778434ee12071d4bffbead2a4d25747710855e4be982cd4e1`；诊断旧/终版二进制 SHA256 分别为 `b47e1e9aa57738e622d6deac02e1ebc43394745cfe1950c60d76166a62ad70a6` / `f1c56dd9549ffe59512e470f44622724c4351a97f8eb736803a3a6c2235d39d0`。另存生产算法读回构建，Q5 仍为 2、CUDA Graph 默认开启，无确定性数值修改；两边读回补丁逻辑 SHA 相同。
+
+所有构建、临时补丁、1043 文件的原始字节与 SHA、实际命令和数据都在仓库外 `D:\deeplearning\NInfer\logs\kvmem-stage7-8\dense-composite-gate`。临时源码已撤回，`last-restoration-sha256.json` 核对 **1043/1043 原字节恢复、0 mismatch、临时头文件不存在**，之后才改动本次验收文档。恢复后的产品完整构建退出 **0**（388 个更新动作），全量 CTest **106 项：102 通过、4 缺其他模型制品跳过、0 失败，247.20 s**，日志 `stage8-composite-restored-full-{build,ctest}.log`。构建过程中一次哈希报告工具缺失、一次 CRLF/LF 导致 GGML 适配依赖校验拒绝的失败均保留；后者经确认内容相同后保留已有 checkout 字节重新构建，没有绕过依赖 SHA 校验。
+
+**执行顺序。** 先九例各版各两次（36 个串行运行），每步比较有效完整词表 248077 个 BF16 原值，物理填充 243 项单独记录；任一重复或跨版本差异立即停止并定位。其次核对九组实际 dense 计划、Graph 准备路径与 split 输入，并额外移除显式分块参数确认默认 1024。最后旧/终版生产算法各三次复现分歧用例，抓取完整第 9 步 logits，按既定门禁 B 公式判定。当前尚无三项通过结论，不提交第 8 步或阶段 4 草稿。
+
+**阶段性数据（未完成全部门禁）。** 32K 与 128K 各 synthetic、needle-10、needle-90 共六例，已完成每版两次、共 24 次诊断运行。每例旧版重复、终版重复、两组跨版本比较的有效词表差异均为 **0/15876928**，物理填充差异也为 0；六例实际计划与有序分派日志相同，64 token 全部匹配原金标准，needle 正确。`diagnostic-progress-32k-128k.json` 保存此阶段性快照，仍需 262K 三例、生产计划与并列门禁。另有 `fixture-identity-check.json` 证明九份 fixture SHA 与原金标准记录全部一致；文档修订后的 `post-doc-source-sha-check.json` 确认 **1008 个非文档文件原始字节不变**，临时头文件不存在。launch 策略核对明确区分实际 host split capacity 日志和按相同策略/输入推导的 device active split 范围，不声称取得硬件 profile。
+
+**门禁 1 已完成，通过。** 九例 × 两版 × 两次，共 **36 次独立诊断运行**。每例都逐步比较 64 个生成位置的 248077 项有效词表 BF16 原值；下面的“跨版本”包含第 1/2 次各一组配对，填充 243 项另检，全部为零差异。36 次的 token ID 均匹配原未插桩金标准，六个 needle 每次都答对。诊断用 Q5 单分片、无 CUDA Graph，不作为产品性能数据。
+
+| 用例 | 旧版重复差异项 | 终版重复差异项 | 跨版本两组差异项 | 计划与有序分派日志 |
+|---|---:|---:|---:|---|
+| needle-32k-10 | 0 | 0 | 0 / 0 | 相同 |
+| needle-32k-90 | 0 | 0 | 0 / 0 | 相同 |
+| synthetic-32k | 0 | 0 | 0 / 0 | 相同 |
+| needle-128k-10 | 0 | 0 | 0 / 0 | 相同 |
+| needle-128k-90 | 0 | 0 | 0 / 0 | 相同 |
+| synthetic-128k | 0 | 0 | 0 / 0 | 相同 |
+| needle-262k-10 | 0 | 0 | 0 / 0 | 相同 |
+| needle-262k-90 | 0 | 0 | 0 / 0 | 相同 |
+| synthetic-262k | 0 | 0 | 0 / 0 | 相同 |
+
+证据：`dense-composite-gate/diagnostic-progress.json`、`diagnostic-run.log` 及 `diagnostic/` 下完整 BF16、JSONL、命令、SHA 和原始日志；`dense-launch-policy-comparison.json` 已覆盖九例。量化 prefill 为 `grid=(ceil(T/64),24,1)`、512 threads、92672 bytes shared memory、无 split-K；small-T 比较实际 host capacity/执行 envelope，再按两版相同的 Q24/KV4、split 上限 64 与固定 SM128 策略推导活动 split 范围。未取得 GPU profile，不把推导当设备读回。门禁 2、3 的后续完整结果见下文。
+
+**门禁 2 已完成，通过。** 保持生产 Q5 双分片和原默认 CUDA Graph，用相同临时只读计划日志构建，在模型构造和 Graph 准备后退出，九组原配置各版一次，另外移除 synthetic-32k 的显式分块参数各版一次，共 **20 次启动**。全部整数预算、Main/MTP 每个 plane 的类型/shape/offset/bytes、block table、持久状态、七种 workspace recipe、内核 route/envelope/host split capacity 与 Graph 准备时的有序分派记录完全一致。额外默认检查两版实际 `prefill_chunk=1024`。永久代码的自动 2048 选择受 `normal_tiered` 条件保护，dense 未进入该选择器。九例实际 prefill/decode 的路径和 split 输入另由门禁 1 的运行日志验证；Graph 日志代表准备/捕获调用，不声称每次 replay 的设备 trace。
+
+| dense 上下文 | Main payload bytes / 物理页 | MTP payload bytes / 物理页 | workspace bytes | Graph allowance bytes | runtime reservation bytes |
+|---|---:|---:|---:|---:|---:|
+| 32768 | 570425344 / 512 | 35721216 / 513 | 180969472 | 268435456 | 1395721472 |
+| 131072 | 2281701376 / 2048 | 142675968 / 2049 | 180969472 | 268435456 | 3213964544 |
+| 262144 | 4563402752 / 4096 | 285282304 / 4097 | 180969472 | 268435456 | 5638288640 |
+
+表中两版相同，reservation 是模型权重之外的执行预算，不是整卡显存。每档三个用例一致；各 pool metadata 分别为 2048、8192、16384 bytes。证据 `dense-plan-runtime-comparison.json`、`production-plans/`、`plan-comparison-run.log` 与 `dense-plan-static-audit.{md,json}`。门禁 3 的后续完整结果见下文。
+
+**门禁 3 的方法核对（六次生产运行未完成时记录）。** 收集脚本最初额外把“六次运行的所有候选差距都不超过旧版差距波动”作为聚合条件；这不是既有 `kvmem-stage4-runtime/check_gate_b.py` 的规则。正式验算器 `evaluate_production_gate_b.py` 逐配对沿用原规则：在实际分歧步检查该次参考 dense 的 top-1/top-2 差距是否不超过同前缀参考 dense 各次差距的 `max-min`，并在共同输入前缀（含分歧预测）逐步检查相对 L2 包络。最终版本的差距不加入参考范围，不增大参考包络；收集脚本的额外统计保留并注明不用于门禁。`gate-b-method-correction.json` 记录检查时序、原门禁脚本 SHA 与正式验算器 SHA，这次是撤回未要求的附加条件，原门禁 B 阈值和分歧规则未变。
+
+旧版生产首轮复现同一变化：仅第 9 token **271→198**，其余 63 token 与金标准相同，needle 正确；该步 271/198 的 BF16 logits 均为 **23.75**，差距 **0**。第二轮选 271，分别为 **23.75/23.625**，差距 **0.125**。这些是补测观察，不回填首次终版失败缺失的 logits，也不能仅凭它们断言唯一波动来源。六次完整结果如下。
+
+**门禁 3 已完成，通过。** 两版各三次，Q5 仍为双分片、默认 Graph，只有临时只读日志/完整 logits D2H；不是未插桩性能运行。六次均生成 64 token、needle 正确、MTP 接受率100%；两版各两次选271、一次选198，仅这一步与金标准有变化。greedy `argmax_better()` 对数值相等时选较小 token ID，因此 271/198 精确并列时选择198，规则本身没有改变。
+
+| 版本 / 次数 | 第9 token | logit(271) | logit(198) | top-1/top-2差距 |
+|---|---:|---:|---:|---:|
+| 旧版1 | 198 | 23.750 | 23.750 | 0 |
+| 旧版2 | 271 | 23.750 | 23.625 | 0.125 |
+| 旧版3 | 271 | 23.750 | 23.625 | 0.125 |
+| 终版1 | 271 | 23.750 | 23.625 | 0.125 |
+| 终版2 | 198 | 23.625 | 23.625 | 0 |
+| 终版3 | 271 | 23.625 | 23.500 | 0.125 |
+
+旧版同前缀差距波动 `max-min=0.125`，每个实际分歧配对的参考 dense 差距为0或0.125，全部满足既定并列规则。旧版三次两两完整词表最大相对 L2 **0.3180724314**，包络 **0.6361448628**；旧/终版九配对最大相对 L2 **0.3735287798**，均通过。第9步本身九配对最大相对 L2 **0.0506294616**。共同前缀为8时仍比较第9步预测，因为其输入前缀一致；之后不同轨迹不比较。
+
+| 旧版 / 终版 | 共同生成前缀 | 共同输入上的最大相对L2 | 包络 / 并列 |
+|---|---:|---:|---|
+| 1 / 1 | 8 | 0.0903826434 | 通过 / 通过 |
+| 1 / 2 | 64 | 0.3127665575 | 通过 / 无分歧 |
+| 1 / 3 | 8 | 0.1740525604 | 通过 / 通过 |
+| 2 / 1 | 64 | 0.3153209565 | 通过 / 无分歧 |
+| 2 / 2 | 8 | 0.0784037083 | 通过 / 通过 |
+| 2 / 3 | 64 | 0.3589242144 | 通过 / 无分歧 |
+| 3 / 1 | 64 | 0.3735287798 | 通过 / 无分歧 |
+| 3 / 2 | 8 | 0.1719530001 | 通过 / 通过 |
+| 3 / 3 | 64 | 0.3078849435 | 通过 / 无分歧 |
+
+翻转频率只作补充记录：两版各 **198=1/3、271=2/3**，样本不足以估计稳定概率。单次约237–265 s，未追加至每版10次；需要再跑14次约一小时，用户将此项设为短耗时情况下的可选记录。正式门禁由 `evaluate_production_gate_b.py` 验算，`production-gate-b-summary.json` 保存全部逐步L2与候选；收集脚本附加的全六次差距统计在本组**也通过**，修正验算器不影响本组结论。原始完整logits、命令/输入/二进制SHA、stdout/stderr、许可事件在 `production/`。
+
+**组合结论与源码恢复。** `dense-combined-gate-summary.json` 三项均为true，同时仍记录原首轮严格标准 `dense_exit_passed=false`；不是改写旧失败。九例原fixture SHA不变，临时补丁未提交，1043原文件撤回核对后再次确认1008非文档文件零字节变化、临时头不存在。恢复后产品二进制SHA256为 `295a194dc1bb4b13c43cdfa4f04e3ba3207f5d19a3f8c59212ae8e4d76993372`，与测量二进制的不同构建身份分别保存；实现源码未变，full build/106项CTest的证据及SHA都绑定到恢复后的源码。阶段3退出标准已逐条关闭；追加恢复调度传输 **0 bytes**、回滚 **2162688 bytes=2.0625 MiB**，32768/262144 MTP接受率 **60.514233%/57.805531%**、decode **5.476297/5.244211 tok/s**，长摘要第55token分歧且未额外抓取logits的限制仍保留。第8步提交发布后，阶段4只提交设计文档并停下等审阅。

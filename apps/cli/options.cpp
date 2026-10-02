@@ -212,6 +212,7 @@ Options parse_options(int argc, char** argv) {
             options.kvmem.staging_capacity_bytes = std::size_t(parse_u32(value(arg), "kvmem-staging-mib")) << 20;
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
+            options.prefill_chunk_explicit = true;
         } else if (arg == "--device") {
             options.device = parse_device(value(arg));
         } else if (arg == "--kv-dtype") {

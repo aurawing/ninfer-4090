@@ -1,5 +1,6 @@
 #pragma once
 #include "core/layout.h"
+#include "core/kvmem/planning_error.h"
 #include <ninfer/types.h>
 #include <algorithm>
 #include <stdexcept>
@@ -27,7 +28,7 @@ inline MtpWindowPlan plan_mtp_window(std::uint32_t capacity, std::uint32_t chunk
             "MTP window cannot fit sink, recent pages and provisional guard");
     p.recent_pages = p.physical_pages - p.sink_pages - p.guard_pages;
     if (p.guard_pages && pages(std::min(chunk, capacity)) + 1 > p.recent_pages)
-        throw std::invalid_argument(
+        throw kvmem::TieredPrefillCapacityError(
             "MTP window cannot fit a prefill chunk and its partial boundary page");
     LayoutBuilder b;
     p.block_table =

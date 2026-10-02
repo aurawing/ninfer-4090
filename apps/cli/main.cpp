@@ -290,6 +290,7 @@ int main(int argc, char** argv) {
         engine_options.kv_mode                = cli.kv_mode;
         engine_options.kvmem                  = cli.kvmem;
         engine_options.prefill_chunk          = cli.prefill_chunk;
+        engine_options.prefill_chunk_explicit = cli.prefill_chunk_explicit;
         engine_options.kv_cache               = cli.kv_cache;
         engine_options.speculative            = cli.speculative;
         engine_options.enable_vision          = cli.enable_vision;

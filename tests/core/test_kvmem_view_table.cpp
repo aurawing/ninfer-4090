@@ -286,6 +286,40 @@ void reset_and_invalid_inputs() {
     validate_snapshot(table.snapshot(), 2);
 }
 
+void restore_preserves_surviving_slots_and_hydrates_only_missing_pages() {
+    KVViewTable table(1024, 3, 1, 1);
+    for (std::uint32_t base = 0; base < 384; base += 64)
+        complete(table, table.begin_append(base, 64)[0], 1);
+    // Logical page 4 lives in slot 2, page 5 in slot 1. Keeping those slots
+    // is necessary to avoid copying a valid prefix merely to canonicalize metadata.
+    const auto current = table.snapshot();
+    const auto recent = table.plan_restore(321);
+    require(recent.blocktable[4] == current.blocktable[4] &&
+                recent.blocktable[5] == current.blocktable[5],
+            "restore must preserve existing physical slots of surviving Both pages");
+    require(recent.hydration_pages.empty(), "current partial prefix needs no hydration");
+    table.install_restore(recent);
+    const auto before_revision = table.plan_restore(321);
+    complete(table, table.begin_append(321, 1)[0], 1);
+    rejects([&] { table.install_restore(before_revision); },
+            "revision change in same physical slot must invalidate an existing restore plan");
+    const auto rollback = table.plan_restore(129);
+    require(rollback.hydration_pages == std::vector<std::uint32_t>({1, 2}),
+            "overwritten target pages must reload while surviving sink stays resident");
+    require(rollback.blocktable[0] == current.blocktable[0], "sink physical slot survives rollback");
+    auto forged = rollback;
+    forged.hydration_pages.clear();
+    rejects([&] { table.install_restore(forged); }, "restore hydration metadata must be validated");
+    table.install_restore(rollback);
+    const auto repeated = table.plan_restore(129);
+    require(repeated.hydration_pages.empty() && repeated.blocktable == rollback.blocktable,
+            "repeated restoration must schedule no hydration and preserve all slots");
+    table.install_restore(repeated);
+    require(table.snapshot().generation == repeated.generation,
+            "zero-hydration restore still publishes a fresh generation");
+    rejects([&] { table.install_restore(rollback); }, "old hydration plan must be rejected");
+}
+
 void partial_admission_failure_preserves_all_descriptors() {
     KVViewTable table(512, 3, 1, 1);
     const auto original = table.begin_append(0, 192);
@@ -323,9 +357,10 @@ int main() {
         host_only_partial_page_requires_restore();
         original_logical_number_survives_many_evictions();
         restore_rebuilds_sink_recent_and_partial_frontier();
+        restore_preserves_surviving_slots_and_hydrates_only_missing_pages();
         reset_and_invalid_inputs();
         partial_admission_failure_preserves_all_descriptors();
-        std::cout << "PASS: CPU KV view table (10 cases)\n";
+        std::cout << "PASS: CPU KV view table (11 cases)\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

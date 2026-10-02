@@ -1,4 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/tiered_plan.h"
+#include "targets/qwen3_6/impl/runtime/mtp_window_plan.h"
+#include "runtime/engine/kv_capacity.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -158,6 +160,89 @@ void fixed_staging_floor() {
         require(rejected, "staging must retain its entire additional transfer tile");
     }
 }
+
+struct CpuPlanner {
+    runtime::SequenceCapacityCurve curve;
+    const runtime::SequenceCapacityCurve& capacity_curve() const { return curve; }
+};
+
+// Real tiered pool/staging/partial allocations, with a fixed CPU stand-in for
+// the target's remaining workspace. No CUDA allocator or free-memory query.
+CpuPlanner candidate(const EngineOptions& options) {
+    const auto limits = tiered_page_limits(options.max_context, options.prefill_chunk, options.kvmem);
+    const auto reservation = [&](std::uint32_t pages) {
+        const auto layout = pool(options.max_context, pages);
+        auto bytes = layout.payload_bytes() + layout.metadata_bytes() + plan_tiered_runtime(layout, options.max_context, pages,
+            std::min(options.prefill_chunk, options.max_context), options.kvmem, false, false).bytes;
+        bytes += 8ULL * 1024 * options.prefill_chunk + (32ULL << 20);
+        if (options.speculative.backend == SpeculativeBackend::Mtp)
+            bytes += plan_mtp_window(options.max_context, options.prefill_chunk, options.kvmem).bytes;
+        return bytes;
+    };
+    const auto minimum = reservation(limits.minimum);
+    return {{64, limits.minimum, limits.maximum, minimum,
+             limits.minimum < limits.maximum ? reservation(limits.minimum + 1) - minimum : 0}};
+}
+
+void automatic_prefill_complete_budget() {
+    EngineOptions options;
+    options.max_context = 32768;
+    options.kv_mode = KvMode::TieredExact;
+    options.kvmem.view_tokens = 8192;
+    options.kv_capacity = KvCapacityPolicy::automatic(16ULL << 20);
+    auto large = options;
+    large.prefill_chunk = 2048;
+    const auto large_minimum = candidate(large).curve.minimum_device_reservation_bytes;
+    const auto headroom = options.kv_capacity.automatic_headroom_bytes;
+    const auto ample = runtime::select_prefill_plan(options, false, large_minimum + headroom, candidate);
+    require(ample.prefill_chunk == 2048 && ample.fallback_reason.empty(),
+            "complete 2048 candidate must be selected exactly at its budget boundary");
+    const auto constrained = runtime::select_prefill_plan(options, false, large_minimum + headroom - 1, candidate);
+    require(constrained.prefill_chunk == 1024 && !constrained.fallback_reason.empty(),
+            "one byte below complete 2048 budget must fall back with reason");
+    bool rejected = false;
+    try { (void)runtime::select_prefill_plan(options, false,
+            candidate(options).curve.minimum_device_reservation_bytes + headroom - 1, candidate); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "both infeasible complete candidates must reject loading");
+    options.prefill_chunk_explicit = true;
+    const auto explicit_small = runtime::select_prefill_plan(options, false, large_minimum + headroom, candidate);
+    require(explicit_small.prefill_chunk == 1024 && explicit_small.fallback_reason.empty(),
+            "explicit 1024 must be honored even when 2048 fits");
+    options.prefill_chunk = 2048;
+    rejected = false;
+    try { (void)runtime::select_prefill_plan(options, false, large_minimum + headroom - 1, candidate); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "explicit 2048 must reject instead of silently falling back");
+    options.prefill_chunk_explicit = false;
+    options.prefill_chunk = 128;
+    require(runtime::select_prefill_plan(options, false, large_minimum + headroom, candidate).prefill_chunk == 128,
+            "nondefault API chunk retains backward compatible explicit semantics");
+    options.prefill_chunk = 1024;
+    require(runtime::select_prefill_plan(options, true, large_minimum + headroom, candidate).prefill_chunk == 1024,
+            "shadow default chunk must stay unchanged");
+    options.kv_mode = KvMode::Dense;
+    require(runtime::select_prefill_plan(options, false, large_minimum + headroom, candidate).prefill_chunk == 1024,
+            "dense default chunk must stay unchanged");
+    options.kv_mode = KvMode::TieredExact;
+    options.kvmem.view_tokens = 2048;
+    require(runtime::select_prefill_plan(options, false, large_minimum + headroom, candidate).prefill_chunk == 1024,
+            "2048 view floor failure must try the feasible 1024 candidate");
+    options.kvmem.view_tokens = 8192;
+    options.kvmem.partial_budget_bytes = 64ULL << 20;
+    require(runtime::select_prefill_plan(options, false, large_minimum + headroom, candidate).prefill_chunk == 1024,
+            "2048 partial budget failure must try the feasible 1024 candidate");
+    options.kvmem.partial_budget_bytes = 128ULL << 20;
+    options.speculative.backend = SpeculativeBackend::Mtp;
+    options.kvmem.mtp_window_tokens = 2048;
+    require(runtime::select_prefill_plan(options, false, large_minimum + headroom, candidate).prefill_chunk == 1024,
+            "2048 MTP window floor failure must try the feasible 1024 candidate");
+    bool unrelated = false;
+    try { (void)runtime::select_prefill_plan(options, false, large_minimum + headroom,
+            [](const EngineOptions&) -> CpuPlanner { throw std::invalid_argument("unrelated configuration"); }); }
+    catch (const std::invalid_argument& e) { unrelated = std::string(e.what()) == "unrelated configuration"; }
+    require(unrelated, "fallback must not mask unrelated configuration errors");
+}
 } // namespace
 
 int main() {
@@ -166,6 +251,7 @@ int main() {
         quantized_budgets();
         fixed_staging_floor();
         shadow_reference_policy();
+        automatic_prefill_complete_budget();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

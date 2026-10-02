@@ -32,6 +32,8 @@ void exercise(const char* artifact, HostKVArchiveMode archive, bool mtp) {
     options.speculative.draft_tokens = mtp ? 3 : 0;
     options.speculative.proposal_head = mtp ? ProposalHead::Optimized : ProposalHead::Full;
     Engine engine(options);
+    require(engine.load_summary().prefill_chunk == 128,
+            "load summary must expose the actual selected nondefault API chunk");
     PromptInput first;
     first.options.enable_thinking = false;
     first.options.preserve_thinking = true;

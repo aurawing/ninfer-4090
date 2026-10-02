@@ -263,33 +263,36 @@ struct TieredContext::Impl {
                                    compute));
     }
 
-    void hydrate(const kvmem::KVViewSnapshot& restored) {
+    std::size_t hydrate(const kvmem::KVViewSnapshot& restored) {
+        if (restored.hydration_pages.empty()) return 0;
+        std::size_t scheduled_bytes = 0;
+        const auto& missing = restored.hydration_pages;
+        const auto physical_id_for = [&](std::uint32_t logical) {
+            return lease_ids.at(plan.shadow_validate ? logical :
+                std::uint32_t(restored.blocktable.at(logical)));
+        };
         const auto offset = plan.staging.maximum_layer_stream_bytes;
         for (std::uint32_t layer = 0; layer < 16; ++layer)
             for (std::size_t plane = 0; plane < plan.archive.layers[layer].size(); ++plane) {
                 const auto& spec = plan.archive.layers[layer][plane];
                 const auto tile_pages = kvmem::kHostKVTransferTileBytes / spec.page_bytes;
                 const auto& tensor = main.pool().plane(spec.pool_plane);
-                for (std::size_t first = 0; first < restored.resident.size();) {
+                for (std::size_t first = 0; first < missing.size();) {
                     std::size_t count = 1;
-                    while (first + count < restored.resident.size() && count < tile_pages &&
-                           restored.resident[first + count].logical_page ==
-                               restored.resident[first].logical_page + count) ++count;
+                    while (first + count < missing.size() && count < tile_pages &&
+                           missing[first + count] == missing[first] + count) ++count;
                     auto ticket = transfer.prefetch_completed(layer, plane,
-                        restored.resident[first].logical_page, static_cast<std::uint32_t>(count), offset);
+                        missing[first], static_cast<std::uint32_t>(count), offset);
+                    scheduled_bytes += count * spec.page_bytes;
                     transfer.wait(ticket, compute);
                     const auto staged = transfer.staged(ticket);
                     // Logical host ranges are coalesced. Lease IDs may be noncontiguous.
                     for (std::size_t j = 0; j < count;) {
-                        const auto& page = restored.resident[first + j];
-                        const auto physical_id = lease_ids.at(plan.shadow_validate ? page.logical_page :
-                                                              std::uint32_t(page.physical_slot));
+                        const auto physical_id = physical_id_for(missing[first + j]);
                         std::size_t run = 1;
                         if (tensor.nb[3] == spec.page_bytes)
                             while (j + run < count) {
-                                const auto& next = restored.resident[first + j + run];
-                                if (lease_ids.at(plan.shadow_validate ? next.logical_page :
-                                                 std::uint32_t(next.physical_slot)) != physical_id + run) break;
+                                if (physical_id_for(missing[first + j + run]) != physical_id + run) break;
                                 ++run;
                             }
                         auto* target = static_cast<std::byte*>(tensor.data) + physical_id * tensor.nb[3];
@@ -303,6 +306,7 @@ struct TieredContext::Impl {
             }
         CUDA_CHECK(cudaStreamSynchronize(compute));
         transfer.synchronize();
+        return scheduled_bytes;
     }
 
     void begin(std::uint32_t base, std::uint32_t count, cudaStream_t stream, ExecutionPhase phase) {
@@ -544,6 +548,7 @@ void TieredContext::restore(const TieredSnapshot& saved, cudaStream_t stream) {
         saved.frontier > i.current_frontier || saved.view_generation > i.table.snapshot().generation ||
         saved.archive_generation > i.archive.generation())
         throw std::logic_error("Main snapshot is stale or belongs to a different bundle");
+    const auto started = std::chrono::steady_clock::now();
     // Borrowed host/device pointers stay live until both workers and consumers are drained.
     i.drain();
     const auto restored = i.table.plan_restore(saved.frontier);
@@ -552,7 +557,7 @@ void TieredContext::restore(const TieredSnapshot& saved, cudaStream_t stream) {
     i.writes.clear();
     i.write_ids.clear();
     i.tickets.clear();
-    i.hydrate(restored);
+    const auto scheduled_bytes = i.hydrate(restored);
     i.table.install_restore(restored);
     i.snapshot = i.table.snapshot();
     i.current_frontier = restored.frontier;
@@ -560,6 +565,12 @@ void TieredContext::restore(const TieredSnapshot& saved, cudaStream_t stream) {
     i.next_layer = 16;
     i.publish();
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::clog << "[kvmem-restore] frontier=" << restored.frontier
+              << " retained_pages=" << restored.resident.size() - restored.hydration_pages.size()
+              << " missing_pages=" << restored.hydration_pages.size()
+              << " scheduled_h2d_bytes=" << scheduled_bytes
+              << " elapsed_ms=" << std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - started).count() << '\n';
 }
 
 void TieredContext::trim(std::uint32_t frontier, cudaStream_t stream) {

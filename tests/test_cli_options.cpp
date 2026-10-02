@@ -75,6 +75,15 @@ int main() {
                           engine_defaults.vision_cpu_memory_mib == 4096,
                       "Engine Vision defaults mismatch");
     const auto defaults = parse({});
+    failures += check(defaults.prefill_chunk == 1024 && !defaults.prefill_chunk_explicit &&
+                          !engine_defaults.prefill_chunk_explicit,
+                      "default prefill chunk must remain implicit for runtime selection");
+    for (const char* chunk : {"1024", "2048"}) {
+        const auto explicit_chunk = parse({"--prefill-chunk", chunk, "--kv-mode", "tiered-exact"});
+        failures += check(explicit_chunk.prefill_chunk_explicit &&
+                              explicit_chunk.prefill_chunk == std::stoul(chunk),
+                          "CLI explicit chunk value and provenance must survive parsing");
+    }
     failures += check(defaults.kvmem.mtp_window_tokens==32768 && engine_defaults.kvmem.mtp_window_tokens==32768,"MTP window defaults mismatch");
     failures += check(parse({"--kvmem-mtp-window","8192"}).kvmem.mtp_window_tokens==8192,"MTP window value lost");
     failures += check(engine_defaults.vision_cpu_cache_mib == 128 && defaults.vision_cpu_cache_mib == 128,

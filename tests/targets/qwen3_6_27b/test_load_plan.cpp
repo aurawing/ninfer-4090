@@ -216,7 +216,25 @@ int verify_profile_mismatch_rejection() {
     options.use_cuda_graph = false;
     auto planner = Package::make_sequence_planner(device, options, WeightsProfile::GroupwiseInt);
     const std::uint32_t pages = planner.capacity_curve().minimum_main_page_groups;
-    auto sequence             = std::move(planner).finalize(pages);
+    const auto planned_bytes = planner.capacity_curve().reservation_bytes(pages);
+    auto moved = std::move(planner);
+    if (planner.capacity_curve().minimum_main_page_groups != 0 ||
+        moved.capacity_curve().reservation_bytes(pages) != planned_bytes) {
+        std::cerr << "planner move did not transfer ownership and preserve the capacity curve\n";
+        return 1;
+    }
+    bool empty_rejected = false;
+    try { (void)std::move(planner).finalize(pages); }
+    catch (const std::logic_error&) { empty_rejected = true; }
+    if (!empty_rejected) {
+        std::cerr << "moved-from planner unexpectedly finalized\n";
+        return 1;
+    }
+    auto sequence = std::move(moved).finalize(pages);
+    if (sequence.device_reservation_bytes() != planned_bytes) {
+        std::cerr << "moved planner finalized a different reservation\n";
+        return 1;
+    }
     RuntimeModelView empty_model;
     try {
         (void)ninfer::targets::qwen3_6::create_program<Variant>(
