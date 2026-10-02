@@ -719,4 +719,17 @@ before 字节按旧版“全部驻留页×全部层/plane”的实际规划及�
 
 新增 [stage4-sparse-implementation-plan.zh-CN.md](stage4-sparse-implementation-plan.zh-CN.md)：全部文档先于实现，4.1 Mean-K/FP64/部分prefix、4.2 GPU score/CPU selector、4.3 query span/三槽Q/Main snapshot、4.4完整exact-prefill到sparse eager。每步新CTest、当时全量CTest、progress和证据完成后，由主任务分别commit/push；4.4终版对新增GPU owner/kernel跑 compute-sanitizer 13.0.85 的 racecheck/synccheck/initcheck，并保持三项dense组合门禁。4.4仅C=1/Graph=off，完成后停审，Graph及ordinary/MTP capture性能门禁下一轮。
 
-4.4合成矩阵固定为128K/262K contexts×128K/32K views×至少3位置×2 denominators×3次独立运行；既有单条长input needle依D9合法soften，另加结构化历史/短query fixture，记录页统计、TTFT分解、H2D/compute、hydrate bytes、decode与MTP。128K视图对dense rk4，32K对tiered-exact INT8。**本轮目前只有文档修订，未开始阶段4代码/构建/GPU验收；真实多文件/工具矩阵未验收，Graph/capture性能门禁未验收，合成测试不能替代。**
+4.4合成矩阵固定为128K/262K contexts×128K/32K views×至少3位置×2 denominators×3次独立运行；既有单条长input needle依D9合法soften，另加结构化历史/短query fixture，记录页统计、TTFT分解、H2D/compute、hydrate bytes、decode与MTP。128K视图对dense rk4，32K对tiered-exact INT8。文档提交时尚未开始阶段4代码/构建/GPU验收，后续实施进度见下文。**真实多文件/工具矩阵未验收，Graph/capture性能门禁未验收，合成测试不能替代。**
+
+### 4.1 算子与主机索引基础验收（2026-10-03）
+
+- 文档修订 `8e5f0b59` 已独立提交并推送到 `origin/feat/kvmem`。实际代码基线仍为阶段3终版 `c4f145e5`；当前先实现 Mean-K GPU 数学和主机索引 continuation，frontend/运行时接线按后续4.3、4.4执行，产品入口暂未解除拒绝。
+- 实施前静态核对：`qn/kn` 分别为连续 BF16 `[256,24,T]` / `[256,4,T]`，捕获位于 RMSNorm 后、原地 RoPE 前。普通解码也使用 `Phase::Verify`，故不得由该枚举决定 provisional；必须使用显式事务种类，并按 Program 最终 Main accepted frontier 提交。ledger 的待生成 token 不进入索引；全接受的 verify 也必须显式提交，不能依赖 trim 才提交。多页 GPU 累加的旧尾页 seed 与新尾页 sum 输出必须分离，避免不同 CTA 共享地址读写竞争。
+- 后续4.4需要扩展现有视图的任意 selection 规划与保护驱逐，并补传输 poison 恢复：现有传输 worker 错误会停止，`reset()` 经 `synchronize()` 仍重抛错误，不能直接当作 DMA 失败恢复。静态研究记录在仓库外 `D:/deeplearning/NInfer/logs/kvmem-stage4-sparse/runtime-research.md`；这不是运行验收结果。
+- 新数据和原始日志目录为仓库外 `D:/deeplearning/NInfer/logs/kvmem-stage4-sparse`。已保存阶段3既有 `src/ops` 的 SHA-256 清单，供最终核对 dense 内核与分派未修改；所有既有数据保留。
+- 待测合成输入清单已冻结到该目录的 `synthetic-matrix-inputs.json`：6份单条长user输入、72次规划运行，插入位置10%/50%/90%。10%和90%沿用原fixture字节及SHA，50%使用相同生成方法；终版frontend仍须核对各输入实际token数。**尚未执行这些稀疏运行**，结构化历史加本轮query样例另行补充。
+- 新增 `test_meank_accumulate` 的初始RED：构建exit0、CTest exit8；后续“trim后未来snapshot仍有效”的回归RED也保留。独立FP64→FP16 RNE oracle覆盖1/63/64/65/129、跨chunk、偶/奇halfway、8次逐位重复、非阻塞流；owner测试包含两份拥有型snapshot、16层统一发布、部分45→48→46重放、旧/foreign/重复ticket拒绝、provisional接受0/2/16及63→79完整跨页接受，后者不依赖generic trim。
+- 两轮全量构建/CTest均exit0，107项：103通过、4跳过、0失败，分别259.45 s与239.56 s。跳过为缺少Qwen3.6-27B专用prefix制品、35B-A3B制品及其DFlash制品，未用Qwen3.8-27B替代。终版代码质量与规格审阅通过，建议后续增加各层不同数值及带符号/消去敏感输入。既有313个`src/ops`文件SHA逐字节不变；这不是4.4终版dense组合门禁。
+- **提交前首次sanitizer失败保留**：`4.1-final-v1-racecheck.log`为0 hazard，synccheck为0 error；initcheck exit99、4032 errors。错误为测试夹具`provisional()`的cudaMemcpy D2H source：读131072 bytes全tail，但只写2048 bytes一个有效tail token；余下129024 bytes恰为4032个32-byte未初始化段。修正为仅回读有效prefix，另外已初始化的整tail保留/拒绝后缀检查不删除，没有增加全缓冲清零来隐藏错误，生产算子未改。定向测试及两项独立审阅复核均通过。
+- **终版门禁**：`full_checks.ps1 -Stage 4.1-final-v3`构建exit0（无待编译文件）、全量CTest exit0，107项中103通过、4制品缺失跳过、0失败，233.94 s。`run_sanitizers.py --stage 4.1-final-v3 --test D:/VSCodeProjects/ninfer-4090/build-vision-integration/tests/test_meank_accumulate.exe`使用compute-sanitizer 13.0.85，依次以`--tool racecheck|synccheck|initcheck --error-exitcode 99`执行，三项均exit0，0 hazard/0 error；终版测试二进制SHA256 `c08630741654775df875ea6e259b109e363e0df96469b744754f6176766370a6`。原始日志、完整命令、8个新源码SHA、现有313文件零变更核对及测试数量在`4.1-final-evidence.json`。
+- 262K、L16/H4/D256、最大分块2048的**布局计算**：固定主机索引128 MiB；设备active/base/seed/output各64 KiB，共256 KiB；BF16 tail2 MiB、provisional512 KiB；最大33页FP16 patch1.03125 MiB、counts64 bytes。主机active/base128 KiB、两份snapshot最大128 KiB、待发布mean/sum patch1.09375 MiB；准入helper合并这些主机payload与4 GiB余量，4 GiB只应在统一准入时计一次。§8账本已同步。该数值不是生产模型的实际加载分配；统一Main加载准入、DMA协调器、模型pre-RoPE hook及最终accepted提交在4.3–4.4接线，`kvmem`入口当前仍拒绝，不把本步独立算子验收写成端到端完成。

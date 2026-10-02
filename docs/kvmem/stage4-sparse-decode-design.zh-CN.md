@@ -53,7 +53,7 @@ Main snapshot 增加有界派生状态：尾页逻辑号、valid_count、该精�
 
 restore/trim 先排空旧 GPU consumers、DMA 与评分任务，再截断更晚页的 index，有效尾页恢复其 snapshot prefix sum/count，重新形成 FP16 mean，并递增 generation。旧 D2H completion、score result、selection plan 不得发布。普通 verify trim 使用尚存 provisional/tail 资料；任意历史 checkpoint trim 必须有该 frontier 的快照资料，不能无依据恢复。
 
-每个活动 prefix sum 带 `base_frontier`：有界 tail/provisional scratch 只能恢复自该基点以后仍保存的贡献。restore 到 checkpoint 后，不能假设先前 tail BF16 资料也被恢复；将保存的 sum作为新基点，后续新贡献独立记录。没有对应 snapshot或完整独立前缀资料时，向 base之前 trim必须拒绝该索引操作并走合法checkpoint/冷启动重算，不能用 FP16mean 或 postRoPE量化KV补算。测试区分“accepted长度回退到本次verify基点”与“任意历史前缀截断”。
+每个活动 prefix sum 带 `base_frontier`：有界 tail/provisional scratch 只能恢复自该基点以后仍保存的贡献。restore 到 checkpoint 后，不能假设先前 tail BF16 资料也被恢复；将保存的 sum作为新基点，后续新贡献独立记录。基点sum与活动sum必须独立保存，追加改变活动sum时不得覆盖基点；例如恢复45、追加到48、截断到46，要从45的sum加第45个token重放，不能用48的sum或FP16 mean倒推。跨页后基点改为新页边界，sum归零。没有对应 snapshot或完整独立前缀资料时，向 base之前 trim必须拒绝该索引操作并走合法checkpoint/冷启动重算，不能用 FP16mean 或 postRoPE量化KV补算。测试区分“accepted长度回退到本次verify基点”与“任意历史前缀截断”。
 
 ## 3. 用户 Q 的范围与 continuation 接口提案
 
@@ -159,7 +159,8 @@ GPU scoring、CPU selection、hydrate、列表上传与回写完成管理在 gra
 | 新资源，262K/M16示例 | 字节/性质 | 规划要求 |
 |---|---|---|
 | 主机 FP16 Mean-K | 128 MiB | `ceil(max_context/64)×16×4×256×2`，固定stride；archive pinned 时 cacheable pinned 直传并计额外准入，否则 pageable 经既有环 |
-| 活动尾页及snapshot FP32 sum | 合计192 KiB | 活动64 KiB加checkpoint/retained各64 KiB，最多两份snapshot |
+| GPU FP32 continuation/事务sum | 256 KiB | active、独立base、只读seed、output各64 KiB；跨页CTA不能覆写共享seed |
+| 主机 FP32 continuation与snapshot | 256 KiB | active/base各64 KiB；checkpoint/retained snapshot各64 KiB，最多两份snapshot |
 | 有界 BF16尾页资料 | 2 MiB | 64×16×4×256×2，尾页回滚恢复资料 |
 | provisional BF16 K | T16为512 KiB | 按最大verify有效列规划，跨页资料不覆盖原尾页 |
 | 主机用户 Q | 三份BF16共9 MiB | active/checkpoint/retained最多三个可分页槽；任务只借用槽，无 CPU FP32 展开 |
@@ -167,7 +168,8 @@ GPU scoring、CPU selection、hydrate、列表上传与回写完成管理在 gra
 | GPU Mean-K / Q 评分输入 | 全索引上限128 MiB；Q BF16 3 MiB | 按加载期方案整体或tile alias空闲staging；Q可复用已完成device capture或固定上传区，列明地址与独占事件 |
 | GPU 两遍统计/score scratch | 6144行FP32 `(m,l)` 为48 KiB，页score为16 KiB，另固定tile归约空间 | alias空闲partial/staging，固定树与固定L/H/M累加；不需两worker logits或CPU层结果 |
 | 主机 score / selection | P4096时FP32 score 16 KiB，另有界plan/list | score D2H完成后CPU pure selector；cacheable pinned D2H bounce加载期规划或证明既有环可借用 |
-| chunk sum/mean设备输出 | `L×touched_pages×KVH×D×4/2` | T2048且起点非页齐最多33页，GPU FP32约2.0625 MiB、GPU FP16约1.03125 MiB；不可只计尾页64KiB |
+| chunk FP16 mean设备输出 | T2048最大1.03125 MiB，另64 bytes counts | 起点非页齐最多33页，`L×touched_pages×KVH×D×2`；每页sum在寄存器累加，输出仅保留最终部分页FP32 sum，已计入上方固定sum区 |
+| 主机待发布mean/sum patches | T2048最大1.09375 MiB | 1.03125 MiB mean加64 KiB sum；全部16层ready后再统一发布，避免部分层新旧generation混用 |
 | Mean-K D2H中转 | 上述示例cacheable pinned 1.03125 MiB | pageable路径覆盖最大chunk mean输出；pinned索引可直接D2H到固定stride切片，均以事件保护 |
 | selection列表；后续graph descriptor | O(actual_view_pages) | eager列表固定上限与地址；graph descriptor下一轮规划，现有partial/staging/归档预算继续保留 |
 
@@ -175,7 +177,7 @@ GPU scoring、CPU selection、hydrate、列表上传与回写完成管理在 gra
 
 上表的capture/snapshot最大份数为加载期硬上限；配置的最大N/T会改变每槽字节，不能只按示例M16分配后接收更大请求。GPU scorer、DMA和后续graph在槽上各有明确借用结束事件；新请求、替换checkpoint、retained覆盖和reset按同一资源账本释放，计入外部日志的高水位。CPU视觉仍在prefill前同步完成，不与最多两个传输worker重叠；D15不承担评分线程契约。
 
-为闭合首版资源账本，尾页BF16/provisional资料在GPU，64 KiB活动sum在GPU，两份snapshot sum在主机；Q原值三主机槽、device capture与pinned bounce合计15 MiB，bounce不可作为持久capture句柄。新增主机索引/中转字节计入D4/D14的可用物理内存和锁页准入，不能在分配8.25 GiB归档后漏计128 MiB pinned索引。设备评分区按加载期生命周期alias取峰值，不把空闲staging/partial重复计费，也不能在hydrate或下一轮exact prefill时继续占用。pinned归档无既有256 MiB环，pageable才复用该环；任何替代中转方案均需列账和事件证明，运行期不得分配。
+为闭合首版资源账本，尾页BF16/provisional资料在GPU，active/base/seed/output sum为四个独立设备区；主机保存active/base镜像及最多两份snapshot sum，待发布patch另列。Q原值三主机槽、device capture与pinned bounce合计15 MiB，bounce不可作为持久capture句柄。新增主机索引/中转字节计入D4/D14的可用物理内存和锁页准入，不能在分配8.25 GiB归档后漏计128 MiB pinned索引。设备评分区按加载期生命周期alias取峰值，不把空闲staging/partial重复计费，也不能在hydrate或下一轮exact prefill时继续占用。pinned归档无既有256 MiB环，pageable才复用该环；任何替代中转方案均需列账和事件证明，运行期不得分配。
 
 ## 9. 实施文件与参考移植
 

@@ -8,11 +8,13 @@
 
 - [ ] 在Q/K RMSNorm后、RoPE前捕获归一化BF16 K，按原缓存ordinal累加固定顺序FP32 sum/count，页mean以FP16 RNE发布；完整页除64，部分页除实际有效count，禁止FP16 mean×count恢复sum。
 - [ ] 实现固定最大stride的主机索引、加载期准入与D2H事件。archive pinned时额外cacheable pinned Mean-K计入准入并可直传；pageable经既有环。运行期不申请CUDA/锁页内存，不重解释F增长后的旧地址。
-- [ ] 有界tail BF16/provisional K、accepted-only commit、64 KiB精确prefix sum continuation及generation；普通verify回退与任意历史snapshot restore分开，禁止无snapshot trim到base之前，禁止用post-RoPE量化K补算。
-- [ ] 新增Mean-K CTest，用独立FP64 oracle覆盖1/63/64/65 token、跨chunk/轮次、FP16 RNE、部分封存、非64 frontier、provisional接受/拒绝/跨页、snapshot后尾页写满/驱逐及旧completion拒绝。
+- [x] 有界tail BF16/provisional K、accepted-only commit、64 KiB精确prefix sum continuation及generation；普通verify回退与任意历史snapshot restore分开，禁止无snapshot trim到base之前，禁止用post-RoPE量化K补算。
+- [x] 新增Mean-K CTest，用独立FP64 oracle覆盖1/63/64/65 token、跨chunk/轮次、FP16 RNE、部分封存、非64 frontier、provisional接受/拒绝/跨页、snapshot后尾页写满/驱逐及旧completion拒绝。
 - [ ] 定向CTest与**全量CTest**通过；保存命令、输出、编译/二进制身份及实际测试数量/跳过原因，更新progress。主任务审阅后独立commit/push，记录结果再进入4.2。
 
 本步只建立数学和恢复基础，不解除KVMem产品入口拒绝，不修改dense kernel/dispatch。
+
+4.1基础门禁已通过：107项全量CTest为103通过、4制品缺失跳过、0失败，终版三项sanitizer为0 hazard/0 error，规格及代码质量审阅通过。前两条涉及真实模型hook、统一加载准入和DMA协调器的接线核验保留至4.3–4.4，不能仅由独立算子通过提前勾选。提交/推送记录见progress与仓库外证据索引。
 
 ## 4.2 确定性GPU评分与CPU纯选择器
 
