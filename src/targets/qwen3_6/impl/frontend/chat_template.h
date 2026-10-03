@@ -75,11 +75,24 @@ struct ChatRenderOptions {
     std::optional<bool> preserve_thinking;
     bool add_vision_id = false;
     std::vector<std::string> tool_jsons;
+    bool collect_input_spans = false;
+    std::optional<std::size_t> current_input_message;
 };
 
+struct ByteSpan {
+    std::size_t begin = 0, count = 0;
+};
+struct RenderedInputSpans {
+    bool available = false;
+    std::size_t current_message = 0;
+    std::optional<std::size_t> source_query_message;
+    std::vector<std::size_t> source_query_messages;
+    std::vector<ByteSpan> current, query, source_query, all_user_text;
+};
 struct RenderedChat {
     std::string text;
     std::optional<std::size_t> turn_rewrite_byte_offset;
+    RenderedInputSpans input_spans;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {

@@ -13,6 +13,15 @@ struct EncodeOptions {
     bool parse_added_tokens = true;
 };
 
+struct SourceByteSpan {
+    std::size_t begin = 0;
+    std::size_t count = 0;
+};
+struct EncodedOffsets {
+    std::vector<int> ids;
+    std::vector<SourceByteSpan> source;
+};
+
 struct DecodeOptions {
     bool skip_special_tokens = false;
     std::vector<int> stop_token_ids;
@@ -39,6 +48,8 @@ public:
     explicit Tokenizer(TokenizerResources resources);
 
     std::vector<int> encode(std::string_view text, EncodeOptions options = {}) const;
+    // Full original encode plus source coverage. Never tokenizes at message boundaries.
+    EncodedOffsets encode_with_offsets(std::string_view text, EncodeOptions options = {}) const;
     std::string decode(std::span<const int> ids, DecodeOptions options = {}) const;
     std::string decode_token_bytes(int id, bool skip_special_tokens = false) const;
 

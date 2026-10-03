@@ -365,6 +365,24 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
                 *rendered.turn_rewrite_byte_offset = boundary - needle.size() + replacement.size();
             }
         }
+        const auto adjust = [&](std::vector<ByteSpan>& spans) {
+            for (auto& span : spans) {
+                const auto end = span.begin + span.count;
+                const auto map_boundary = [&](std::size_t value) {
+                    if (value <= position) return value;
+                    if (value >= position + needle.size())
+                        return value - needle.size() + replacement.size();
+                    throw std::logic_error("input provenance boundary intersects media placeholder");
+                };
+                const auto begin = map_boundary(span.begin);
+                span.count = map_boundary(end) - begin;
+                span.begin = begin;
+            }
+        };
+        adjust(rendered.input_spans.current);
+        adjust(rendered.input_spans.query);
+        adjust(rendered.input_spans.source_query);
+        adjust(rendered.input_spans.all_user_text);
         rendered.text.replace(position, needle.size(), replacement);
         search = position + replacement.size();
     }
@@ -520,7 +538,32 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered) {
     EncodedChat encoded;
-    encoded.input_ids = tokenizer.encode(rendered.text);
+    if (rendered.input_spans.available) {
+        auto offsets = tokenizer.encode_with_offsets(rendered.text);
+        encoded.input_ids = std::move(offsets.ids);
+        encoded.input_spans.available = true;
+        encoded.input_spans.current_message = rendered.input_spans.current_message;
+        encoded.input_spans.source_query_message = rendered.input_spans.source_query_message;
+        encoded.input_spans.source_query_messages = rendered.input_spans.source_query_messages;
+        const auto project = [&](const std::vector<ByteSpan>& source) {
+            std::vector<qwen3_6::TokenSpan> spans;
+            for (std::size_t token = 0; token < offsets.source.size(); ++token) {
+                const auto& origin = offsets.source[token];
+                const bool contained = std::any_of(source.begin(), source.end(), [&](const auto& s) {
+                    return origin.begin >= s.begin && origin.begin + origin.count <= s.begin + s.count;
+                });
+                if (!contained) continue;
+                if (!spans.empty() && spans.back().begin + spans.back().count == token)
+                    ++spans.back().count;
+                else spans.push_back({token, 1});
+            }
+            return spans;
+        };
+        encoded.input_spans.current = project(rendered.input_spans.current);
+        encoded.input_spans.query = project(rendered.input_spans.query);
+        encoded.input_spans.source_query = project(rendered.input_spans.source_query);
+        encoded.input_spans.all_user_text = project(rendered.input_spans.all_user_text);
+    } else encoded.input_ids = tokenizer.encode(rendered.text);
     if (!rendered.turn_rewrite_byte_offset) { return encoded; }
     if (*rendered.turn_rewrite_byte_offset > rendered.text.size()) {
         throw std::logic_error("turn rewrite byte offset exceeds rendered chat");
@@ -588,6 +631,10 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
             throw;
         }
         media.item.content_digest = sha256(part->media.bytes);
+        media.item.occurrence_id = items.size();
+        for (std::size_t message = 0; message < messages.size(); ++message)
+            for (const auto& candidate : messages[message].parts)
+                if (&candidate == part) media.item.source_message = message;
         if (media.patches.size() % kPatchFeatures != 0) {
             throw std::logic_error("preprocessed patch buffer is not row aligned");
         }
@@ -605,6 +652,7 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
     EncodedChat encoded          = encode_rendered_chat(tokenizer_, rendered);
     output.input_ids             = std::move(encoded.input_ids);
     output.turn_rewrite_boundary = encoded.turn_rewrite_boundary;
+    output.input_spans = std::move(encoded.input_spans);
     output.token_types.resize(output.input_ids.size(), 0);
     for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
         if (output.input_ids[i] == kImageToken) {

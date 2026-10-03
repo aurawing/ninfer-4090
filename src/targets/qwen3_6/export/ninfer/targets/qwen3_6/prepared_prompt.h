@@ -27,9 +27,26 @@ struct TokenSpan {
     std::size_t count = 0;
 };
 
+struct PromptInputSpans {
+    bool available = false; // raw prepare_tokens has no role provenance
+    std::size_t current_message = 0;
+    // Last source message is a convenience hint; source_query_messages/spans
+    // carry all users in an explicit input event.
+    std::optional<std::size_t> source_query_message;
+    std::vector<std::size_t> source_query_messages;
+    std::vector<TokenSpan> current;
+    std::vector<TokenSpan> query; // new user text only
+    std::vector<TokenSpan> source_query; // original user text, including tool continuation
+    // Role-proven user text for validating a saved capture's actual ordinals.
+    // Historical rows are never implicitly selected as a new query.
+    std::vector<TokenSpan> all_user_text;
+};
+
 struct VisionItem {
     PromptModality modality = PromptModality::Image;
     VisionGrid grid;
+    std::size_t occurrence_id = 0;
+    std::size_t source_message = 0;
     std::size_t patch_begin = 0;
     std::size_t patch_count = 0;
     // SHA-256 of the owned encoded media bytes. Grid/modality/span identity is carried
@@ -61,6 +78,7 @@ struct PreparedPromptData {
     std::vector<float> patches;
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;
+    PromptInputSpans input_spans;
     bool starts_in_reasoning = false;
     PrepareStats prepare;
 

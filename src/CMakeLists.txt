@@ -34,6 +34,7 @@ add_library(ninfer_core STATIC
   core/kvmem/host_kv_transfer.cpp
   core/kvmem/kv_view_table.cpp
   core/kvmem/host_meank_index.cpp
+  core/kvmem/query_capture.cpp
   core/kvmem/scoring_resources.cpp
   core/kvmem/selection_plan.cpp
   core/linear_attention_state.cpp

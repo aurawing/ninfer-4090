@@ -4,6 +4,7 @@
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
+#include "targets/qwen3_6/impl/runtime/sparse_capture_owner.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -243,6 +244,213 @@ bool throws_invalid_argument(Callable&& callable) {
         callable();
     } catch (const std::invalid_argument&) { return true; }
     return false;
+}
+
+FrontendResources provenance_resources() {
+    auto result = resources();
+    auto json = nlohmann::json::parse(result.tokenizer_json);
+    for (int b = 0; b < 256; ++b) {
+        const auto symbol = byte_level_symbol(static_cast<std::uint8_t>(b));
+        if (!json["model"]["vocab"].contains(symbol)) json["model"]["vocab"][symbol] = 1000 + b;
+    }
+    json["model"]["vocab"]["xy"] = 2000;
+    json["model"]["merges"].push_back(nlohmann::json::array({"x", "y"}));
+    result.tokenizer_json = json.dump();
+    return result;
+}
+
+ninfer::ChatMessage input_message(std::string role, std::string content) {
+    ninfer::ChatMessage message;
+    message.role = std::move(role);
+    message.parts.push_back({.text = std::move(content)});
+    return message;
+}
+
+std::vector<std::size_t> ordinals(const std::vector<ninfer::targets::qwen3_6::TokenSpan>& spans) {
+    std::vector<std::size_t> result;
+    for (const auto& span : spans)
+        for (std::size_t t = span.begin; t < span.begin + span.count; ++t) result.push_back(t);
+    return result;
+}
+
+int test_query_provenance(const Frontend&) {
+    int failures = 0;
+    const auto owned = provenance_resources();
+    const auto frontend = FrontendFactory::create_component(owned, true, 8192, true);
+    const auto dense_frontend = FrontendFactory::create_component(owned);
+    const fi::Tokenizer tokenizer({owned.tokenizer_json, owned.tokenizer_config_json,
+                                    owned.generation_config_json});
+    // Full encode identity, NFC composition/reordering, Hangul, fallback, and BPE boundary.
+    for (const std::string text : {std::string("xxyxx"), std::string("e\xcc\x81"),
+                                  std::string("a\xcc\x81\xcc\xa7"),
+                                  std::string("\xe1\x84\x80\xe1\x85\xa1\xe1\x86\xa8"),
+                                  std::string("<think>xy\xf0\x9f\x98\x80</think>")}) {
+        const auto encoded = tokenizer.encode_with_offsets(text);
+        failures += check(encoded.ids == tokenizer.encode(text), "provenance changed full encode IDs");
+        failures += check(encoded.source.size() == encoded.ids.size(), "missing fallback offsets");
+        for (const auto& source : encoded.source)
+            failures += check(source.count > 0 && source.begin + source.count <= text.size(),
+                              "NFC token source outside original bytes");
+    }
+    const auto nfc = tokenizer.encode_with_offsets("e\xcc\x81");
+    failures += check(nfc.source.front().begin == 0 && nfc.source.front().count == 3,
+                      "NFC composition lost combining source bytes");
+    const auto hangul = tokenizer.encode_with_offsets("\xe1\x84\x80\xe1\x85\xa1\xe1\x86\xa8");
+    failures += check(hangul.source.front().count == 9, "Hangul was normalized per codepoint");
+
+    const auto merged = tokenizer.encode_with_offsets("xy");
+    failures += check(merged.ids == std::vector<int>{2000} && merged.source[0].begin == 0 &&
+                      merged.source[0].count == 2, "BPE merge lost source boundary coverage");
+    ninfer::PromptInput split;
+    auto split_user = input_message("user", "x");
+    split_user.parts.push_back({.text = "y"});
+    split.messages.push_back(split_user);
+    auto split_prompt = frontend.prepare(split);
+    const auto& split_data = FrontendFactory::inspect(split_prompt);
+    failures += check(ordinals(split_data.input_spans.query).size() == 1 &&
+                      split_data.token_ids[split_data.input_spans.query.front().begin] == 2000,
+                      "text parts were tokenized separately across BPE boundary");
+    split.messages.front().parts = {{.text = "e"}, {.text = "\xcc\x81"}};
+    auto split_nfc = frontend.prepare(split);
+    failures += check(ordinals(FrontendFactory::inspect(split_nfc).input_spans.query).size() == 2,
+                      "text parts were normalized separately across NFC boundary");
+
+    ninfer::PromptInput input;
+    input.messages = {input_message("system", "history system"), input_message("user", "old user"),
+                      input_message("assistant", "old answer"), input_message("user", "xxxxxxxxxxxxxxxxxxxx")};
+    auto prepared = frontend.prepare(input);
+    const auto& data = FrontendFactory::inspect(prepared);
+    auto dense_prompt = dense_frontend.prepare(input);
+    failures += check(data.token_ids == FrontendFactory::inspect(dense_prompt).token_ids &&
+                      !FrontendFactory::inspect(dense_prompt).input_spans.available,
+                      "metadata changed dense full prompt IDs or default dense path");
+    failures += check(data.input_spans.available && data.input_spans.current_message == 3,
+                      "cold-start history became current input");
+    const auto query = ordinals(data.input_spans.query);
+    failures += check(query.size() == 20 && data.input_spans.query.front().begin > 0,
+                      "query contains template/system/assistant/history");
+    failures += check(data.input_spans.current.front().begin < query.front() &&
+                      data.input_spans.current.back().begin + data.input_spans.current.back().count <
+                          data.token_ids.size(), "current input includes generation header");
+    input.messages.push_back(input_message("assistant", "call"));
+    input.messages.push_back(input_message("tool", "result one"));
+    input.messages.push_back(input_message("tool", "result two"));
+    auto continued = frontend.prepare(input);
+    const auto& tool = FrontendFactory::inspect(continued);
+    failures += check(tool.input_spans.query.empty() && tool.input_spans.current_message == 5 &&
+                      ordinals(tool.input_spans.source_query) == query,
+                      "tool user wrapper became new query or lost original query");
+    input.current_input_message = 3;
+    auto explicit_event = frontend.prepare(input);
+    failures += check(FrontendFactory::inspect(explicit_event).input_spans.query.size() == 1,
+                      "explicit event start ignored");
+    ninfer::PromptInput multiple;
+    multiple.messages = {input_message("user", std::string(20, 'x')), input_message("user", "x")};
+    multiple.current_input_message = 0;
+    auto multiple_prompt = frontend.prepare(multiple);
+    const auto& multiple_data = FrontendFactory::inspect(multiple_prompt);
+    std::vector<std::size_t> expected_event;
+    for (std::size_t t = 2; t <= 21; ++t) expected_event.push_back(t);
+    expected_event.push_back(26);
+    failures += check(ordinals(multiple_data.input_spans.query) == expected_event &&
+                      ordinals(multiple_data.input_spans.source_query) == expected_event &&
+                      ordinals(multiple_data.input_spans.all_user_text) == expected_event &&
+                      multiple_data.input_spans.source_query_messages ==
+                          std::vector<std::size_t>{0, 1},
+                      "explicit multi-user event lost earlier user text");
+    namespace capture = ninfer::targets::qwen3_6::detail;
+    const auto multi_source = capture::query_provenance(multiple_data, 17, 19, 1);
+    const auto expected_last16 = std::vector<std::uint32_t>(expected_event.end() - 16, expected_event.end());
+    failures += check(multi_source.ordinals == expected_last16 &&
+                      multi_source.ordinals.front() == 7 && multi_source.ordinals.back() == 26,
+                      "multi-user event last16 did not cross message boundary");
+    auto multiple_dense = dense_frontend.prepare(multiple);
+    failures += check(multiple_data.token_ids == FrontendFactory::inspect(multiple_dense).token_ids,
+                      "explicit multi-user metadata changed full encode IDs");
+    multiple.current_input_message.reset();
+    multiple.messages.push_back(input_message("assistant", "call"));
+    multiple.messages.push_back(input_message("tool", "result"));
+    auto multiple_tool = frontend.prepare(multiple);
+    const auto& multiple_tool_data = FrontendFactory::inspect(multiple_tool);
+    const auto fallback_source = capture::query_provenance(multiple_tool_data, 17, 19, 2, 16, true);
+    const auto known_source = capture::query_provenance_for_ordinals(
+        multiple_tool_data, 17, 19, 2, multi_source.ordinals);
+    failures += check(multiple_tool_data.input_spans.query.empty() &&
+                      fallback_source.ordinals == std::vector<std::uint32_t>{26} &&
+                      multiple_tool_data.input_spans.source_query_messages ==
+                          std::vector<std::size_t>{1} &&
+                      known_source.ordinals == multi_source.ordinals &&
+                      known_source.source_prefix == multi_source.source_prefix,
+                      "tool prompt lost known multi-user capture or broadened fallback");
+    multiple.messages.front().role = "assistant";
+    auto changed_role = frontend.prepare(multiple);
+    failures += check(throws_invalid_argument([&] {
+        (void)capture::query_provenance_for_ordinals(
+            FrontendFactory::inspect(changed_role), 17, 19, 2, multi_source.ordinals);
+    }), "saved multi-user query accepted changed role provenance");
+    ninfer::PromptInput interleaved;
+    interleaved.messages = {input_message("user", std::string(20, 'x')),
+                           input_message("system", "x"), input_message("assistant", "x"),
+                           input_message("tool", "x"), input_message("user", "x")};
+    interleaved.current_input_message = 0;
+    auto interleaved_prompt = frontend.prepare(interleaved);
+    const auto& interleaved_data = FrontendFactory::inspect(interleaved_prompt);
+    failures += check(ordinals(interleaved_data.input_spans.query).size() == 21 &&
+                      interleaved_data.input_spans.source_query_messages ==
+                          std::vector<std::size_t>{0, 4} &&
+                      ordinals(interleaved_data.input_spans.query) ==
+                          ordinals(interleaved_data.input_spans.all_user_text),
+                      "multi-user event included system/assistant/tool template rows");
+    auto attachment = image_input();
+    attachment.messages.insert(attachment.messages.begin(), input_message("user", "xxxx"));
+    attachment.current_input_message = 0;
+    auto attachment_prompt = frontend.prepare(attachment);
+    const auto& attachment_data = FrontendFactory::inspect(attachment_prompt);
+    failures += check(ordinals(attachment_data.input_spans.query) ==
+                          std::vector<std::size_t>{2, 3, 4, 5} &&
+                      ordinals(attachment_data.input_spans.source_query) ==
+                          std::vector<std::size_t>{2, 3, 4, 5} &&
+                      attachment_data.input_spans.source_query_messages ==
+                          std::vector<std::size_t>{0},
+                      "attachment-only final user erased earlier event text");
+    failures += check(capture::query_provenance(attachment_data, 17, 19, 1).ordinals ==
+                          std::vector<std::uint32_t>{2, 3, 4, 5},
+                      "attachment-only final user removed usable earlier Q capture source");
+    input.current_input_message = 99;
+    failures += check(throws_invalid_argument([&] { (void)frontend.prepare(input); }),
+                      "invalid event start accepted");
+    auto raw = frontend.prepare_tokens(data.token_ids);
+    failures += check(!FrontendFactory::inspect(raw).input_spans.available,
+                      "role-free raw token array silently became a query");
+
+    auto mixed = image_input();
+    mixed.messages.front().parts.insert(mixed.messages.front().parts.begin(), {.text = "xy"});
+    mixed.messages.front().parts.push_back({.text = "xxxx"});
+    auto multimedia = frontend.prepare(mixed);
+    const auto& media = FrontendFactory::inspect(multimedia);
+    auto dense_media = dense_frontend.prepare(mixed);
+    failures += check(media.token_ids == FrontendFactory::inspect(dense_media).token_ids &&
+                      media.positions == FrontendFactory::inspect(dense_media).positions,
+                      "metadata changed dense media IDs or MRoPE positions");
+    failures += check(media.input_spans.query.size() == 2 && ordinals(media.input_spans.query).size() == 5,
+                      "text/media/text source spans lost or image tokens included");
+    const auto media_source = capture::query_provenance(media, 17, 19, 1);
+    failures += check(capture::query_provenance_for_ordinals(media, 17, 19, 2, media_source.ordinals)
+                          .source_prefix == media_source.source_prefix,
+                      "expanded media shifted saved user text role coverage");
+    const auto before = media.input_spans.query.front();
+    const auto after = media.input_spans.query.back();
+    failures += check(before.begin + before.count <= media.vision_items[0].token_spans[0].begin &&
+                      after.begin >= media.vision_items[0].token_spans[0].begin +
+                                     media.vision_items[0].token_spans[0].count,
+                      "placeholder expansion did not shift query offsets");
+    mixed.messages.front().parts.push_back(mixed.messages.front().parts[1]);
+    auto repeated = frontend.prepare(mixed);
+    const auto& images = FrontendFactory::inspect(repeated).vision_items;
+    failures += check(images.size() == 2 && images[0].occurrence_id != images[1].occurrence_id &&
+                      images[0].content_digest == images[1].content_digest,
+                      "repeated image occurrences lost identity");
+    return failures;
 }
 
 int test_official_tokenizer_merge() {
@@ -1090,11 +1298,14 @@ int test_high_resolution_image_resizing_and_budget() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
         const FrontendResources owned = resources();
         const Frontend frontend       = FrontendFactory::create_component(owned);
+        if (argc > 1 && std::string_view(argv[1]) == "--query-provenance")
+            return test_query_provenance(frontend) ? 1 : 0;
         int failures                  = 0;
+        failures += test_query_provenance(frontend);
         failures += test_official_tokenizer_merge();
         failures += test_official_chat_template();
         failures += test_mid_conversation_system_render();

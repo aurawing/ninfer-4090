@@ -77,6 +77,7 @@ class HostMeanKIndex {
     // Coordinator first drains consumers and DMA. Snapshot saves only bounded
     // exact prefix sums, not KV or raw K. Partial FP16 mean is regenerated on GPU
     // with count=0 before all-layer republish. Older raw tail is invalid at new base.
+    [[nodiscard]] bool snapshot_matches(const MeanKSnapshotHandle&, std::uint32_t frontier) const noexcept;
     [[nodiscard]] MeanKTicket restore(const MeanKSnapshotHandle&);
     // Only current bounded tail, at/after base, may be replayed without snapshot.
     // Complete this ticket with GPU-recomputed sums/means at exact new frontier.

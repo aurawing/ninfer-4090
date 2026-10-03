@@ -268,6 +268,12 @@ MeanKSnapshotHandle HostMeanKIndex::capture() {
     *slot = snapshot;
     return snapshot;
 }
+bool HostMeanKIndex::snapshot_matches(const MeanKSnapshotHandle& snapshot,
+                                     std::uint32_t frontier) const noexcept {
+    const auto& state = *impl_;
+    return snapshot && snapshot->valid && snapshot->owner == state.owner &&
+           snapshot->epoch == state.epoch && snapshot->frontier == frontier && frontier <= state.frontier;
+}
 MeanKTicket HostMeanKIndex::restore(const MeanKSnapshotHandle& snapshot) {
     auto& state = *impl_;
     if (!snapshot || !snapshot->valid || snapshot->owner != state.owner ||

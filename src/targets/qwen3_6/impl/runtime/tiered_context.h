@@ -2,6 +2,7 @@
 
 #include "targets/qwen3_6/impl/runtime/tiered_plan.h"
 #include "core/kvmem/kv_view_table.h"
+#include "targets/qwen3_6/impl/runtime/sparse_capture_owner.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 
 #include <memory>
@@ -20,6 +21,7 @@ struct TieredSnapshot {
     std::uint32_t frontier = 0;
     std::uint64_t view_generation = 0;
     std::shared_ptr<TieredSnapshotLifetime> lifetime;
+    std::shared_ptr<const SparseDerivedSnapshot> sparse;
 };
 
 // Serialized C=1 owner. Main cache, backing and compute stream outlive this object.
@@ -36,6 +38,12 @@ public:
     [[nodiscard]] std::uint32_t view_pages() const noexcept;
     [[nodiscard]] std::uint32_t frontier() const noexcept;
     void bind_pages(std::span<const std::int32_t> lease_ids);
+    // Loading attaches this subordinate owner only for the KVMem Main pool.
+    // Scheduling remains explicit until the stage4.4 eager route is enabled.
+    void attach_sparse_capture(std::unique_ptr<SparseCaptureOwner>);
+    [[nodiscard]] SparseCaptureOwner* sparse_capture() noexcept;
+    [[nodiscard]] std::uint64_t bundle_identity() const noexcept;
+    void capture_pre_rope(std::uint32_t layer, const Tensor& qn, const Tensor& kn, cudaStream_t);
     enum class ExecutionPhase { Prefill, Decode };
     void begin_block(std::uint32_t base, std::uint32_t count, cudaStream_t stream,
                      ExecutionPhase phase = ExecutionPhase::Prefill);

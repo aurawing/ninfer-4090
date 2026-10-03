@@ -33,6 +33,7 @@ struct TieredContext::Impl {
     kvmem::KVViewTable table;
     kvmem::HostKVArchive archive;
     kvmem::HostKVTransferEngine transfer;
+    std::unique_ptr<SparseCaptureOwner> sparse;
     std::vector<std::int32_t> lease_ids, block_table, write_ids;
     std::vector<kvmem::KVViewWrite> writes;
     kvmem::KVViewSnapshot snapshot;
@@ -141,6 +142,7 @@ struct TieredContext::Impl {
 
     void drain() {
         CUDA_CHECK(cudaStreamSynchronize(compute));
+        if (sparse) sparse->drain();
         transfer.synchronize();
         complete_writebacks();
         collect_times();
@@ -305,6 +307,7 @@ struct TieredContext::Impl {
                 }
             }
         CUDA_CHECK(cudaStreamSynchronize(compute));
+        if (sparse) sparse->drain();
         transfer.synchronize();
         return scheduled_bytes;
     }
@@ -455,6 +458,22 @@ void TieredContext::bind_pages(std::span<const std::int32_t> ids) {
     impl_->lease_ids.assign(ids.begin(), ids.end());
 }
 
+void TieredContext::attach_sparse_capture(std::unique_ptr<SparseCaptureOwner> owner) {
+    auto& i = *impl_;
+    if (!owner || i.sparse || i.current_frontier || i.next_layer != 16 ||
+        owner->resources().mean.max_context != i.plan.logical_tokens ||
+        owner->resources().mean.max_chunk < i.plan.max_query_tokens || owner->index().frontier())
+        throw std::invalid_argument("Main sparse capture must attach at loading before first block");
+    i.sparse = std::move(owner);
+}
+SparseCaptureOwner* TieredContext::sparse_capture() noexcept { return impl_->sparse.get(); }
+std::uint64_t TieredContext::bundle_identity() const noexcept { return impl_->bundle_identity; }
+void TieredContext::capture_pre_rope(std::uint32_t layer, const Tensor& qn, const Tensor& kn,
+                                    cudaStream_t stream) {
+    auto& i = *impl_;
+    if (i.sparse) i.sparse->capture_pre_rope(layer, qn, kn, stream);
+}
+
 void TieredContext::begin_block(std::uint32_t base, std::uint32_t count, cudaStream_t stream, ExecutionPhase phase) {
     impl_->begin(base, count, stream, phase);
 }
@@ -532,11 +551,17 @@ TieredSnapshot TieredContext::capture() {
     for (std::uint32_t layer = 0; layer < 16; ++layer)
         if (i.archive.frontier(layer) != view.frontier)
             throw std::logic_error("snapshot archive/view frontiers disagree");
+    std::shared_ptr<const SparseDerivedSnapshot> derived;
+    if (i.sparse) {
+        if (i.sparse->index().frontier() != view.frontier)
+            throw std::logic_error("Main snapshot accepted index/KV frontiers disagree");
+        derived = std::make_shared<const SparseDerivedSnapshot>(i.sparse->capture_snapshot());
+    }
     i.invalidate_captures(i.current_frontier);
     auto lifetime = std::make_shared<TieredSnapshotLifetime>();
     lifetime->frontier = view.frontier;
     i.captures.push_back(lifetime);
-    return {i.bundle_identity, i.archive.generation(), view.frontier, view.frontier, view.generation, std::move(lifetime)};
+    return {i.bundle_identity, i.archive.generation(), view.frontier, view.frontier, view.generation, std::move(lifetime), std::move(derived)};
 }
 kvmem::KVViewSnapshot TieredContext::current_view() const { return impl_->table.snapshot(); }
 
@@ -552,6 +577,11 @@ void TieredContext::restore(const TieredSnapshot& saved, cudaStream_t stream) {
     // Borrowed host/device pointers stay live until both workers and consumers are drained.
     i.drain();
     const auto restored = i.table.plan_restore(saved.frontier);
+    if (i.sparse) {
+        if (!saved.sparse || saved.sparse->frontier != saved.frontier)
+            throw std::logic_error("Main snapshot missing exact derived index/Q state");
+        i.sparse->restore_snapshot(*saved.sparse);
+    } else if (saved.sparse) throw std::logic_error("Main derived snapshot has no capture owner");
     i.transfer.trim(saved.frontier);
     i.invalidate_captures(saved.frontier);
     i.writes.clear();
@@ -579,6 +609,7 @@ void TieredContext::trim(std::uint32_t frontier, cudaStream_t stream) {
     if (frontier > i.current_frontier)
         throw std::out_of_range("tiered trim cannot grow its frontier");
     i.drain();
+    if (i.sparse) i.sparse->trim(frontier);
     i.transfer.trim(frontier);
     i.table.trim(frontier);
     i.invalidate_captures(frontier);
@@ -593,6 +624,8 @@ void TieredContext::trim(std::uint32_t frontier, cudaStream_t stream) {
 }
 
 void TieredContext::reset(cudaStream_t stream) {
+    impl_->check_stream(stream);
+    if (impl_->sparse) impl_->sparse->reset();
     trim(0, stream);
     for (const auto& weak : impl_->captures)
         if (auto capture = weak.lock()) capture->valid = false;

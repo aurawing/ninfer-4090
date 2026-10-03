@@ -346,6 +346,32 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     const long last_query_index = last_real_user_query(messages);
     std::optional<std::size_t> turn_rewrite_byte_offset;
 
+    RenderedInputSpans spans;
+    std::size_t current_begin = 0;
+    if (options.collect_input_spans) {
+        spans.available = true;
+        if (options.current_input_message) {
+            spans.current_message = *options.current_input_message;
+            if (spans.current_message >= messages.size() || spans.current_message < num_sys)
+                throw std::invalid_argument("current input message is outside rendered input");
+        } else {
+            bool found = false;
+            for (std::size_t i = messages.size(); i-- > num_sys;) {
+                if (messages[i].role == "user" || messages[i].role == "tool") {
+                    spans.current_message = i;
+                    if (messages[i].role == "tool")
+                        while (spans.current_message > num_sys &&
+                               messages[spans.current_message - 1].role == "tool")
+                            --spans.current_message;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) throw std::invalid_argument("no current user/tool input event");
+        }
+        for (std::size_t i = messages.size(); i-- > 0;)
+            if (messages[i].role == "user") { spans.source_query_message = i; break; }
+    }
     int image_count = 0;
     int video_count = 0;
     for (std::size_t i = 0; i < messages.size(); ++i) {
@@ -357,8 +383,17 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         if (message.role == "system" && message.has_media()) {
             throw std::invalid_argument("system message cannot contain images or videos");
         }
-        const std::string content = trim_ascii_whitespace(
-            message.rendered_content(options.add_vision_id, &image_count, &video_count));
+        if (spans.available && i == spans.current_message) current_begin = rendered.size();
+        const int first_image = image_count, first_video = video_count;
+        std::string raw;
+        const std::string content = [&] {
+            if (spans.available) {
+                raw = message.rendered_content(options.add_vision_id, &image_count, &video_count);
+                return trim_ascii_whitespace(raw);
+            }
+            return trim_ascii_whitespace(
+                message.rendered_content(options.add_vision_id, &image_count, &video_count));
+        }();
         if (message.role == "system") {
             // A system turn that arrives after the conversation has started - a per-turn client
             // reminder, for instance - renders where it sits. Hoisting it into the leading system
@@ -371,6 +406,40 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         }
         if (message.role == "user") {
             rendered += "<|im_start|>user\n";
+            if (spans.available) {
+                std::vector<ByteSpan> user_text;
+                std::size_t trim = 0;
+                while (trim < raw.size() && std::isspace(static_cast<unsigned char>(raw[trim]))) ++trim;
+                std::size_t offset = 0;
+                int images = first_image, videos = first_video;
+                for (const auto& part : message.parts) {
+                    if (part.kind == ChatPartKind::Text) {
+                        const auto begin = std::max(offset, trim);
+                        const auto end = std::min(offset + part.text.size(), trim + content.size());
+                        if (begin < end) {
+                            ByteSpan span{rendered.size() + begin - trim, end - begin};
+                            if (!user_text.empty() &&
+                                user_text.back().begin + user_text.back().count == span.begin)
+                                user_text.back().count += span.count;
+                            else user_text.push_back(span);
+                        }
+                        offset += part.text.size();
+                    } else {
+                        const bool image = part.kind == ChatPartKind::Image;
+                        const auto number = image ? ++images : ++videos;
+                        offset += image ? std::string_view("<|vision_start|><|image_pad|><|vision_end|>").size()
+                                        : std::string_view("<|vision_start|><|video_pad|><|vision_end|>").size();
+                        if (options.add_vision_id)
+                            offset += (image ? 8 : 6) + std::to_string(number).size() + 2;
+                    }
+                }
+                spans.all_user_text.insert(spans.all_user_text.end(), user_text.begin(), user_text.end());
+                if (spans.source_query_message == i) spans.source_query = user_text;
+                if (i >= spans.current_message && !user_text.empty()) {
+                    spans.query.insert(spans.query.end(), user_text.begin(), user_text.end());
+                    spans.source_query_messages.push_back(i);
+                }
+            }
             rendered += content;
             rendered += "<|im_end|>\n";
             continue;
@@ -424,6 +493,15 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         rendered += "<|im_end|>\n";
     }
 
+    if (spans.available) {
+        spans.current.push_back({current_begin, rendered.size() - current_begin});
+        if (!spans.query.empty()) {
+            spans.source_query = spans.query;
+            spans.source_query_message = spans.source_query_messages.back();
+        } else if (spans.source_query_message) {
+            spans.source_query_messages.push_back(*spans.source_query_message);
+        }
+    }
     if (options.add_generation_prompt) {
         rendered += "<|im_start|>assistant\n";
         if (!turn_rewrite_byte_offset) { turn_rewrite_byte_offset = rendered.size(); }
@@ -434,7 +512,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         }
     }
     return RenderedChat{.text                     = std::move(rendered),
-                        .turn_rewrite_byte_offset = turn_rewrite_byte_offset};
+                        .turn_rewrite_byte_offset = turn_rewrite_byte_offset,
+                        .input_spans = std::move(spans)};
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

@@ -135,10 +135,11 @@ private:
 
     friend class FrontendTestAccess;
     friend Frontend make_frontend(const FrontendResources& resources, bool vision_enabled,
-                                  std::uint32_t vision_max_tokens);
+                                  std::uint32_t vision_max_tokens, bool collect_input_spans);
 };
 
 [[nodiscard]] Frontend make_frontend(const FrontendResources& resources, bool vision_enabled,
-                                     std::uint32_t vision_max_tokens = 8192);
+                                     std::uint32_t vision_max_tokens = 8192,
+                                     bool collect_input_spans = false);
 
 } // namespace ninfer::targets::qwen3_6

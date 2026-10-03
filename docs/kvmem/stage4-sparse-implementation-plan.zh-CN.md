@@ -30,13 +30,15 @@
 
 ## 4.3 Frontend query span、三槽capture与Main snapshot
 
-- [ ] frontend显式提供current-input事件跨度、用户文本query跨度、图像token span/身份；lastN不取模板/生成头/历史assistant/system/tool/图像token，跨chunk按ordinal捕获16层Q。冷启动历史不变成本轮输入，current不等于实际prefill delta。
-- [ ] 首版不做历史图像引用检测；保留图像ID/digest/grid/span供原子闭包，历史图像为候选，本轮图像按D9。协议引用识别留待后续，不猜自然语言引用。
-- [ ] 最多active/checkpoint/retained三个不可变Q capture槽，拥有型句柄、完整16层有效性、prefix identity/lineage与covered frontier；相同句柄可共享槽，score/DMA只借用。替换/reset排空借用，不创建第四槽。
-- [ ] 无新用户文本的tool续接仅沿用身份/源前缀/lineage匹配的有效capture；index epoch与capture epoch分别验证，旧capture可合法配新index。query被复用跳过时取已有有效capture，否则从合法continuation边界exact补捕获，必要时冷启动；不使用stale Q，不做window query replay。
-- [ ] Main snapshot保存Mean-K精确prefix sum/count及index frontier/generation，并持有Q capture句柄；restore排空GPU/DMA，截断index、恢复sum、递增generation，拒绝旧score/plan/ticket，KV原量化字节和D12生命周期保持一致。
-- [ ] 新增frontend/continuation CTest，覆盖跨chunk lastN、冷启动messages/单条长input、无文本tool续接、源prefix改写/恢复早于query、capture缺失补捕获、三槽高水位/借用、重复restore及旧状态拒绝。
-- [ ] 定向CTest与**全量CTest**通过，更新progress及证据；主任务审阅后独立commit/push，再进入4.4。
+- [x] frontend显式提供current-input事件跨度、用户文本query跨度、图像token span/身份；lastN不取模板/生成头/历史assistant/system/tool/图像token，跨chunk按ordinal捕获16层Q。冷启动历史不变成本轮输入，current不等于实际prefill delta。
+- [x] 首版不做历史图像引用检测；保留图像ID/digest/grid/span供原子闭包，历史图像为候选，本轮图像按D9。协议引用识别留待后续，不猜自然语言引用。
+- [x] 最多active/checkpoint/retained三个不可变Q capture槽，拥有型句柄、完整16层有效性、prefix identity/lineage与covered frontier；相同句柄可共享槽，score/DMA只借用。替换/reset排空借用，不创建第四槽。
+- [x] 无新用户文本的tool续接仅沿用身份/源前缀/lineage匹配的有效capture；index epoch与capture epoch分别验证，旧capture可合法配新index。query被复用跳过时取已有有效capture，否则从合法continuation边界exact补捕获，必要时冷启动；不使用stale Q，不做window query replay。
+- [x] Main snapshot保存Mean-K精确prefix sum/count及index frontier/generation，并持有Q capture句柄；restore排空GPU/DMA，截断index、恢复sum、递增generation，拒绝旧score/plan/ticket，KV原量化字节和D12生命周期保持一致。
+- [x] 新增frontend/continuation CTest，覆盖跨chunk lastN、冷启动messages/单条长input、无文本tool续接、源prefix改写/恢复早于query、capture缺失补捕获、三槽高水位/借用、重复restore及旧状态拒绝。
+- [x] 定向CTest与**全量CTest**通过，更新progress及证据；主任务审阅后独立commit/push，再进入4.4。
+
+4.3基础验收通过：111项全量CTest为107通过、4制品缺失跳过、0失败；三项sanitizer均为0 hazard/error，规格与质量复审通过。前端、多user源校验、Main派生状态与真实hook基础已实现；Program加载、事务协调、评分和稀疏产品入口仍在4.4接线，尚未启用kvmem模式。修正前规格失败记录与终版证据见progress。
 
 ## 4.4 Exact prefill到单列表sparse eager完整接线
 

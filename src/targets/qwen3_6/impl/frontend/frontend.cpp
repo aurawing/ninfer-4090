@@ -322,6 +322,8 @@ VisionItem convert_vision_item(fi::VisionItem item) {
     result.patch_begin    = item.patch_begin;
     result.patch_count    = item.patch_count;
     result.content_digest = item.content_digest;
+    result.occurrence_id = item.occurrence_id;
+    result.source_message = item.source_message;
     result.timestamps     = std::move(item.timestamps);
     result.token_spans.reserve(item.token_spans.size());
     for (const fi::TokenSpan span : item.token_spans) {
@@ -613,13 +615,14 @@ DecoderState terminal_state(DecoderState state) {
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, bool registered_checkpoint, bool vision_enabled_,
-         std::uint32_t vision_max_tokens_)
+         std::uint32_t vision_max_tokens_, bool collect_input_spans_)
         : chat_template(compile_chat_template(resources)),
           tokenizer(std::make_shared<const fi::Tokenizer>(
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,
                                      .generation_config_json = resources.generation_config_json})),
-          processor(processor_options(resources)), vision_enabled(vision_enabled_) {
+          processor(processor_options(resources)), vision_enabled(vision_enabled_),
+          collect_input_spans(collect_input_spans_) {
         // The vision encode workspace is sized to vision_max_tokens; keep the processor
         // budget in lockstep so oversized media fails as MediaBudgetExceeded before it
         // reaches the encoder, and smart_resize_image downscales high-res media within
@@ -657,6 +660,7 @@ public:
     std::shared_ptr<xgrammar::GrammarCompiler> grammar_compiler;
     int grammar_vocab_size = 0;
     bool vision_enabled = true;
+    bool collect_input_spans = false;
 };
 
 class OutputSession::Impl {
@@ -908,16 +912,17 @@ Frontend& Frontend::operator=(Frontend&&) noexcept = default;
 Frontend::~Frontend()                              = default;
 
 Frontend make_frontend(const FrontendResources& resources, bool vision_enabled,
-                       std::uint32_t vision_max_tokens) {
+                       std::uint32_t vision_max_tokens, bool collect_input_spans) {
     return Frontend(
-        std::make_shared<const Frontend::Impl>(resources, true, vision_enabled, vision_max_tokens));
+        std::make_shared<const Frontend::Impl>(resources, true, vision_enabled, vision_max_tokens,
+                                               collect_input_spans));
 }
 
 Frontend FrontendTestAccess::create_component(const FrontendResources& resources,
                                               bool vision_enabled,
-                                              std::uint32_t vision_max_tokens) {
+                                              std::uint32_t vision_max_tokens, bool collect_input_spans) {
     return Frontend(std::make_shared<const Frontend::Impl>(resources, false, vision_enabled,
-                                                           vision_max_tokens));
+                                                           vision_max_tokens, collect_input_spans));
 }
 
 const PreparedPromptData& PreparedPromptAccess::view(const PreparedPrompt& prompt) {
@@ -938,6 +943,9 @@ const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prom
 PreparedPrompt Frontend::prepare(PromptInput input) const {
     const auto start                      = Clock::now();
     const PromptOptions options           = input.options;
+    auto render = render_options(options);
+    render.collect_input_spans = impl_->collect_input_spans;
+    render.current_input_message = input.current_input_message;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
@@ -959,7 +967,7 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
         fi::Processor processor(*impl_->tokenizer, impl_->chat_template, processor_options);
         fi::ProcessedInput processed;
         try {
-            processed = processor.process(messages, render_options(options));
+            processed = processor.process(messages, render);
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
         result.token_types = std::move(processed.token_types);
@@ -976,12 +984,14 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
         result.prepare.attention_pairs        = processed.stats.attention_pairs;
         result.prepare.patch_bytes            = processed.stats.patch_bytes;
         result.identity.turn_rewrite_boundary = processed.turn_rewrite_boundary;
+        result.input_spans = std::move(processed.input_spans);
     } else {
         const fi::RenderedChat rendered =
-            impl_->chat_template.render(messages, render_options(options));
+            impl_->chat_template.render(messages, render);
         fi::EncodedChat encoded = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
         result.token_ids        = std::move(encoded.input_ids);
         result.identity.turn_rewrite_boundary = encoded.turn_rewrite_boundary;
+        result.input_spans = std::move(encoded.input_spans);
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());

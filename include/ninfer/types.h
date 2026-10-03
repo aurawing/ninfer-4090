@@ -325,6 +325,9 @@ struct PromptOptions {
 struct PromptInput {
     std::vector<ChatMessage> messages;
     PromptOptions options;
+    // First message of this input event. Default: latest user or final tool group.
+    // Recomputed history preceding this event is never a current query.
+    std::optional<std::size_t> current_input_message;
 };
 
 enum class RequestErrorKind : std::uint8_t {

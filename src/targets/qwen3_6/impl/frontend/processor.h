@@ -2,6 +2,7 @@
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
+#include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include <array>
 #include <cstddef>
@@ -54,6 +55,7 @@ struct TokenSpan {
 struct VisionItem {
     Modality modality = Modality::Image;
     VisionGrid grid;
+    std::size_t occurrence_id = 0, source_message = 0;
     std::size_t patch_begin = 0;
     std::size_t patch_count = 0;
     std::array<std::uint8_t, 32> content_digest{};
@@ -102,6 +104,7 @@ struct ProcessedInput {
     std::vector<float> patches;
     std::vector<VisionItem> vision_items;
     std::optional<std::uint32_t> turn_rewrite_boundary;
+    PromptInputSpans input_spans;
     PreprocessStats stats;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
@@ -110,6 +113,7 @@ struct ProcessedInput {
 struct EncodedChat {
     std::vector<int> input_ids;
     std::optional<std::uint32_t> turn_rewrite_boundary;
+    PromptInputSpans input_spans;
 };
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered);

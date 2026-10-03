@@ -3,6 +3,7 @@
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
+#include <utf8proc/utf8proc.h>
 
 #include <algorithm>
 #include <charconv>
@@ -670,6 +671,78 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
         pos = match_pos + match_token->content.size();
     }
     return ids;
+}
+
+EncodedOffsets Tokenizer::encode_with_offsets(std::string_view text, EncodeOptions options) const {
+    EncodedOffsets result;
+    result.ids = encode(text, options); // dense encoder remains the token-ID authority
+    std::size_t token = 0;
+    const auto ordinary = [&](std::size_t begin, std::size_t count) {
+        const auto input = text.substr(begin, count);
+        const auto cps = uni::utf8_codepoints(input, "token source provenance");
+        std::string normalized;
+        std::vector<SourceByteSpan> mapping;
+        utf8proc_int32_t state = 0;
+        std::size_t cluster = 0;
+        const auto append_cluster = [&](std::size_t end) {
+            const auto source = input.substr(cluster, end - cluster);
+            const auto nfc = uni::normalize_nfc(source);
+            normalized += nfc;
+            for (std::size_t byte = 0; byte < nfc.size(); ++byte) {
+                mapping.push_back(nfc == source ? SourceByteSpan{begin + cluster + byte, 1}
+                                               : SourceByteSpan{begin + cluster, end - cluster});
+            }
+            cluster = end;
+        };
+        for (std::size_t i = 1; i < cps.size(); ++i) {
+            if (utf8proc_grapheme_break_stateful(cps[i - 1].value, cps[i].value, &state)) {
+                append_cluster(cps[i].offset);
+            }
+        }
+        if (!input.empty()) append_cluster(input.size());
+        if (normalized != uni::normalize_nfc(input)) {
+            throw std::logic_error("grapheme NFC provenance differs from full normalization");
+        }
+        std::size_t cursor = 0;
+        while (cursor < normalized.size()) {
+            if (token >= result.ids.size()) throw std::logic_error("token provenance exhausted");
+            const auto bytes = decode_token_bytes(result.ids[token++]);
+            if (bytes.empty() || normalized.compare(cursor, bytes.size(), bytes) != 0) {
+                throw std::logic_error("BPE source reconstruction differs from original encoder");
+            }
+            std::size_t first = mapping.at(cursor).begin, end = first;
+            for (std::size_t b = cursor; b < cursor + bytes.size(); ++b) {
+                first = std::min(first, mapping.at(b).begin);
+                end = std::max(end, mapping.at(b).begin + mapping.at(b).count);
+            }
+            result.source.push_back({first, end - first});
+            cursor += bytes.size();
+        }
+    };
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        std::size_t match = std::string_view::npos;
+        const AddedToken* added = nullptr;
+        if (options.parse_added_tokens) for (const auto& candidate : added_tokens_) {
+            if (candidate.content.empty()) continue;
+            const auto found = text.find(candidate.content, pos);
+            if (found != std::string_view::npos && (added == nullptr || found < match)) {
+                match = found;
+                added = &candidate;
+            }
+        }
+        if (added == nullptr) { ordinary(pos, text.size() - pos); break; }
+        if (match > pos) ordinary(pos, match - pos);
+        if (token >= result.ids.size() || result.ids[token++] != added->id) {
+            throw std::logic_error("added-token provenance differs from original encoder");
+        }
+        result.source.push_back({match, added->content.size()});
+        pos = match + added->content.size();
+    }
+    if (token != result.ids.size() || result.source.size() != result.ids.size()) {
+        throw std::logic_error("incomplete token source provenance");
+    }
+    return result;
 }
 
 std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) const {

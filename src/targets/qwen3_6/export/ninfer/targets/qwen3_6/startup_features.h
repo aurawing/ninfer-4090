@@ -7,6 +7,7 @@ namespace ninfer::targets::qwen3_6 {
 
 struct StartupFeatures {
     bool vision                    = false;
+    bool kvmem_input_spans = false;
     std::uint32_t vision_max_tokens = 8192;
     VisionDevice vision_device      = VisionDevice::Cuda;
     std::filesystem::path vision_mmproj_path;
@@ -69,6 +70,7 @@ struct StartupFeatures {
     }
     return StartupFeatures{
         .vision            = options.enable_vision,
+        .kvmem_input_spans = options.kv_mode == KvMode::KVMem,
         .vision_max_tokens = options.vision_max_tokens > 0 ? options.vision_max_tokens : 8192,
         .vision_device = options.vision_device,
         .vision_mmproj_path = options.vision_mmproj_path,

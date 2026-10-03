@@ -836,6 +836,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
+    if (tiered_) tiered_->capture_pre_rope(fidx, qn, kn, s);
     ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});

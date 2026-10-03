@@ -405,3 +405,11 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
 
+
+add_test(NAME ninfer_qwen3_6_query_provenance_test
+  COMMAND ninfer_qwen3_6_frontend_test --query-provenance)
+
+ninfer_add_op_test(ninfer_test_query_capture
+  SOURCES targets/qwen3_6/test_query_capture.cpp LIBRARIES ninfer_engine ninfer_ops)
+target_include_directories(ninfer_test_query_capture PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
