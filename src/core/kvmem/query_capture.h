@@ -75,7 +75,7 @@ class QueryCapturePool {
     std::shared_ptr<QueryCaptureStorage> storage_;
     std::shared_ptr<QueryCapture> pending_;
     std::array<bool, 16> layers_{};
-    std::vector<std::weak_ptr<QueryCaptureBorrow::State>> borrows_;
+    std::vector<std::shared_ptr<QueryCaptureBorrow::State>> borrows_;
 };
 [[nodiscard]] bool query_capture_matches(const QueryCaptureHandle&, const QueryProvenance& expected,
                                          std::uint32_t restored_frontier) noexcept;

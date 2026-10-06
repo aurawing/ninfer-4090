@@ -28,6 +28,8 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         card.set_attn_scale(state.execution.attn_scale);
         card.set_tiered_context(state.execution.tiered);
         if (state.execution.tiered) {
+            if (state.execution.tiered->sparse_capture())
+                state.execution.tiered->prepare_main_transaction(kvmem::MeanKTransactionKind::OrdinaryMain, 1);
             state.execution.tiered->begin_block(
                 static_cast<std::uint32_t>(state.host_ingress.cache_positions[0]), 1,
                 state.execution.device.stream, qwen3_6::detail::TieredContext::ExecutionPhase::Decode);

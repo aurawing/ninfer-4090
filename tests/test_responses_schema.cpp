@@ -115,11 +115,47 @@ int test_basic_request() {
     previous_text.text = "old answer";
     previous.content.push_back(std::move(previous_text));
     compose_responses_generation_messages(composed, {previous});
+    failures += check(composed.generation.current_input_message == 2,
+                      "current input boundary includes instructions and actual history offset");
     failures += check(composed.generation.messages.size() == 3 &&
                           composed.generation.messages[0].role == "developer" &&
                           composed.generation.messages[1].content[0].text == "old answer" &&
                           composed.generation.messages[2].content[0].text == "hello",
                       "instructions, previous context, and current input composed in order");
+    return failures;
+}
+
+int test_current_input_event_boundary() {
+    int failures = 0;
+    ChatTurn history;
+    history.role = "user";
+    history.content.push_back(ContentPart{ContentKind::Text, "historical user", "input_text"});
+    for (const bool instructions : {false, true}) {
+        for (const Json& current : {Json("cold user"),
+                Json::array({{{"role", "user"}, {"content", "first current"}},
+                             {{"role", "user"}, {"content", "second current"}}}),
+                Json::array({{{"type", "function_call_output"}, {"call_id", "call_a"},
+                             {"output", "tool-only current"}}})}) {
+            Json body = {{"model", "m"}, {"input", current}};
+            if (instructions) body["instructions"] = "system instruction";
+            auto request = parse_responses_request(body, limits());
+            compose_responses_generation_messages(request, {history});
+            const std::size_t expected = instructions ? 2 : 1;
+            failures += check(request.generation.current_input_message == expected,
+                              "Responses event starts after actual normalized history");
+            const auto prompt = to_prompt_input(request.generation,
+                resolve_prompt_semantics(request.generation, ServeOptions{}, effort_capabilities()), {});
+            failures += check(prompt.current_input_message == expected,
+                              "Responses boundary reaches frontend input");
+            compose_responses_generation_messages(request, {});
+            failures += check(request.generation.current_input_message == (instructions ? 1 : 0),
+                              "cold Responses boundary uses only instruction offset");
+        }
+    }
+    ResponsesRequest empty;
+    compose_responses_generation_messages(empty, {history});
+    failures += check(empty.generation.current_input_empty && !empty.generation.current_input_message,
+                      "constructed empty input does not mark historical user as current");
     return failures;
 }
 
@@ -264,6 +300,15 @@ int test_typed_items_and_tools() {
     const ResponsesRequest request = parse_responses_request(body, limits());
     int failures                   = 0;
     failures += check(request.input_turns.size() == 3, "typed Items grouped into three turns");
+    auto composed = request;
+    ChatTurn historical;
+    historical.role = "user";
+    historical.content.push_back(ContentPart{ContentKind::Text, "history", "input_text"});
+    compose_responses_generation_messages(composed, {historical});
+    failures += check(composed.generation.current_input_message == 1 &&
+        composed.generation.messages.size() == 4 &&
+        composed.generation.messages[1].tool_calls.size() == 2,
+        "event boundary uses normalized turn count, preserving grouped function calls and image input");
     failures += check(request.input_turns[0].role == "assistant" &&
                           request.input_turns[0].reasoning_content == "need tools" &&
                           request.input_turns[0].tool_calls.size() == 2,
@@ -493,6 +538,7 @@ int test_input_tokens_schema() {
 int main() {
     int failures = 0;
     failures += test_basic_request();
+    failures += test_current_input_event_boundary();
     failures += test_preserve_thinking_options_and_inheritance();
     failures += test_reasoning_effort();
     failures += test_typed_items_and_tools();

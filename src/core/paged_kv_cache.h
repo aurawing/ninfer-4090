@@ -133,6 +133,15 @@ public:
     void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr);
 
     [[nodiscard]] std::size_t page_bytes(std::size_t plane_index) const;
+    // CoalescedRuns preserves the legacy HeadMajor run layout; IndividualPages
+    // packs each page independently for the archive. PageMajor coalesces in both.
+    enum class HostCopyLayout { CoalescedRuns, IndividualPages };
+    [[nodiscard]] cudaError_t copy_pages_to_host_status(std::size_t plane_index,
+        std::span<const std::int32_t> page_ids, void* dst, cudaStream_t stream = nullptr,
+        HostCopyLayout layout = HostCopyLayout::CoalescedRuns) const;
+    [[nodiscard]] cudaError_t copy_pages_from_host_status(std::size_t plane_index,
+        std::span<const std::int32_t> page_ids, const void* src, cudaStream_t stream = nullptr,
+        HostCopyLayout layout = HostCopyLayout::CoalescedRuns);
     void copy_page_to_host(std::size_t plane_index, std::int32_t page_id, void* dst,
                            cudaStream_t stream = nullptr) const;
     void copy_page_from_host(std::size_t plane_index, std::int32_t page_id, const void* src,

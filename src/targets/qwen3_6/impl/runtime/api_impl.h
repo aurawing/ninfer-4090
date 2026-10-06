@@ -4,6 +4,7 @@
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+#include "targets/qwen3_6/impl/runtime/test_access.h"
 
 #include <stdexcept>
 #include <utility>
@@ -212,6 +213,15 @@ void Program<Variant>::abort_lane(std::uint32_t lane) noexcept {
 }
 
 template <>
+bool Program<Variant>::can_continue_after_gpu_failure(std::exception_ptr error) const noexcept {
+    return impl_->can_continue_after_gpu_failure(std::move(error));
+}
+template <>
+std::exception_ptr Program<Variant>::gpu_failure_after_cleanup(std::exception_ptr original) const noexcept {
+    return impl_->gpu_failure_after_cleanup(std::move(original));
+}
+
+template <>
 bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
     return impl_->has_retained_lane(lane);
 }
@@ -294,3 +304,65 @@ create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile
 }
 
 } // namespace ninfer::targets::qwen3_6
+
+namespace ninfer::targets::qwen3_6::detail {
+template<>
+TieredContext& ProgramTestAccess::owner(Program<NINFER_QWEN36_VARIANT>& program) {
+    if (!program.impl_->tiered) throw std::logic_error("Program has no tiered owner");
+    return *program.impl_->tiered;
+}
+template<>
+void ProgramTestAccess::check_compute_drain(Program<NINFER_QWEN36_VARIANT>& program, cudaError_t status) {
+    program.impl_->check_kvmem_compute_drain(status);
+}
+template<>
+void ProgramTestAccess::fail_reset_after_hardware_prepare(Program<NINFER_QWEN36_VARIANT>& program,
+                                                         cudaError_t status) {
+    auto& impl = *program.impl_;
+    impl.tiered->reset_with_cleanup(impl.device.stream, [&] {
+        impl.prepare_sparse_reset(impl.sequences[0]);
+        // Actual Main/capture/GDN/MTP/position hardware preparation completed;
+        // feed a safe returned rejection at the final drain before host commit.
+        impl.tiered->check_compute_drain(status, "KVMem whole bundle reset final drain");
+    });
+    throw std::logic_error("reset failure fixture accepted a failed drain");
+}
+
+template<>
+ProgramTestState ProgramTestAccess::inspect(Program<NINFER_QWEN36_VARIANT>& program) {
+    auto& impl = *program.impl_;
+    impl.device.synchronize();
+    const auto& sequence = impl.sequences[0];
+    ProgramTestState state{
+        .execution_frontier = sequence.execution_frontier,
+        .ledger_frontier = sequence.ledger_frontier,
+        .text_valid = sequence.text_kv_valid,
+        .mtp_valid = sequence.mtp_kv_valid,
+        .owns_kv = bool(sequence.kv), .ledger_empty = sequence.ledger.empty(),
+        .hidden_valid = sequence.tail_hidden_valid, .retained = sequence.retained,
+        .checkpoint_valid = sequence.turn_checkpoint.valid,
+        .resume_valid = sequence.resume.valid, .original_query = bool(sequence.original_query),
+        .cleanup_failure = bool(impl.kvmem_cleanup_failure),
+        .gdn_zero = true, .positions_zero = true, .mtp_tags_empty = true,
+    };
+    const auto bytes_zero = [](const Tensor& tensor) {
+        std::vector<std::byte> bytes(tensor.bytes());
+        CUDA_CHECK(cudaMemcpy(bytes.data(), tensor.data, bytes.size(), cudaMemcpyDeviceToHost));
+        return std::all_of(bytes.begin(), bytes.end(), [](std::byte b) { return b == std::byte{}; });
+    };
+    const auto slot = NINFER_QWEN36_RUNTIME_NS::LinearStateSlots::current_state_slot(0, impl.max_concurrency);
+    for (std::uint32_t layer = 0; layer < impl.decoder->linear_attention.layer_count(); ++layer) {
+        state.gdn_zero &= bytes_zero(impl.decoder->linear_attention.conv_slot(layer, slot));
+        state.gdn_zero &= bytes_zero(impl.decoder->linear_attention.recurrent_slot(layer, slot));
+    }
+    state.positions_zero = bytes_zero(impl.io.pos) && bytes_zero(impl.io.rope_pos) &&
+        bytes_zero(impl.io.rope_delta) && (!impl.io.mtp || bytes_zero(impl.io.mtp->position));
+    if (impl.mtp_window) {
+        const auto tags = impl.mtp_window->page_tags();
+        std::vector<std::int32_t> values(tags.bytes() / sizeof(std::int32_t));
+        CUDA_CHECK(cudaMemcpy(values.data(), tags.data, tags.bytes(), cudaMemcpyDeviceToHost));
+        state.mtp_tags_empty = std::all_of(values.begin(), values.end(), [](std::int32_t v) { return v == -1; });
+    }
+    return state;
+}
+} // namespace ninfer::targets::qwen3_6::detail

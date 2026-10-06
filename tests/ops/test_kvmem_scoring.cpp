@@ -36,6 +36,8 @@ double hf(std::uint16_t x) {
            (e ? std::ldexp(1. + m / 1024., e - 15) : std::ldexp(double(m), -24));
 }
 template <int P = 37, int D = 256, int H = 24, int K = 4, int M = 16, int L = 16> void gpu() {
+    std::cout << "[kernel-case] score P=" << P << " D=" << D << " H=" << H
+              << " K=" << K << " M=" << M << " L=" << L << '\n' << std::flush;
     auto plan =
         plan_scoring_resources(4096, 256, 24, 4, 16, 9 * 1024 * 1024, 7 * 1024 * 1024, 64 * 1024);
     require(plan.index_bytes == 8 * 1024 * 1024 && plan.query_bytes == 192 * 1024 &&
@@ -214,6 +216,8 @@ void cpu() {
     i.scores = scores;
     i.current_resident = {0, 2, 4};
     auto p = select_pages(i);
+    require(p.hard_logical_ids == std::vector<std::uint32_t>({2}), "exact hard excludes scored candidates");
+    require(preflight_selection(i).hard_logical_ids == p.hard_logical_ids, "preflight shares hard policy");
     require(p.selected == std::vector<std::uint32_t>({2, 8, 9}) &&
                 p.retained == std::vector<std::uint32_t>({2}) &&
                 p.added == std::vector<std::uint32_t>({8, 9}) &&
@@ -221,6 +225,8 @@ void cpu() {
             "newer ties/diff/exact reserves");
     i.current_input_spans = {{192, 640}};
     p = select_pages(i);
+    require(p.hard_logical_ids == std::vector<std::uint32_t>({2}) &&
+                preflight_selection(i).hard_logical_ids == p.hard_logical_ids, "softened current is not hard");
     require(p.current_input_softened_pages == 7, "long current input softens");
     i.physical_pages = 12;
     p = select_pages(i);
@@ -300,6 +306,10 @@ int main() {
     try {
         cpu();
         gpu<>();
+        // Exact owner row grid (24 heads x two immutable query rows) at both
+        // owner logical-index capacities, including kept-band/all-page masks.
+        gpu<64, 256, 24, 4, 2, 16>();
+        gpu<128, 256, 24, 4, 2, 16>();
         gpu<513, 16, 6, 2, 2, 2>();
         std::cout << "PASS kvmem scoring/selection\n";
         return 0;

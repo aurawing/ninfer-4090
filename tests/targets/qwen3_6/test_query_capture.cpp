@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/sparse_capture_owner.h"
 #include "core/device.h"
+#include "core/kvmem/cuda_status.h"
 #include "targets/qwen3_6/impl/runtime/tiered_context.h"
 #include <ninfer/ops/rope.h>
 #include <algorithm>
@@ -89,7 +90,54 @@ void cpu_contracts() {
     pool.reset();
     require(!d->valid(), "reset left old capture valid");
 }
+void fallible_borrow_contract() {
+    QueryCapturePool pool(plan_query_capture_resources());
+    pool.begin(provenance());
+    std::vector<std::uint16_t> rows(256 * 24 * 4, 0x3f80);
+    for (std::uint32_t layer = 0; layer < 16; ++layer) pool.complete_layer(layer, rows);
+    auto saved = pool.publish();
+    bool reject_drain = true, second_drained = false;
+    {
+        auto first = pool.borrow(saved, [&] {
+            if (reject_drain) throw std::runtime_error("injected source borrower drain rejection");
+        });
+        auto second = pool.borrow(saved, [&] { second_drained = true; });
+        saved.reset();
+        rejects([&] { first.finish(); });
+        rejects([&] { pool.drain_borrows(); });
+        require(second_drained && pool.live_slots() == 1, "failed drain retains source and still drains other borrowers");
+    } // explicit failure must not terminate or release the still-borrowed source slot
+    require(pool.live_slots() == 1, "pool retains failed source lease after borrower destruction");
+    reject_drain = false;
+    pool.drain_borrows();
+    require(pool.live_slots() == 0, "source released only after a successful later drain");
+}
+
 void continuation_contracts() {
+    {
+        QueryCapturePool pool(plan_query_capture_resources());
+        pool.begin(provenance());
+        std::vector<std::uint16_t> rows(256 * 24 * 4, 0x3f80);
+        for (unsigned layer = 0; layer < 16; ++layer) pool.complete_layer(layer, rows);
+        auto source = pool.publish();
+        unsigned first_calls = 0, second_calls = 0;
+        auto first = pool.borrow(source, [&] {
+            if (++first_calls == 1) throw std::runtime_error("first generic borrower");
+        });
+        auto second = pool.borrow(source, [&] {
+            if (++second_calls == 1) throw CudaTransferError(cudaErrorIllegalAddress, "second fatal borrower");
+        });
+        bool typed = false;
+        try { pool.drain_borrows(); }
+        catch (const CudaTransferError& error) {
+            typed = error.status() == cudaErrorIllegalAddress && !error.drain_failed() &&
+                std::string_view(error.operation()) == "second fatal borrower";
+        }
+        require(typed && first_calls == 1 && second_calls == 1,
+            "generic borrower masked later typed fatal or skipped a borrower drain");
+        pool.drain_borrows();
+        require(!first.valid() && !second.valid(), "successful later borrowers did not retire");
+    }
     const auto p = provenance();
     const std::vector<ExactCaptureContinuation> states{
         {50, 17, 19, true}, {60, 17, 19, true}, {61, 17, 19, true}, {0, 99, 19, true}};
@@ -444,6 +492,7 @@ void integrated_main_contracts() {
 int main() {
     try {
         cpu_contracts();
+        fallible_borrow_contract();
         continuation_contracts();
         provenance_identity_contracts();
         int count = 0;

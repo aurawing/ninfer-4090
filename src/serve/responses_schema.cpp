@@ -973,6 +973,9 @@ void compose_responses_generation_messages(ResponsesRequest& request,
         messages.push_back(std::move(instructions));
     }
     messages.insert(messages.end(), previous_context.begin(), previous_context.end());
+    request.generation.current_input_empty = request.input_turns.empty();
+    request.generation.current_input_message = request.input_turns.empty()
+        ? std::nullopt : std::optional<std::size_t>(messages.size());
     messages.insert(messages.end(), request.input_turns.begin(), request.input_turns.end());
     request.generation.messages = std::move(messages);
 }

@@ -32,9 +32,12 @@
 
 namespace ninfer::runtime {
 
+struct ConcurrentExecutorTestAccess;
+
 template <class Instance>
 class ConcurrentExecutor {
     struct Request;
+    friend struct ConcurrentExecutorTestAccess;
 
 public:
     using Package  = typename Instance::Package;
@@ -225,6 +228,19 @@ public:
     }
 
 private:
+    [[nodiscard]] std::exception_ptr gpu_failure_after_cleanup(std::exception_ptr error) const noexcept {
+        if constexpr (requires { instance_.program->gpu_failure_after_cleanup(error); }) {
+            return instance_.program->gpu_failure_after_cleanup(std::move(error));
+        }
+        return error;
+    }
+    [[nodiscard]] bool can_continue_after_gpu_failure(std::exception_ptr error) const noexcept {
+        if constexpr (requires { instance_.program->can_continue_after_gpu_failure(error); }) {
+            return instance_.program->can_continue_after_gpu_failure(std::move(error));
+        }
+        return false;
+    }
+
     void publish_runtime_stats() {
         RuntimeStats snapshot = cumulative_stats_;
         {
@@ -503,6 +519,7 @@ private:
         if (cancel_at_boundary) {
             (void)request->output.preview_terminal(FinishReason::Cancelled);
             instance_.program->abort_lane(lane);
+            if (const auto failure = gpu_failure_after_cleanup({})) std::rethrow_exception(failure);
             append_output(request, request->output.commit_preview());
             complete_success(request, FinishReason::Cancelled);
             return true;
@@ -570,6 +587,7 @@ private:
             const auto& request = slots_[lane];
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
             instance_.program->abort_lane(lane);
+            if (const auto failure = gpu_failure_after_cleanup({})) std::rethrow_exception(failure);
             if (prefill_lane_ && *prefill_lane_ == lane) {
                 instance_.request_memory.deactivate();
                 prefill_lane_.reset();
@@ -668,6 +686,7 @@ private:
                 prefill_lane_.reset();
             }
             instance_.program->abort_lane(lane);
+            if (const auto failure = gpu_failure_after_cleanup({})) std::rethrow_exception(failure);
             complete_cancelled(request);
             remove_completed_slot(lane);
             return;
@@ -702,10 +721,19 @@ private:
             resolve_prefill_step(request, step, cancel_at_boundary);
         } catch (const RequestCancelled&) {
             instance_.program->abort_lane(lane);
+            if (const auto failure = gpu_failure_after_cleanup({})) std::rethrow_exception(failure);
             instance_.request_memory.deactivate();
             prefill_lane_.reset();
             complete_cancelled(request);
             remove_completed_slot(lane);
+        } catch (...) {
+            instance_.program->abort_lane(lane);
+            const auto error = gpu_failure_after_cleanup(std::current_exception());
+            if (!can_continue_after_gpu_failure(error)) std::rethrow_exception(error);
+            instance_.request_memory.deactivate();
+            prefill_lane_.reset();
+            remove_completed_slot(lane);
+            complete_error(request, error);
         }
         publish_runtime_stats();
     }
@@ -839,6 +867,7 @@ private:
                 if (retained_lane != lane && slots_[retained_lane] == nullptr &&
                     instance_.program->has_retained_lane(retained_lane)) {
                     instance_.program->evict_retained_lane(retained_lane);
+                    if (const auto failure = gpu_failure_after_cleanup({})) std::rethrow_exception(failure);
                     invalidate_lane_plans(retained_lane);
                 }
             }
@@ -911,6 +940,7 @@ private:
             publish_runtime_stats();
         } catch (const RequestCancelled&) {
             if (target_started) { instance_.program->abort_lane(lane); }
+            if (const auto failure = gpu_failure_after_cleanup({})) std::rethrow_exception(failure);
             if (prefill_lane_ && *prefill_lane_ == lane) {
                 instance_.request_memory.deactivate();
                 prefill_lane_.reset();
@@ -920,8 +950,9 @@ private:
             complete_cancelled(request);
             publish_runtime_stats();
         } catch (...) {
-            const std::exception_ptr error = std::current_exception();
             if (target_started) { instance_.program->abort_lane(lane); }
+            const auto error = gpu_failure_after_cleanup(std::current_exception());
+            const bool recovered = target_started && can_continue_after_gpu_failure(error);
             if (prefill_lane_ && *prefill_lane_ == lane) {
                 instance_.request_memory.deactivate();
                 prefill_lane_.reset();
@@ -929,7 +960,7 @@ private:
             slots_[lane].reset();
             invalidate_lane_plans(lane);
             complete_error(request, error);
-            throw;
+            if (!recovered) std::rethrow_exception(error);
         }
         return AdmissionProgress::RanGpuUnit;
     }
@@ -1079,86 +1110,99 @@ private:
 
     void run_decode_round(const RoundMembership& membership) {
         const std::span<const std::uint32_t> lanes = membership.lane_span();
-        const BatchedGeneratedRound round =
-            instance_.program->decode_batch(lanes, membership.budget_span());
+        try {
+            const BatchedGeneratedRound round =
+                instance_.program->decode_batch(lanes, membership.budget_span());
 
-        std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
-        for (std::size_t row = 0; row < lanes.size(); ++row) {
-            cancelled[row] =
-                slots_[lanes[row]]->cancelled.load(std::memory_order_acquire) ? 1U : 0U;
-        }
+            std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                cancelled[row] =
+                    slots_[lanes[row]]->cancelled.load(std::memory_order_acquire) ? 1U : 0U;
+            }
 
-        if (round.row_stride == 0 ||
-            (!round.row_counts.empty() && round.row_counts.size() != lanes.size()) ||
-            round.tokens.size() < static_cast<std::size_t>(round.row_stride) * lanes.size()) {
-            throw std::logic_error("decode batch returned an invalid ragged layout");
-        }
+            if (round.row_stride == 0 ||
+                (!round.row_counts.empty() && round.row_counts.size() != lanes.size()) ||
+                round.tokens.size() < static_cast<std::size_t>(round.row_stride) * lanes.size()) {
+                throw std::logic_error("decode batch returned an invalid ragged layout");
+            }
 
-        std::array<std::uint32_t, kMaximumConcurrency> accepted{};
-        std::array<std::uint8_t, kMaximumConcurrency> terminal{};
-        std::array<FinishReason, kMaximumConcurrency> finish_reasons{};
-        for (std::size_t row = 0; row < lanes.size(); ++row) {
-            const std::uint32_t lane = lanes[row];
-            const auto& request      = slots_[lane];
-            const std::uint32_t count =
-                round.row_counts.empty() ? 1U : static_cast<std::uint32_t>(round.row_counts[row]);
-            if (count == 0 || count > round.row_stride) {
-                throw std::logic_error("decode batch returned an invalid licensed row extent");
+            std::array<std::uint32_t, kMaximumConcurrency> accepted{};
+            std::array<std::uint8_t, kMaximumConcurrency> terminal{};
+            std::array<FinishReason, kMaximumConcurrency> finish_reasons{};
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const std::uint32_t lane = lanes[row];
+                const auto& request      = slots_[lane];
+                const std::uint32_t count =
+                    round.row_counts.empty() ? 1U : static_cast<std::uint32_t>(round.row_counts[row]);
+                if (count == 0 || count > round.row_stride) {
+                    throw std::logic_error("decode batch returned an invalid licensed row extent");
+                }
+                const auto row_tokens =
+                    round.tokens.subspan(row * round.row_stride, static_cast<std::size_t>(count));
+                if (cancelled[row]) {
+                    (void)request->output.preview_terminal(FinishReason::Cancelled);
+                    accepted[row]       = 0;
+                    terminal[row]       = 1;
+                    finish_reasons[row] = FinishReason::Cancelled;
+                    continue;
+                }
+                const OutputDecision decision = request->output.preview(
+                    row_tokens, request->budget->remaining(), request->budget->limit_reason());
+                if (decision.accepted_tokens == 0 || decision.accepted_tokens > count) {
+                    throw std::logic_error("output policy returned an invalid licensed prefix");
+                }
+                accepted[row]       = decision.accepted_tokens;
+                terminal[row]       = decision.finished() ? 1 : 0;
+                finish_reasons[row] = decision.finish_reason;
             }
-            const auto row_tokens =
-                round.tokens.subspan(row * round.row_stride, static_cast<std::size_t>(count));
-            if (cancelled[row]) {
-                (void)request->output.preview_terminal(FinishReason::Cancelled);
-                accepted[row]       = 0;
-                terminal[row]       = 1;
-                finish_reasons[row] = FinishReason::Cancelled;
-                continue;
-            }
-            const OutputDecision decision = request->output.preview(
-                row_tokens, request->budget->remaining(), request->budget->limit_reason());
-            if (decision.accepted_tokens == 0 || decision.accepted_tokens > count) {
-                throw std::logic_error("output policy returned an invalid licensed prefix");
-            }
-            accepted[row]       = decision.accepted_tokens;
-            terminal[row]       = decision.finished() ? 1 : 0;
-            finish_reasons[row] = decision.finish_reason;
-        }
 
-        instance_.program->resolve_pending_batch(
-            lanes, std::span<const std::uint32_t>(accepted.data(), lanes.size()),
-            std::span<const std::uint8_t>(terminal.data(), lanes.size()),
-            std::span<const std::uint8_t>(cancelled.data(), lanes.size()));
+            instance_.program->resolve_pending_batch(
+                lanes, std::span<const std::uint32_t>(accepted.data(), lanes.size()),
+                std::span<const std::uint8_t>(terminal.data(), lanes.size()),
+                std::span<const std::uint8_t>(cancelled.data(), lanes.size()));
 
-        for (std::size_t row = 0; row < lanes.size(); ++row) {
-            const std::uint32_t lane = lanes[row];
-            const auto& request      = slots_[lane];
-            if (!cancelled[row]) {
-                const auto row_tokens = round.tokens.subspan(
-                    row * round.row_stride, static_cast<std::size_t>(accepted[row]));
-                request->generated.insert(request->generated.end(), row_tokens.begin(),
-                                          row_tokens.end());
-                request->budget->commit(accepted[row]);
-                consume_service_work(request, accepted[row]);
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const std::uint32_t lane = lanes[row];
+                const auto& request      = slots_[lane];
+                if (!cancelled[row]) {
+                    const auto row_tokens = round.tokens.subspan(
+                        row * round.row_stride, static_cast<std::size_t>(accepted[row]));
+                    request->generated.insert(request->generated.end(), row_tokens.begin(),
+                                              row_tokens.end());
+                    request->budget->commit(accepted[row]);
+                    consume_service_work(request, accepted[row]);
+                }
+                auto published = request->output.commit_preview();
+                if (!request->first_token && accepted[row] != 0) {
+                    request->first_token = Clock::now();
+                }
+                append_output(request, std::move(published));
+                if (terminal[row]) {
+                    complete_success(request, finish_reasons[row]);
+                    remove_completed_slot(lane);
+                } else if (request->output.has_token_constraint()) {
+                    instance_.program->set_token_mask_lane(lane,
+                                                           request->output.next_token_bitmask());
+                }
             }
-            auto published = request->output.commit_preview();
-            if (!request->first_token && accepted[row] != 0) {
-                request->first_token = Clock::now();
+            ++cumulative_stats_.decode_rounds;
+            cumulative_stats_.decode_row_rounds += lanes.size();
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                if (!cancelled[row]) { cumulative_stats_.committed_decode_tokens += accepted[row]; }
             }
-            append_output(request, std::move(published));
-            if (terminal[row]) {
-                complete_success(request, finish_reasons[row]);
+            publish_runtime_stats();
+        } catch (...) {
+            for (const auto lane : lanes) if (slots_[lane]) instance_.program->abort_lane(lane);
+            const auto error = gpu_failure_after_cleanup(std::current_exception());
+            if (!can_continue_after_gpu_failure(error)) std::rethrow_exception(error);
+            for (const auto lane : lanes) {
+                const auto request = slots_[lane];
+                if (!request) continue;
                 remove_completed_slot(lane);
-            } else if (request->output.has_token_constraint()) {
-                instance_.program->set_token_mask_lane(lane,
-                                                       request->output.next_token_bitmask());
+                complete_error(request, error);
             }
+            publish_runtime_stats();
         }
-        ++cumulative_stats_.decode_rounds;
-        cumulative_stats_.decode_row_rounds += lanes.size();
-        for (std::size_t row = 0; row < lanes.size(); ++row) {
-            if (!cancelled[row]) { cumulative_stats_.committed_decode_tokens += accepted[row]; }
-        }
-        publish_runtime_stats();
     }
 
     void fail_all(std::exception_ptr error) noexcept {
@@ -1177,6 +1221,7 @@ private:
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
                 instance_.program->abort_lane(lane);
+                error = gpu_failure_after_cleanup(error);
                 complete_error(slots_[lane], error);
                 slots_[lane].reset();
             }

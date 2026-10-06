@@ -367,6 +367,9 @@ GenerationService::acquire_media_input(Clock::time_point deadline,
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
+    if (options_.kv_mode == ninfer::KvMode::KVMem && request.current_input_empty) {
+        throw_invalid_input(std::invalid_argument("KVMem requires a non-empty current input event"));
+    }
     PreparedRequest prepared;
     ninfer::RequestOptions request_options = to_request_options(request, options_);
     prepared.include_usage                 = request.include_usage;
@@ -419,6 +422,9 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
 
 int GenerationService::count_prompt_tokens(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
+    if (options_.kv_mode == ninfer::KvMode::KVMem && request.current_input_empty) {
+        throw_invalid_input(std::invalid_argument("KVMem requires a non-empty current input event"));
+    }
     const std::size_t media_items = media_item_count(request);
     const bool request_has_media  = media_items != 0;
     if (request_has_media && !options_.enable_vision) {

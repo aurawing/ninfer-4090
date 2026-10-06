@@ -5,7 +5,9 @@
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -249,6 +251,19 @@ PromptInput prompt_from_messages(const std::filesystem::path& path, bool enable_
     PromptInput input;
     input.options.enable_thinking = enable_thinking;
     if (root.is_object()) {
+        if (root.contains("current_input_message")) {
+            const Json& boundary = root.at("current_input_message");
+            if (!boundary.is_number_integer() ||
+                (boundary.is_number_integer() && !boundary.is_number_unsigned() &&
+                 boundary.get<std::int64_t>() < 0)) {
+                throw std::invalid_argument("current_input_message must be a nonnegative integer");
+            }
+            const auto value = boundary.get<std::uint64_t>();
+            if (value > std::numeric_limits<std::size_t>::max()) {
+                throw std::invalid_argument("current_input_message is out of range");
+            }
+            input.current_input_message = static_cast<std::size_t>(value);
+        }
         if (root.contains("tools")) {
             if (!root.at("tools").is_array()) {
                 throw std::invalid_argument("messages JSON tools must be an array");
@@ -268,6 +283,16 @@ PromptInput prompt_from_messages(const std::filesystem::path& path, bool enable_
     input.messages.reserve(root.size());
     for (std::size_t i = 0; i < root.size(); ++i) {
         input.messages.push_back(parse_message(root.at(i), i, vision_enabled));
+    }
+    if (input.current_input_message) {
+        std::size_t leading_system = 0;
+        while (leading_system < input.messages.size() &&
+               (input.messages[leading_system].role == "system" ||
+                input.messages[leading_system].role == "developer")) { ++leading_system; }
+        if (*input.current_input_message >= input.messages.size() ||
+            *input.current_input_message < leading_system) {
+            throw std::invalid_argument("current_input_message must identify a message after leading system messages");
+        }
     }
     return input;
 }

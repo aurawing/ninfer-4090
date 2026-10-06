@@ -446,6 +446,42 @@ void full_accept_cross_page() {
                            g.mean.begin(), g.mean.end()),
                 "full accepted cross-page published means differ from completed oracle patches");
 }
+void owner_kernel_configurations() {
+    GPU g;
+    // Exact (first modulo 64, valid T) pairs in the external full owner
+    // inventory, plus accepted=2 and zero-row snapshot restoration. Mean-K
+    // does not branch on KV format; it always consumes pre-RoPE BF16.
+    constexpr std::pair<int,int> cases[]{
+        {0,1},{0,2},{0,16},{0,32},{0,63},{0,64},
+        {1,1},{1,3},{1,4},{1,32},{1,64},{2,1},{3,32},{5,3},
+        {16,16},{32,16},{48,16},{63,1},{63,3},{63,4},
+        {1,2},{63,2},{0,0},{1,0},{3,0},{5,0},{16,0},{32,0},{48,0},{63,0}
+    };
+    for (auto [offset,count] : cases) {
+        std::cout << "[kernel-case] meank rows=1024 offset=" << offset
+                  << " valid=" << count << " prefix_restore=" << (count==0) << '\n' << std::flush;
+        const int first=64000+offset;
+        auto prefix=data(offset,64000), input=data(count,first);
+        std::vector<double> exact(R,0.0);
+        for(int t=0;t<offset;++t) for(int r=0;r<R;++r) exact[r]+=bf(prefix[t*R+r]);
+        std::vector<float> seed(exact.begin(),exact.end());
+        g.run(input,first,count,seed);
+        oracle(g,input,first,count,exact);
+        if(!count || !((first+count)%64)) continue;
+        check(cudaMemsetAsync(g.tail.p,205,g.tail.bytes,g.stream));
+        ops::meank_retain_tail(Tensor(g.k.p,DType::BF16,{256,4,count}),first,count,
+                              Tensor(g.tail.p,DType::BF16,{256,4,64}),g.stream);
+        check(cudaStreamSynchronize(g.stream));
+        std::vector<std::uint16_t> actual(64*R);
+        g.tail.copy_to_host(actual.data(),actual.size()*2);
+        const int lo=std::max(0,count-(first+count)%64);
+        for(int slot=0;slot<64;++slot) for(int r=0;r<R;++r) {
+            std::uint16_t expected=0xcdcd;
+            for(int t=lo;t<count;++t) if((first+t)%64==slot) expected=input[t*R+r];
+            require(actual[slot*R+r]==expected,"owner exact retain-tail byte oracle/untouched slots");
+        }
+    }
+}
 } // namespace
 int main() {
     try {
@@ -463,6 +499,7 @@ int main() {
         provisional();
         std::cout << "full_accept_cross_page\n";
         full_accept_cross_page();
+        owner_kernel_configurations();
         std::cout << "MeanK FP64 oracle, snapshots, generation and accepted-only tests passed\n";
         return 0;
     } catch (const std::exception& e) {

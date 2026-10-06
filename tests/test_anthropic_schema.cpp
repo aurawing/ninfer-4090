@@ -400,6 +400,42 @@ int test_tool_use_result_roundtrip() {
     return failures;
 }
 
+int test_current_input_event_boundary() {
+    int failures = 0;
+    const Json result = {{"type", "tool_result"}, {"tool_use_id", "call_a"}, {"content", "a"}};
+    Json result_b = result;
+    result_b["tool_use_id"] = "call_b";
+    const Json text = {{"type", "text"}, {"text", "current text"}};
+    const Json image = {{"type", "image"}, {"source", {{"type", "base64"},
+        {"media_type", "image/png"}, {"data", "AA=="}}}};
+    for (const bool system : {false, true}) {
+        for (const Json& content : {Json::array({result}), Json::array({result, result_b}),
+                                   Json::array({result, text}), Json::array({result, text, image})}) {
+            Json body = {{"model", "m"}, {"max_tokens", 8},
+                {"messages", Json::array({{{"role", "user"}, {"content", "history"}},
+                    {{"role", "assistant"}, {"content", "prior reply"}},
+                    {{"role", "user"}, {"content", content}}})}};
+            if (system) {
+                body["system"] = "top-level system";
+                body["messages"].insert(body["messages"].begin(),
+                    Json{{"role", "system"}, {"content", "leading reminder"}});
+            }
+            const auto request = parse_messages_request(body, default_limits());
+            const std::size_t expected = system ? 3 : 2;
+            failures += check(request.current_input_message == expected,
+                              "current event includes normalized leading tool envelopes");
+            failures += check(request.messages[expected].role == "tool",
+                              "normalization keeps tool envelope order");
+            const auto prompt = translate(request);
+            failures += check(prompt.current_input_message == expected,
+                              "translation forwards original event boundary");
+            failures += check(prompt.messages.size() == request.messages.size(),
+                              "boundary forwarding preserves normalized messages");
+        }
+    }
+    return failures;
+}
+
 int test_thinking_and_sampling() {
     int failures                = 0;
     Json body                   = {{"model", "m"},
@@ -681,6 +717,7 @@ int main() {
     failures += test_parse_image();
     failures += test_tools_and_choice();
     failures += test_tool_use_result_roundtrip();
+    failures += test_current_input_event_boundary();
     failures += test_thinking_and_sampling();
     failures += test_reasoning_effort();
     failures += test_stop_reason_mapping();

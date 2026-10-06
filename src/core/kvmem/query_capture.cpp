@@ -1,6 +1,8 @@
 #include "core/kvmem/query_capture.h"
+#include "core/kvmem/cuda_status.h"
 #include <algorithm>
 #include <atomic>
+#include <exception>
 #include <stdexcept>
 #include <utility>
 namespace ninfer::kvmem {
@@ -35,14 +37,19 @@ std::span<const std::uint16_t> QueryCapture::layer(std::uint32_t layer) const {
     const auto size = provenance_.ordinals.size() * r.dimension * r.heads;
     return {storage_->data.data() + slot_ * (r.slot_bytes / 2) + layer * size, size};
 }
-struct QueryCaptureBorrow::State {
+struct QueryCaptureBorrow::State : std::enable_shared_from_this<QueryCaptureBorrow::State> {
     QueryCaptureHandle handle;
     std::function<void()> drain;
+    // A failed completion retains its source even if the public borrower/pool dies.
+    // Successful explicit retry releases this exceptional quarantine lease.
+    std::shared_ptr<State> failed_lease;
     void finish() {
         if (!handle)
             return;
-        drain(); // completion must succeed before its source lease is released
+        try { drain(); }
+        catch (...) { failed_lease = shared_from_this(); throw; }
         handle.reset();
+        failed_lease.reset();
     }
 };
 QueryCaptureBorrow::~QueryCaptureBorrow() {
@@ -50,7 +57,7 @@ QueryCaptureBorrow::~QueryCaptureBorrow() {
         try {
             state_->finish();
         } catch (...) {
-            std::terminate();
+            // The pool and failed_lease retain the source until a proven drain.
         }
     }
 }
@@ -62,7 +69,7 @@ QueryCaptureBorrow& QueryCaptureBorrow::operator=(QueryCaptureBorrow&& other) no
             try {
                 state_->finish();
             } catch (...) {
-                std::terminate();
+                // The pool and failed_lease retain the source until a proven drain.
             }
         }
         state_ = std::move(other.state_);
@@ -92,7 +99,9 @@ QueryCapturePool::~QueryCapturePool() {
     try {
         drain_borrows();
     } catch (...) {
-        std::terminate();
+        // An unknown completion must retain source storage. Never invoke the
+        // callbacks after the owning pool/runtime has been destroyed.
+        for (auto& task : borrows_) if (task->handle) task->drain = {};
     }
 }
 void QueryCapturePool::begin(QueryProvenance p) {
@@ -149,16 +158,19 @@ QueryCaptureBorrow QueryCapturePool::borrow(const QueryCaptureHandle& handle,
     result.state_->handle = handle;
     result.state_->drain = std::move(drain);
     borrows_.erase(
-        std::remove_if(borrows_.begin(), borrows_.end(), [](const auto& w) { return w.expired(); }),
+        std::remove_if(borrows_.begin(), borrows_.end(), [](const auto& task) { return !task->handle; }),
         borrows_.end());
     borrows_.push_back(result.state_);
     return result;
 }
 void QueryCapturePool::drain_borrows() {
-    for (auto& weak : borrows_)
-        if (auto task = weak.lock())
-            task->finish();
-    borrows_.clear();
+    std::exception_ptr first;
+    for (auto& task : borrows_) {
+        try { task->finish(); }
+        catch (...) { prefer_unrecoverable_exception(first, std::current_exception()); }
+    }
+    std::erase_if(borrows_, [](const auto& task) { return !task->handle; });
+    if (first) std::rethrow_exception(first);
 }
 void QueryCapturePool::reset() {
     drain_borrows();

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <atomic>
 #include <memory>
+#include <exception>
 #include <span>
 
 namespace ninfer {
@@ -30,6 +31,7 @@ struct GraphExecutionProfile {
 };
 
 namespace detail {
+struct ProgramTestAccess;
 template <class Variant>
 struct SequencePlanImpl;
 template <class Variant>
@@ -173,6 +175,10 @@ public:
                                std::span<const std::uint8_t> terminal,
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
+    // Target-owned classification after complete cleanup; the executor keeps
+    // the original request exception and never infers recovery from its type.
+    [[nodiscard]] bool can_continue_after_gpu_failure(std::exception_ptr error) const noexcept;
+    [[nodiscard]] std::exception_ptr gpu_failure_after_cleanup(std::exception_ptr original) const noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
@@ -190,6 +196,7 @@ public:
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;
     std::unique_ptr<detail::ProgramImpl<Variant>> impl_;
+    friend struct detail::ProgramTestAccess;
 
     template <class V>
     friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,

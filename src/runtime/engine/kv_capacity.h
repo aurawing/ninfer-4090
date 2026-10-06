@@ -12,7 +12,7 @@ namespace ninfer::runtime {
 [[nodiscard]] inline KvCapacityPolicy execution_kv_capacity_policy(KvMode mode,
                                                                   const KvCapacityPolicy& requested,
                                                                   bool shadow_validate) {
-    if (mode != KvMode::TieredExact || shadow_validate) return requested;
+    if (mode == KvMode::Dense || (mode == KvMode::TieredExact && shadow_validate)) return requested;
     // An ignored dense explicit capacity carries no automatic reserve. Use
     // the normal automatic default rather than interpreting that zero as an
     // intentional reserve override. Preserve explicit automatic API tuning.
@@ -37,7 +37,8 @@ template <class Factory>
 [[nodiscard]] auto select_prefill_plan(const EngineOptions& requested, bool shadow_validate,
                                        std::size_t available_runtime_bytes, Factory&& make_planner) {
     using Planner = decltype(make_planner(requested));
-    const bool normal_tiered = requested.kv_mode == KvMode::TieredExact && !shadow_validate;
+    const bool normal_tiered = requested.kv_mode == KvMode::KVMem ||
+        (requested.kv_mode == KvMode::TieredExact && !shadow_validate);
     const auto policy = execution_kv_capacity_policy(requested.kv_mode, requested.kv_capacity,
                                                      shadow_validate);
     const auto build = [&](std::uint32_t chunk, bool automatic_trial) {

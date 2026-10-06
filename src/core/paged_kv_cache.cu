@@ -265,66 +265,92 @@ void PagedKVPool::copy_page_from_host(std::size_t plane_index, std::int32_t page
 
 void PagedKVPool::copy_pages_to_host(std::size_t plane_index, std::span<const std::int32_t> page_ids,
                                      void* dst, cudaStream_t stream) const {
-    if (page_ids.empty() || dst == nullptr) { return; }
+    CUDA_CHECK(copy_pages_to_host_status(plane_index, page_ids, dst, stream));
+}
+
+cudaError_t PagedKVPool::copy_pages_to_host_status(std::size_t plane_index, std::span<const std::int32_t> page_ids,
+                                     void* dst, cudaStream_t stream, HostCopyLayout host_layout) const {
+    if (page_ids.empty() || dst == nullptr) { return cudaSuccess; }
     const Tensor& plane = planes_.at(plane_index);
     const auto* base    = static_cast<const unsigned char*>(plane.data);
     auto* dst_ptr       = static_cast<unsigned char*>(dst);
     const std::size_t p_bytes = page_bytes(plane_index);
 
+    for (auto page : page_ids) {
+        if (page < 0 || static_cast<std::uint32_t>(page) >= spec_.page_group_count)
+            throw std::invalid_argument("host copy physical page outside pool");
+    }
     std::size_t i = 0;
     while (i < page_ids.size()) {
         std::size_t run = 1;
-        while (i + run < page_ids.size() && page_ids[i + run] == page_ids[i] + static_cast<std::int32_t>(run)) {
+        while ((spec_.plane_order == PagedKVPlaneOrder::PageMajor ||
+                host_layout == HostCopyLayout::CoalescedRuns) && i + run < page_ids.size() && page_ids[i + run] == page_ids[i] + static_cast<std::int32_t>(run)) {
             ++run;
         }
 
+        cudaError_t status = cudaSuccess;
         const std::int32_t first_page = page_ids[i];
         if (spec_.plane_order == PagedKVPlaneOrder::PageMajor) {
             const auto* src = base + static_cast<std::int64_t>(first_page) * plane.nb[3];
-            CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src, run * plane.nb[3], cudaMemcpyDeviceToHost, stream));
+            status = cudaMemcpyAsync(dst_ptr, src, run * plane.nb[3], cudaMemcpyDeviceToHost, stream);
         } else {
             const std::size_t width  = static_cast<std::size_t>(plane.nb[2]) * run;
             const std::size_t height = static_cast<std::size_t>(plane.ne[3]);
             const auto* src          = base + static_cast<std::int64_t>(first_page) * plane.nb[2];
-            CUDA_CHECK(cudaMemcpy2DAsync(dst_ptr, width, src, plane.nb[3], width, height,
-                                         cudaMemcpyDeviceToHost, stream));
+            status = cudaMemcpy2DAsync(dst_ptr, width, src, plane.nb[3], width, height,
+                                         cudaMemcpyDeviceToHost, stream);
         }
 
+        if (status != cudaSuccess) return status;
         dst_ptr += run * p_bytes;
         i += run;
     }
+    return cudaSuccess;
 }
 
 void PagedKVPool::copy_pages_from_host(std::size_t plane_index, std::span<const std::int32_t> page_ids,
                                        const void* src, cudaStream_t stream) {
-    if (page_ids.empty() || src == nullptr) { return; }
+    CUDA_CHECK(copy_pages_from_host_status(plane_index, page_ids, src, stream));
+}
+
+cudaError_t PagedKVPool::copy_pages_from_host_status(std::size_t plane_index, std::span<const std::int32_t> page_ids,
+                                       const void* src, cudaStream_t stream, HostCopyLayout host_layout) {
+    if (page_ids.empty() || src == nullptr) { return cudaSuccess; }
     const Tensor& plane = planes_.at(plane_index);
     auto* base          = static_cast<unsigned char*>(plane.data);
     const auto* src_ptr = static_cast<const unsigned char*>(src);
     const std::size_t p_bytes = page_bytes(plane_index);
 
+    for (auto page : page_ids) {
+        if (page < 0 || static_cast<std::uint32_t>(page) >= spec_.page_group_count)
+            throw std::invalid_argument("host copy physical page outside pool");
+    }
     std::size_t i = 0;
     while (i < page_ids.size()) {
         std::size_t run = 1;
-        while (i + run < page_ids.size() && page_ids[i + run] == page_ids[i] + static_cast<std::int32_t>(run)) {
+        while ((spec_.plane_order == PagedKVPlaneOrder::PageMajor ||
+                host_layout == HostCopyLayout::CoalescedRuns) && i + run < page_ids.size() && page_ids[i + run] == page_ids[i] + static_cast<std::int32_t>(run)) {
             ++run;
         }
 
+        cudaError_t status = cudaSuccess;
         const std::int32_t first_page = page_ids[i];
         if (spec_.plane_order == PagedKVPlaneOrder::PageMajor) {
             auto* dst = base + static_cast<std::int64_t>(first_page) * plane.nb[3];
-            CUDA_CHECK(cudaMemcpyAsync(dst, src_ptr, run * plane.nb[3], cudaMemcpyHostToDevice, stream));
+            status = cudaMemcpyAsync(dst, src_ptr, run * plane.nb[3], cudaMemcpyHostToDevice, stream);
         } else {
             const std::size_t width  = static_cast<std::size_t>(plane.nb[2]) * run;
             const std::size_t height = static_cast<std::size_t>(plane.ne[3]);
             auto* dst                = base + static_cast<std::int64_t>(first_page) * plane.nb[2];
-            CUDA_CHECK(cudaMemcpy2DAsync(dst, plane.nb[3], src_ptr, width, width, height,
-                                         cudaMemcpyHostToDevice, stream));
+            status = cudaMemcpy2DAsync(dst, plane.nb[3], src_ptr, width, width, height,
+                                         cudaMemcpyHostToDevice, stream);
         }
 
+        if (status != cudaSuccess) return status;
         src_ptr += run * p_bytes;
         i += run;
     }
+    return cudaSuccess;
 }
 
 void PagedKVPool::gather_to_contiguous_device(std::span<const std::int32_t> page_ids, void* d_staging,

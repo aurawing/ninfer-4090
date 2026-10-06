@@ -83,6 +83,13 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
     validate_sampling(options.sampling);
+    if (kvmem_cleanup_failure) std::rethrow_exception(kvmem_cleanup_failure);
+    if (tiered && tiered->sparse_capture()) {
+        const auto query = qwen3_6::detail::query_provenance(prompt, 1, 1, 1,
+            workspace_plan.tiered->scoring_query_tokens, prompt.input_spans.query.empty());
+        qwen3_6::detail::preflight_sparse_turn(qwen3_6::detail::sparse_turn_input(prompt, query),
+            *workspace_plan.tiered, static_cast<std::uint32_t>(prompt.token_ids.size()));
+    }
 
     auto base                             = std::make_unique<RequestBasePlanImpl>();
     base->summary.prompt_tokens           = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -227,6 +234,49 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                 plan->disk_snapshot_path = disk_match->file_path;
             }
         }
+    }
+
+    if (tiered && tiered->sparse_capture()) {
+        const auto caller = sequence.kv ? sequence.kv->identity : 1;
+        auto query = qwen3_6::detail::query_provenance(prompt, caller, caller,
+            query_capture_epoch + 1, workspace_plan.tiered->scoring_query_tokens,
+            prompt.input_spans.query.empty());
+        const auto& saved = plan->reuse == ReusePath::RestoreTurnCheckpoint
+            ? sequence.turn_checkpoint : sequence.resume;
+        const auto capture = saved.main && saved.main->sparse ? saved.main->sparse->query : nullptr;
+        if (prompt.input_spans.query.empty() && sequence.original_query) {
+            try {
+                auto original = qwen3_6::detail::query_provenance_for_ordinals(prompt, caller, caller,
+                    query_capture_epoch + 1, sequence.original_query->ordinals);
+                if (original.source_prefix == sequence.original_query->source_prefix)
+                    query = std::move(original);
+            } catch (const std::invalid_argument&) {} // unrelated history keeps its role-proven cold source
+        }
+        // Tool-only continuation revalidates the complete original query,
+        // including multiple user spans, using its actual saved ordinals.
+        if (plan->reuse != ReusePath::FullReset && prompt.input_spans.query.empty() && capture && capture->valid()) {
+            try {
+                auto original = qwen3_6::detail::query_provenance_for_ordinals(prompt, caller,
+                    caller, query_capture_epoch + 1, capture->provenance().ordinals);
+                if (kvmem::query_capture_matches(capture, original, saved.frontier)) query = std::move(original);
+            } catch (const std::invalid_argument&) {} // cold source remains role-proven
+        }
+        if (plan->reuse != ReusePath::FullReset && plan->reuse_base > query.ordinals.front() &&
+            !kvmem::query_capture_matches(capture, query, plan->reuse_base)) {
+            const auto& checkpoint = sequence.turn_checkpoint;
+            if (checkpoint.valid && checkpoint.frontier <= query.ordinals.front() &&
+                qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+                                                checkpoint.frontier)) {
+                plan->reuse = ReusePath::RestoreTurnCheckpoint;
+                plan->reuse_base = checkpoint.frontier;
+            } else {
+                plan->reuse = ReusePath::FullReset;
+                plan->reuse_base = 0;
+            }
+        }
+        plan->sparse_query_ordinals = query.ordinals;
+        qwen3_6::detail::preflight_sparse_turn(qwen3_6::detail::sparse_turn_input(prompt, query),
+            *workspace_plan.tiered, static_cast<std::uint32_t>(prompt.token_ids.size()));
     }
 
     if (speculative_backend == SpeculativeBackend::Mtp) {

@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <iostream>
 #include <limits>
+#include <new>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -28,6 +30,24 @@ std::vector<std::byte> pattern(std::size_t size, unsigned plane, unsigned page, 
         result[i] = std::byte((i * 37 + plane * 19 + page * 71 + version * 43) & 255);
     }
     return result;
+}
+
+void read_event_allocation_failure_unwinds(HostArchiveMode mode) {
+    LayoutBuilder builder;
+    const auto pool_layout=plan_paged_kv_pool(builder,
+        {2,4,1,PagedKVPlaneOrder::PageMajor,{{DType::I8,16,2}}});
+    const auto archive_layout=plan_host_kv_archive(pool_layout,1,256);
+    HostKVArchiveFaultInjection fault;
+    fault.fail_read_done_allocation=true;
+    bool allocation_failed=false;
+    try { HostKVArchive archive(archive_layout,mode,false,fault); }
+    catch(const std::bad_alloc&) { allocation_failed=true; }
+    require(allocation_failed,"injected archive read-event allocation must unwind as an ordinary bad_alloc");
+    // Failed construction must clean up initialized resources, leaving the same
+    // validated layout reusable by an ordinary archive owner.
+    HostKVArchive retry(archive_layout,mode);
+    retry.synchronize();
+    require(retry.frontier(0)==0,"archive reconstruction retains an empty frontier");
 }
 
 void roundtrip(HostArchiveMode mode, PagedKVPlaneOrder order, bool os_lock = false) {
@@ -144,10 +164,13 @@ void roundtrip(HostArchiveMode mode, PagedKVPlaneOrder order, bool os_lock = fal
 }
 }
 
-int main() {
+int main(int argc,char** argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) { return 77; }
     try {
+        for(auto mode : {HostArchiveMode::Pinned,HostArchiveMode::Pageable,HostArchiveMode::Auto})
+            read_event_allocation_failure_unwinds(mode);
+        if(argc==2 && std::strcmp(argv[1],"--constructor-unwind-only")==0) return 0;
         require(keep_pinned_archive(true, std::uint64_t{4} << 30), "4 GiB boundary admits pin");
         require(!keep_pinned_archive(true, (std::uint64_t{4} << 30) - 1), "headroom rejection");
         require(!keep_pinned_archive(false, std::numeric_limits<std::uint64_t>::max()),

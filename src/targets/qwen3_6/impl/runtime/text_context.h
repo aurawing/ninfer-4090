@@ -177,6 +177,7 @@ public:
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
     void set_mtp_window(qwen3_6::detail::MtpWindow* window) noexcept { mtp_window_=window; }
     void set_tiered_context(qwen3_6::detail::TieredContext* owner) noexcept { tiered_ = owner; }
+    void set_tiered_valid_columns(std::uint32_t count) noexcept { tiered_valid_columns_ = count; }
 
     void set_prefill_turn_checkpoint_frontier(std::int64_t position) noexcept {
         prefill_turn_checkpoint_frontier_ = position;
@@ -306,6 +307,7 @@ private:
     std::uint32_t text_kv_base_;
     qwen3_6::detail::MtpWindow* mtp_window_ = nullptr;
     qwen3_6::detail::TieredContext* tiered_ = nullptr;
+    std::uint32_t tiered_valid_columns_ = 0;
     const Tensor* active_cache_positions_                 = nullptr;
     const Tensor* active_rope_positions_                  = nullptr;
     const Tensor* active_kv_table_rows_                   = nullptr;

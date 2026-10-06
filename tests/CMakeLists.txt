@@ -66,6 +66,8 @@ endfunction()
 ninfer_add_op_test(test_host_kv_transfer SOURCES core/test_host_kv_transfer.cpp)
 ninfer_add_op_test(test_meank_accumulate SOURCES ops/test_meank_accumulate.cpp LIBRARIES ninfer_ops)
 ninfer_add_op_test(test_kvmem_scoring SOURCES ops/test_kvmem_scoring.cpp LIBRARIES ninfer_ops)
+ninfer_add_op_test(test_kvmem_kernel_racecheck
+  SOURCES ops/test_kvmem_kernel_racecheck.cpp LIBRARIES ninfer_ops)
 ninfer_add_op_test(test_meank_index_transfer SOURCES core/test_meank_index_transfer.cpp)
 ninfer_add_op_test(test_host_kv_transfer_engine SOURCES core/test_host_kv_transfer_engine.cpp)
 ninfer_add_op_test(ninfer_test_mtp_window SOURCES targets/qwen3_6/test_mtp_window.cpp LIBRARIES ninfer_engine ninfer_ops)
@@ -73,6 +75,11 @@ target_include_directories(ninfer_test_mtp_window PRIVATE ${PROJECT_SOURCE_DIR}/
 ninfer_add_test(test_mtp_window_plan SOURCES core/test_mtp_window_plan.cpp LIBRARIES ninfer_ops)
 ninfer_add_test(test_kvmem_view_table SOURCES core/test_kvmem_view_table.cpp)
 ninfer_add_test(test_kvmem_budget SOURCES core/test_kvmem_budget.cpp LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_test_kvmem_runtime_owner
+  SOURCES targets/qwen3_6/test_kvmem_runtime_owner.cpp LIBRARIES ninfer_engine ninfer_ops)
+target_include_directories(ninfer_test_kvmem_runtime_owner PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+
 ninfer_add_op_test(ninfer_test_tiered_runtime
   SOURCES targets/qwen3_6/test_tiered_runtime.cpp LIBRARIES ninfer_engine ninfer_ops)
 target_include_directories(ninfer_test_tiered_runtime PRIVATE
@@ -226,6 +233,16 @@ set_tests_properties(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
 # Product protocol contracts.
+ninfer_add_test(ninfer_product_prompt_input_test
+  SOURCES test_product_prompt_input.cpp
+  LIBRARIES ninfer_product_prompt_input)
+ninfer_add_op_test(ninfer_test_kvmem_product
+  SOURCES targets/qwen3_6/test_kvmem_product.cpp
+  LIBRARIES ninfer_engine ninfer_ops)
+target_include_directories(ninfer_test_kvmem_product PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
 ninfer_add_test(ninfer_openai_schema_test
   SOURCES test_openai_schema.cpp
   LIBRARIES ninfer_serve)

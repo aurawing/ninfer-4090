@@ -46,7 +46,22 @@ bool rejects_vision_options(const std::vector<std::string>& flags) {
 
 int main() {
     int failures = 0;
-    failures += check(!accepts({"ninfer-serve", "model.ninfer", "--kv-mode", "kvmem"}), "sparse decode must remain unavailable before stage 4");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--kv-mode", "kvmem"}).kv_mode == ninfer::KvMode::KVMem,
+                      "serve KVMem eager route missing");
+    const auto sparse = parse({"ninfer-serve", "model.ninfer", "--kv-mode", "kvmem",
+        "--kvmem-recent-tokens", "4096", "--kvmem-gen-reserve-tokens", "2048", "--kvmem-query-tokens", "8"});
+    failures += check(sparse.kvmem.recent_tokens == 4096 && sparse.kvmem.gen_reserve_tokens == 2048 &&
+        sparse.kvmem.query_tokens == 8, "serve sparse parameters lost");
+    failures += check(rejects_vision_options({"--kv-mode", "kvmem", "--max-concurrency", "2"}), "sparse C>1 accepted");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--kv-mode", "kvmem", "--kvmem-gen-reserve", "6144"}).kvmem.gen_reserve_tokens == 6144,
+        "approved serve generation reserve spelling missing");
+    for (const auto flag : {"--kvmem-recent-tokens", "--kvmem-gen-reserve", "--kvmem-gen-reserve-tokens"})
+        for (const auto bad : {"63", "65"})
+            failures += check(rejects_vision_options({"--kv-mode", "kvmem", flag, bad}), "invalid sparse page policy accepted");
+    failures += check(accepts({"ninfer-serve", "model.ninfer", "--kv-mode", "kvmem",
+        "--kvmem-recent-tokens", "0", "--kvmem-gen-reserve-tokens", "0"}).has_value(), "approved zero policy rejected");
+    for (const auto bad : {"0", "17"})
+        failures += check(rejects_vision_options({"--kv-mode", "kvmem", "--kvmem-query-tokens", bad}), "invalid query width accepted");
     failures += check(accepts({"ninfer-serve", "model.ninfer", "--kv-mode", "tiered-exact", "--kvmem-prefill", "exact"}).has_value(), "exact prefill missing");
     failures += check(rejects_vision_options({"--kvmem-prefill", "window"}) && rejects_vision_options({"--kvmem-prefill", "invalid"}), "inexact prefill accepted");
     failures += check(accepts({"ninfer-serve", "model.ninfer", "--kv-mode", "tiered-exact", "--kvmem-host-archive", "pageable", "--kvmem-lock-archive"}).has_value(), "pageable VirtualLock missing");

@@ -1,9 +1,11 @@
 #include "core/kvmem/host_kv_archive.h"
+#include "core/kvmem/cuda_status.h"
 #include "core/device.h"
 
 #include <algorithm>
 #include <iostream>
 #include <limits>
+#include <new>
 #include <stdexcept>
 #include <utility>
 
@@ -62,7 +64,7 @@ std::uint64_t available_physical_memory_bytes() {
 void check_host_archive_admission(std::size_t bytes, std::uint64_t available) {
     if (available < kHostArchivePhysicalHeadroom ||
         bytes > available - kHostArchivePhysicalHeadroom) {
-        throw std::runtime_error("host KV archive needs its full capacity plus 4 GiB physical "
+        throw HostMemoryAdmissionError("host KV archive needs its full capacity plus 4 GiB physical "
                                  "headroom; shrink --max-context or use a smaller --kv-dtype "
                                  "(BF16 -> int8 -> rk4v4-e8). --kvmem-host-archive pageable "
                                  "avoids CUDA pin limits but does not waive physical admission");
@@ -217,6 +219,10 @@ struct HostKVArchive::Impl {
 };
 
 HostKVArchive::HostKVArchive(HostKVArchiveLayout layout, HostArchiveMode requested, bool lock_pageable)
+    : HostKVArchive(std::move(layout), requested, lock_pageable, {}) {}
+
+HostKVArchive::HostKVArchive(HostKVArchiveLayout layout, HostArchiveMode requested,
+                             bool lock_pageable, HostKVArchiveFaultInjection fault)
     : impl_(std::make_unique<Impl>()) {
     if (requested != HostArchiveMode::Auto && requested != HostArchiveMode::Pinned &&
         requested != HostArchiveMode::Pageable) {
@@ -255,17 +261,24 @@ HostKVArchive::HostKVArchive(HostKVArchiveLayout layout, HostArchiveMode request
     state.external_done.resize(layers);
     state.pending.resize(layers);
     state.reading.resize(layers);
-    state.done.resize(layers);
+    if (fault.fail_read_done_allocation) throw std::bad_alloc();
     state.read_done.resize(layers);
+    // Destruction indexes read events for every completion event. Allocate
+    // the read-event domain before publishing the completion-event domain.
+    state.done.resize(layers);
     for (std::size_t i = 0; i < layers; ++i) {
         state.committed[i].resize(state.layout.layers[i].size());
-        CUDA_CHECK(cudaEventCreateWithFlags(&state.done[i], cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventCreateWithFlags(&state.read_done[i], cudaEventDisableTiming));
+        check_transfer_cuda(cudaEventCreateWithFlags(&state.done[i], cudaEventDisableTiming),
+                            "archive create completion event");
+        check_transfer_cuda(cudaEventCreateWithFlags(&state.read_done[i], cudaEventDisableTiming),
+                            "archive create read event");
     }
     const char* reason = "explicit pageable";
     if (requested != HostArchiveMode::Pageable) {
         void* pinned = nullptr;
         const auto error = cudaMallocHost(&pinned, state.layout.bytes);
+        if (error != cudaSuccess && cuda_failure_is_fatal(error))
+            check_transfer_cuda(error, "archive pinned admission allocation");
         // Own the successful allocation before the potentially throwing memory query.
         if (error == cudaSuccess) {
             state.data = pinned;
@@ -277,13 +290,15 @@ HostKVArchive::HostKVArchive(HostKVArchiveLayout layout, HostArchiveMode request
             state.mode = HostArchiveMode::Pinned;
             reason = "whole archive pinned, physical headroom >= 4 GiB";
         } else {
-            if (pinned) { CUDA_CHECK(cudaFreeHost(pinned)); }
+            if (pinned) check_transfer_cuda(cudaFreeHost(pinned), "archive rejected admission free");
             state.data = nullptr;
             state.mode = HostArchiveMode::Pageable;
             // A failed admission probe must not leak its CUDA last-error status.
             if (error != cudaSuccess) { (void)cudaGetLastError(); }
             if (requested == HostArchiveMode::Pinned) {
-                throw std::runtime_error("explicit pinned KV archive could not pin full capacity "
+                if (error != cudaSuccess && error != cudaErrorMemoryAllocation)
+                    check_transfer_cuda(error, "explicit archive pinned allocation");
+                throw HostMemoryAdmissionError("explicit pinned KV archive could not pin full capacity "
                                          "with 4 GiB physical headroom; use --kvmem-host-archive pageable, "
                                          "shrink --max-context or use a smaller --kv-dtype");
             }
@@ -357,12 +372,12 @@ void HostKVArchive::synchronize_layer(std::size_t layer) {
         external = {};
     }
     if (state.pending.at(layer)) {
-        CUDA_CHECK(cudaEventSynchronize(state.done[layer]));
+        check_transfer_cuda(cudaEventSynchronize(state.done[layer]), "archive done event drain", true);
         state.frontiers[layer] = state.pending_frontiers[layer];
         state.pending[layer] = false;
     }
     if (state.reading.at(layer)) {
-        CUDA_CHECK(cudaEventSynchronize(state.read_done[layer]));
+        check_transfer_cuda(cudaEventSynchronize(state.read_done[layer]), "archive read_done event drain", true);
         state.reading[layer] = false;
     }
 }
@@ -521,6 +536,42 @@ void HostKVArchive::attach_transfer_owner(void* owner) {
     }
     synchronize();
     impl_->transfer_owner = owner;
+}
+void HostKVArchive::commit_empty_frontiers() noexcept {
+    // recover already retired every completion and advanced archive generation.
+    // Keep the bounded committed backing: decommit is fallible and cannot be
+    // part of the whole-bundle host commit after checked GPU cleanup.
+    auto& state = *impl_;
+    std::fill(state.frontiers.begin(), state.frontiers.end(), 0);
+    std::fill(state.pending_frontiers.begin(), state.pending_frontiers.end(), 0);
+    std::fill(state.pending_first.begin(), state.pending_first.end(), 0);
+    std::fill(state.pending_end.begin(), state.pending_end.end(), 0);
+}
+void HostKVArchive::retire_transfer_completions(bool invalidate_archive) {
+    auto& state = *impl_;
+    if (state.generation == std::numeric_limits<std::uint64_t>::max())
+        throw std::overflow_error("host KV archive generation exhausted");
+    for (std::size_t layer = 0; layer < state.layout.layers.size(); ++layer) {
+        auto& completion = state.external_done[layer];
+        if (completion.valid()) {
+            try {
+                completion.get();
+                state.frontiers[layer] = state.pending_frontiers[layer];
+            } catch (...) {
+                // A canceled job never publishes its prospective frontier. The
+                // transfer owner separately identifies uncertain partial copies.
+            }
+            completion = {};
+        }
+        if (state.pending[layer]) check_transfer_cuda(cudaEventSynchronize(state.done[layer]), "archive done event drain", true);
+        if (state.reading[layer]) check_transfer_cuda(cudaEventSynchronize(state.read_done[layer]), "archive read_done event drain", true);
+        state.pending[layer] = false;
+        state.reading[layer] = false;
+        if (invalidate_archive) state.frontiers[layer] = 0;
+        state.pending_frontiers[layer] = state.frontiers[layer];
+        state.pending_first[layer] = state.pending_end[layer] = 0;
+    }
+    ++state.generation;
 }
 void HostKVArchive::detach_transfer_owner(void* owner) noexcept {
     if (impl_->transfer_owner == owner) { impl_->transfer_owner = nullptr; }

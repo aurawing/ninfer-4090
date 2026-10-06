@@ -88,6 +88,54 @@ void budgets() {
     require(rejected, "view ceiling must admit sink/chunk/replacement floor");
 }
 
+void sparse_budgets() {
+    TieredKVOptions options;
+    options.gen_reserve_tokens = 6144;
+    const auto sparse_limits = tiered_page_limits(32768, 128, options, KvMode::KVMem);
+    require(sparse_limits.minimum == 247 && sparse_limits.maximum == 512,
+        "sparse floor includes worst-case distinct Q pages and straddling recent band");
+    auto small = options; small.view_tokens = 1024; small.sink_tokens = 64;
+    small.recent_tokens = 128; small.gen_reserve_tokens = 128;
+    bool bad_query_capacity = false;
+    try { (void)plan_tiered_runtime(pool(4096, 16), 4096, 16, 64, small, false, false, KvMode::KVMem); }
+    catch (const kvmem::TieredPrefillCapacityError&) { bad_query_capacity = true; }
+    require(bad_query_capacity, "V16/Q16 startup rejects worst-case hard capacity before allocations");
+    small.query_tokens = 2;
+    require(tiered_page_limits(4096, 64, small, KvMode::KVMem).minimum == 10,
+        "explicit Q2 admits small actual owner fixture with same policy");
+    require(sparse_first_loading_mode(kvmem::HostArchiveMode::Auto, false) == kvmem::HostArchiveMode::Pinned,
+            "Auto tries complete pinned bundle before pageable ring admission");
+    require(sparse_first_loading_mode(kvmem::HostArchiveMode::Auto, true) == kvmem::HostArchiveMode::Pageable,
+            "Auto+VirtualLock chooses pageable directly");
+    for (auto chunk : {128U, 1024U, 2048U}) {
+        const auto plan = plan_tiered_runtime(pool(1048576, 2048), 1048576, 2048, chunk,
+            options, false, false, KvMode::KVMem);
+        require(plan.scoring.logits_bytes == 24ULL * 1024 * 1024, "1M/Q16 logits alias is 24 MiB");
+        require(plan.scratch_o.region.bytes >= plan.scoring.logits_bytes,
+                "short-chunk O alias must still fit maximum score logits");
+        require(plan.owned_device_bytes == plan.sparse_capture->device_bytes &&
+                    plan.owned_device_bytes > 0, "capture own allocation separately reserved exactly once");
+        const auto payload = sparse_host_payload_bytes(plan, false);
+        const auto& c = *plan.sparse_capture;
+        require(payload == plan.archive.bytes + c.mean.index_bytes + c.mean.snapshot_bytes +
+            c.mean.host_continuation_bytes + c.mean.host_patch_bytes + c.pinned_bytes +
+            c.pageable_query_bytes + plan.host_score_bytes, "combined host payload accounts every owner byte");
+        require(sparse_host_payload_bytes(plan, true) == payload + (256ULL << 20),
+                "pageable charges exactly four existing 64 MiB ring slots");
+        const auto available = payload + kvmem::kHostArchivePhysicalHeadroom + (128ULL << 20);
+        kvmem::check_host_archive_admission(payload, available);
+        bool pageable_rejected = false;
+        try { kvmem::check_host_archive_admission(sparse_host_payload_bytes(plan, true), available); }
+        catch (const kvmem::HostMemoryAdmissionError&) { pageable_rejected = true; }
+        require(pageable_rejected, "complete pinned bundle may fit boundary where unnecessary ring cannot fit");
+        kvmem::check_host_archive_admission(payload, payload + kvmem::kHostArchivePhysicalHeadroom);
+        bool rejected = false;
+        try { kvmem::check_host_archive_admission(payload, payload + kvmem::kHostArchivePhysicalHeadroom - 1); }
+        catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "combined host admission charges physical headroom once at exact boundary");
+    }
+}
+
 void quantized_budgets() {
     for (bool packed : {false, true}) {
         LayoutBuilder builder;
@@ -248,6 +296,7 @@ void automatic_prefill_complete_budget() {
 int main() {
     try {
         budgets();
+        sparse_budgets();
         quantized_budgets();
         fixed_staging_floor();
         shadow_reference_policy();

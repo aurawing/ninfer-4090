@@ -30,9 +30,12 @@ struct SelectionPlan {
     std::uint32_t capacity{}, sink_pages{}, recent_pages{}, query_pages{}, image_closure_pages{},
         hard_pages{}, current_input_softened_pages{}, skipped_image_groups{}, current_input_pages{},
         image_pages{};
+    std::vector<std::uint32_t> hard_logical_ids;
     std::vector<std::uint32_t> selected, retained, added, removed;
 };
 // Rejects stale/missing capture metadata and hard overflow before any owner mutation.
 // Logical IDs remain original; sorted unique diff contains no compact positions/RoPE.
+// Same D9 closure/current-fit policy, without requiring scores. Pure request admission.
+[[nodiscard]] SelectionPlan preflight_selection(const SelectionInput&);
 [[nodiscard]] SelectionPlan select_pages(const SelectionInput&);
 } // namespace ninfer::kvmem

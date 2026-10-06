@@ -7,12 +7,21 @@
 #include <future>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer::kvmem {
 class HostKVTransferEngine;
 
 enum class HostArchiveMode { Auto, Pinned, Pageable };
+// Deterministic test-only constructor allocation fault, disabled by default.
+struct HostKVArchiveFaultInjection {
+    bool fail_read_done_allocation = false;
+};
+class HostMemoryAdmissionError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 inline constexpr std::uint64_t kHostArchivePhysicalHeadroom = std::uint64_t{4} << 30;
 
 struct HostKVPlaneLayout {
@@ -47,6 +56,8 @@ void check_host_archive_admission(std::size_t archive_bytes, std::uint64_t avail
 class HostKVArchive {
 public:
     explicit HostKVArchive(HostKVArchiveLayout layout, HostArchiveMode requested, bool lock_pageable = false);
+    HostKVArchive(HostKVArchiveLayout layout, HostArchiveMode requested, bool lock_pageable,
+                  HostKVArchiveFaultInjection fault);
     ~HostKVArchive();
     HostKVArchive(const HostKVArchive&) = delete;
     HostKVArchive& operator=(const HostKVArchive&) = delete;
@@ -76,6 +87,11 @@ private:
     void attach_transfer_owner(void* owner);
     void detach_transfer_owner(void* owner) noexcept;
     void trim_owned(std::uint32_t frontier);
+    void commit_empty_frontiers() noexcept;
+    // Transfer owner calls only after both workers and GPU borrowers are drained.
+    // Failed futures are retired deliberately; uncertain destination bytes reset
+    // every valid frontier without reallocating the archive.
+    void retire_transfer_completions(bool invalidate_archive);
     // Read completed history without waiting for a disjoint pending tail write.
     [[nodiscard]] std::span<const std::byte> completed_pages(
         std::size_t layer, std::size_t plane, std::uint32_t first, std::uint32_t count);

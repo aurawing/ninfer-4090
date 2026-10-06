@@ -121,7 +121,11 @@ std::string serve_usage_text(const char* argv0) {
            "  --disk-cache-dir <DIR>            Directory path for prompt cache (default: %LOCALAPPDATA%/ninfer/cache/<profile>)\n"
            "  --disk-cache-gb <N>               Disk cache storage quota limit in GiB (default: 30)\n\n"
            "Quantization & Storage Layouts:\n"
-           "  --kv-mode <mode>            dense (default), tiered-exact (C=1); kvmem requires stage 4 sparse decode\n"
+           "  --kv-mode <mode>            dense (default), tiered-exact or kvmem (C=1 eager, CUDA Graph off)\n"
+           "  --kvmem-recent-tokens <N>   Hard recent band (default 8192, multiple of 64; zero allowed)\n"
+           "  --kvmem-gen-reserve <N>     Generation reserve (default 6144, multiple of 64; zero allowed)\n"
+           "                              Alias: --kvmem-gen-reserve-tokens\n"
+           "  --kvmem-query-tokens <N>    Last original user text tokens (default 16, range 1..16)\n"
            "  --kvmem-view-tokens <N>    Resident view ceiling (default 131072; budget may reduce)\n"
            "                              Alias: --kvmem-view; tiered replaces dense --kv-capacity\n"
            "  --kvmem-sink-tokens <N>    Always-resident prefix (default 256; alias --kvmem-sink)\n"
@@ -231,6 +235,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kvmem-mtp-window") {
             options.kvmem.mtp_window_tokens = parse_positive_u32(require_value("--kvmem-mtp-window"), "kvmem-mtp-window");
             if (!options.kvmem.mtp_window_tokens) throw std::invalid_argument("kvmem-mtp-window must be positive");
+        } else if (arg == "--kvmem-recent-tokens") {
+            options.kvmem.recent_tokens = parse_positive_u32(require_value("--kvmem-recent-tokens"), "kvmem-recent-tokens", true);
+        } else if (arg == "--kvmem-gen-reserve" || arg == "--kvmem-gen-reserve-tokens") {
+            options.kvmem.gen_reserve_tokens = parse_positive_u32(require_value(arg.c_str()), "kvmem-gen-reserve", true);
+        } else if (arg == "--kvmem-query-tokens") {
+            options.kvmem.query_tokens = parse_positive_u32(require_value("--kvmem-query-tokens"), "kvmem-query-tokens");
         } else if (arg == "--kvmem-host-archive") {
             options.kvmem.host_archive = product::parse_host_archive_mode(require_value("--kvmem-host-archive"));
         } else if (arg == "--kvmem-prefill") {

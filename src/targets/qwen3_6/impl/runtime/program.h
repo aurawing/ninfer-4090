@@ -11,6 +11,7 @@
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/tiered_context.h"
+#include "targets/qwen3_6/impl/runtime/sparse_product.h"
 #include "targets/qwen3_6/impl/runtime/mtp_window.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
@@ -79,6 +80,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::filesystem::path disk_snapshot_path;
+    std::vector<std::uint32_t> sparse_query_ordinals;
     std::vector<std::uint32_t> token_mask;
     bool disable_speculation = false;
 };
@@ -174,6 +176,7 @@ struct SequenceState {
     bool retained                 = false;
     TurnCheckpoint turn_checkpoint;
     TurnCheckpoint resume;
+    std::optional<kvmem::QueryProvenance> original_query;
     std::uint32_t last_disk_snapshot_tokens = 0;
 };
 
@@ -203,12 +206,14 @@ struct RequestControl {
         bool prepare_mtp                 = false;
         ReusePath reuse                  = ReusePath::FullReset;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
+        std::optional<kvmem::QueryProvenance> sparse_query;
     };
 
     std::optional<Prefill> prefill;
 };
 
 class ProgramImplCore {
+    friend struct qwen3_6::detail::ProgramTestAccess;
 public:
     ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
                     DeviceContext& device);
@@ -241,6 +246,8 @@ public:
                                std::span<const std::uint8_t> terminal,
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] bool can_continue_after_gpu_failure(std::exception_ptr error) const noexcept;
+    [[nodiscard]] std::exception_ptr gpu_failure_after_cleanup(std::exception_ptr original) const noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
@@ -360,6 +367,10 @@ public:
     const bool vision_enabled;
 
     const bool use_cuda_graph;
+    std::exception_ptr kvmem_cleanup_failure;
+    bool kvmem_cold_cleanup_complete = false;
+    std::exception_ptr kvmem_completed_failure;
+    std::uint64_t query_capture_epoch = 0;
     const std::size_t kv_payload_bytes;
     const std::size_t text_kv_bytes;
     const std::size_t mtp_kv_bytes;
@@ -411,6 +422,10 @@ public:
 private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
+    void prepare_sparse_reset(SequenceState& sequence);
+    void commit_sparse_reset(SequenceState& sequence);
+    void synchronize_execution();
+    void check_kvmem_compute_drain(cudaError_t status);
     void retain_sequence(SequenceState& sequence);
     void restore_continuation(SequenceState& sequence, const TurnCheckpoint& saved, std::uint32_t base);
     void prepare_graphs();

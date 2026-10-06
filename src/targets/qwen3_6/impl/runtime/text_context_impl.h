@@ -836,14 +836,18 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    if (tiered_) tiered_->capture_pre_rope(fidx, qn, kn, s);
+    const int tiered_columns = tiered_valid_columns_ ? static_cast<int>(tiered_valid_columns_) : T;
+    if (tiered_) tiered_->capture_pre_rope(fidx, qn.slice(2, 0, tiered_columns),
+                                         kn.slice(2, 0, tiered_columns), s);
     ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
     if (tiered_ && !tiered_->shadow()) {
-        tiered_->attention(fidx, qn, kn, v, cache_positions.view({T}), attn_scale_, a, s);
+        tiered_->attention(fidx, qn.slice(2, 0, tiered_columns), kn.slice(2, 0, tiered_columns),
+                           v.slice(2, 0, tiered_columns), cache_positions.view({T}).slice(0, 0, tiered_columns),
+                           attn_scale_, a, s);
     } else if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -1294,6 +1298,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
         }
 
+        if (tiered_) tiered_->finish_exact_block();
         if constexpr (requires { tap.consume_prefill_chunk(len, false); }) {
             work_.reset();
             tap.consume_prefill_chunk(len, checkpoint_rel > 0 && t0 + len == checkpoint_rel);
@@ -1309,7 +1314,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
     prefill_turn_checkpoint_frontier_ = -1;
 
-    ctx_.synchronize();
+    if (tiered_ && tiered_->sparse_capture()) tiered_->synchronize_prefill();
+    else ctx_.synchronize();
     work_.reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
                               .finalized        = finalize_at_end && t0 == T};

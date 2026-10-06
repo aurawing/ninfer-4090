@@ -347,7 +347,29 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                       << " guard_pages=" << mp.guard_pages
                       << " main_view_tokens=" << workspace_plan.tiered->view_pages*64U << '\n';
         }
-        std::clog << "[kvmem] tiered-exact supports retained resume and turn checkpoints; disk snapshots remain disabled\n";
+        std::clog << "[kvmem] mode=" << (tiered->sparse_capture() ? "kvmem" : "tiered-exact")
+                  << " CUDA Graph=off disk_cache=off retained_resume=on turn_checkpoints=on\n";
+        if (tiered->sparse_capture()) {
+            const auto actual = tiered->loading_info();
+            const auto& capture = *workspace_plan.tiered->sparse_capture;
+            std::clog << "[kvmem-loading] archive_mode="
+                << (actual.archive_mode == kvmem::HostArchiveMode::Pinned ? "pinned" : "pageable")
+                << " archive_bytes=" << workspace_plan.tiered->archive.bytes
+                << " mean_index_bytes=" << capture.mean.index_bytes
+                << " query_slots_bytes=" << capture.query.pageable_bytes
+                << " capture_pinned_bytes=" << capture.pinned_bytes
+                << " score_host_bytes=" << workspace_plan.tiered->host_score_bytes
+                << " host_payload_bytes=" << actual.host_payload_bytes
+                << " actual_pinned_bytes=" << actual.pinned_bytes
+                << " device_backing_bytes=" << actual.device_backing_bytes
+                << " owned_device_bytes=" << actual.owned_device_bytes
+                << " physical_view_tokens=" << tiered->view_pages() * 64U
+                << " recent_tokens=" << workspace_plan.tiered->recent_tokens
+                << " reserve_pages=" << workspace_plan.tiered->reserve_pages
+                << " guard_pages=" << workspace_plan.tiered->guard_pages
+                << " physical_remaining_bytes=" << actual.physical_remaining_bytes
+                << " physical_headroom_bytes=" << 4ULL * 1024 * 1024 * 1024 << '\n';
+        }
         if (kv_dtype == DType::BF16) {
             std::clog << "[kvmem] BF16 tiered is functional only; large-T performance is not guaranteed\n";
         }
@@ -461,6 +483,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     SequenceState& sequence = sequences[lane];
     RequestControl& request = requests[lane];
+    if (kvmem_cleanup_failure) std::rethrow_exception(kvmem_cleanup_failure);
+    if (tiered && tiered->sparse_capture()) {
+        kvmem_cold_cleanup_complete = false;
+        kvmem_completed_failure = {};
+    }
     if (plan.impl_ == nullptr) { throw std::invalid_argument("request plan is empty"); }
     RequestPlanImpl& request_plan = *plan.impl_;
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
@@ -522,9 +549,12 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     sequence.retained = false;
     try {
         if (request_plan.reuse == ReusePath::FullReset) {
-            if (tiered) { tiered->reset(device.stream); }
+            if (tiered && tiered->sparse_capture())
+                tiered->reset_with_cleanup(device.stream, [&] { prepare_sparse_reset(sequence); });
+            else if (tiered) tiered->reset(device.stream);
+            if (tiered && tiered->sparse_capture()) commit_sparse_reset(sequence);
             sequence.kv.reset();
-            ordered_reset(sequence);
+            if (!tiered || !tiered->sparse_capture()) ordered_reset(sequence);
             sequence.ledger.clear();
             sequence.text_kv_valid = 0;
             sequence.mtp_kv_valid  = 0;
@@ -836,6 +866,24 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         if (request_plan.turn_checkpoint_action != TurnCheckpointAction::KeepExisting) {
             sequence.turn_checkpoint = {};
         }
+        std::optional<kvmem::QueryProvenance> sparse_query;
+        if (tiered && tiered->sparse_capture()) {
+            const auto caller = sequence.kv->identity;
+            sparse_query = qwen3_6::detail::query_provenance_for_ordinals(prompt, caller, caller,
+                ++query_capture_epoch, request_plan.sparse_query_ordinals);
+            const auto& saved = tiered->sparse_capture()->query();
+            if (kvmem::query_capture_matches(saved, *sparse_query, base)) {
+                sparse_query->capture_epoch = saved->provenance().capture_epoch;
+                tiered->use_query(saved, *sparse_query, caller);
+            } else {
+                if (base > sparse_query->ordinals.front())
+                    throw std::logic_error("planned query recapture skipped its first required ordinal");
+                tiered->begin_query(*sparse_query, caller);
+            }
+            // The restored derived state is now owned by Main. Release obsolete
+            // resume handles before any replacement Mean/Q snapshot is captured.
+            sequence.resume = {};
+        }
         request.timings            = {};
         request.cpu_vision_cache   = {};
         request.pending            = {};
@@ -874,6 +922,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .prepare_mtp                      = request_plan.prepare_mtp,
             .reuse                            = request_plan.reuse,
             .mtp_bridge                       = request_plan.mtp_bridge,
+            .sparse_query                     = std::move(sparse_query),
         };
         request.prefill.emplace(std::move(prefill));
         auto& staged = *request.prefill;
@@ -886,10 +935,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         request.lifecycle      = Lifecycle::Prefilling;
         return advance_prefill(sequence, request);
     } catch (...) {
-        try {
-            device.synchronize();
-        } catch (...) {}
+        if (!tiered || !tiered->sparse_capture()) {
+            try { device.synchronize(); } catch (...) {}
+        }
         clear_lane(sequence, request);
+        if (kvmem_cleanup_failure) std::rethrow_exception(kvmem_cleanup_failure);
         throw;
     }
 }
@@ -924,7 +974,9 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                 throw std::logic_error("ordinary pending batch no longer matches Program state");
             }
             if (cancelled[row]) {
+                if (tiered && tiered->sparse_capture()) tiered->flush_accepted_frontier(0);
                 clear_lane(sequences[lane], requests[lane]);
+                if (kvmem_cleanup_failure) std::rethrow_exception(kvmem_cleanup_failure);
             } else {
                 resolve_non_speculative_pending(sequences[lane], requests[lane],
                                                 accepted_tokens[row], terminal[row] != 0);
@@ -976,6 +1028,8 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
 
     const auto tail_started = Clock::now();
     try {
+        if (tiered && tiered->sparse_capture())
+            tiered->flush_accepted_frontier(cancelled[0] ? 0U : accepted_tokens[0]);
         ops::gdn_replay_fold(*replay_records, decoder->linear_attention.all_layers_view(),
                              std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                              device.stream);
@@ -1030,16 +1084,17 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             }
         }
 
-        device.synchronize();
+        synchronize_execution();
         work.reset();
     } catch (...) {
-        try {
-            device.synchronize();
-        } catch (...) {}
+        if (!tiered || !tiered->sparse_capture()) {
+            try { device.synchronize(); } catch (...) {}
+        }
         work.reset();
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
         }
+        if (kvmem_cleanup_failure) std::rethrow_exception(kvmem_cleanup_failure);
         throw;
     }
 
@@ -1051,6 +1106,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             RequestControl& request = requests[lanes[row]];
             if (cancelled[row]) {
                 clear_lane(sequence, request);
+                if (kvmem_cleanup_failure) std::rethrow_exception(kvmem_cleanup_failure);
                 continue;
             }
 
@@ -1112,6 +1168,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
         }
+        if (kvmem_cleanup_failure) std::rethrow_exception(kvmem_cleanup_failure);
         throw;
     }
 }
@@ -1158,8 +1215,67 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     }
     request.prefill.reset();
     if (tiered) {
-        try { tiered->reset(device.stream); }
-        catch (const std::exception& error) { std::clog << "[kvmem] reset: " << error.what() << '\n'; }
+        if (tiered->sparse_capture()) {
+            kvmem_cold_cleanup_complete = false;
+            kvmem_completed_failure = {};
+        }
+        const auto original_failure = std::current_exception();
+        if (original_failure && tiered->sparse_capture()) {
+            try { std::rethrow_exception(original_failure); }
+            catch (const kvmem::CudaTransferError& error) {
+                if (kvmem::cuda_transfer_failure_is_unrecoverable(error.status(), error.drain_failed()))
+                    kvmem::prefer_unrecoverable_exception(kvmem_cleanup_failure, original_failure);
+            } catch (...) {}
+        }
+        bool whole_cold_rebuild = false;
+        if (original_failure) {
+            try { std::rethrow_exception(original_failure); }
+            catch (const qwen3_6::detail::KVMemColdResetRequired&) { whole_cold_rebuild = true; }
+            catch (...) {}
+        }
+        try {
+            if (tiered->sparse_capture() && kvmem_cleanup_failure) {
+                // Any historical failed compute drain remains terminal even if
+                // all owner lanes drain successfully later. Drain borrowers,
+                // then reject before resetting generation or correlated state.
+                tiered->drain();
+                tiered->sparse_capture()->throw_if_unrecoverable();
+                std::rethrow_exception(kvmem_cleanup_failure);
+            }
+            if (tiered->sparse_capture() && tiered->poisoned() && !whole_cold_rebuild) {
+                std::exception_ptr drain_failure;
+                try { tiered->drain(); }
+                catch (...) { drain_failure = std::current_exception(); }
+                // Even when the current operation reported a generic poison,
+                // a historical fatal Q cause outranks it after ALL lanes drain.
+                tiered->sparse_capture()->throw_if_unrecoverable();
+                if (drain_failure) std::rethrow_exception(drain_failure);
+                // Generic owner failures retain poison. Only the explicit
+                // cold-required classification licenses a whole bundle rebuild.
+                if (original_failure) std::rethrow_exception(original_failure);
+                throw std::runtime_error("poisoned KVMem bundle requires explicit cold rebuild");
+            }
+            if (tiered->sparse_capture() && tiered->sparse_capture()->transaction_pending() &&
+                (request.pending.kind == PendingKind::Ordinary || request.pending.kind == PendingKind::Speculative))
+                tiered->flush_accepted_frontier(0);
+            // The checked Main reset preserves original fatal/failed-drain
+            // causes. Only after it succeeds rebuild correlated sequence state.
+            if (tiered->sparse_capture()) {
+                tiered->reset_with_cleanup(device.stream, [&] { prepare_sparse_reset(sequence); });
+                commit_sparse_reset(sequence);
+                if (whole_cold_rebuild)
+                    std::clog << "[kvmem] whole bundle cold rebuild: Main/GDN/MTP/hidden/position/ledger cleared\n";
+            } else tiered->reset(device.stream);
+        } catch (...) {
+            if (tiered->sparse_capture())
+                kvmem::prefer_unrecoverable_exception(kvmem_cleanup_failure, std::current_exception());
+            try { throw; }
+            catch (const std::exception& error) { std::clog << "[kvmem] reset: " << error.what() << '\n'; }
+            catch (...) { std::clog << "[kvmem] reset: unknown failure\n"; }
+            // Preserve the correlated metadata if the checked Main reset failed.
+            // The latched cause blocks every later admission before any mutation.
+            if (tiered->sparse_capture()) return;
+        }
     }
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
@@ -1167,6 +1283,10 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.ledger_frontier    = 0;
     sequence.ledger.clear();
     sequence.prefix_identity.clear();
+    if (tiered && tiered->sparse_capture()) {
+        sequence.rope_delta = 0;
+        sequence.previous_rope_position = {};
+    }
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
@@ -1175,7 +1295,35 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.retained                = false;
     sequence.turn_checkpoint         = {};
     sequence.resume                  = {};
+    sequence.original_query          = {};
     request.pending                  = {};
+    if (tiered && tiered->sparse_capture()) {
+        kvmem_cold_cleanup_complete = true;
+        kvmem_completed_failure = std::current_exception();
+    }
+}
+
+bool ProgramImplCore::can_continue_after_gpu_failure(std::exception_ptr error) const noexcept {
+    // MSVC current_exception may copy the exception at each capture. Successful
+    // cleanup must belong to an exceptional GPU boundary, but pointer identity
+    // cannot establish that relationship. Admission clears this marker before
+    // every request; classify the original executor exception after cleanup.
+    if (!error || !kvmem_completed_failure || !kvmem_cold_cleanup_complete || kvmem_cleanup_failure || !tiered ||
+        !tiered->sparse_capture() || tiered->poisoned() || tiered->frontier() != 0 ||
+        tiered->sparse_capture()->index().frontier() != 0 || sequences[0].kv ||
+        !sequences[0].ledger.empty() || sequences[0].tail_hidden_valid ||
+        requests[0].lifecycle != Lifecycle::Empty)
+        return false;
+    try { std::rethrow_exception(error); }
+    catch (const qwen3_6::detail::KVMemColdResetRequired&) { return true; }
+    catch (const kvmem::CudaTransferError& cause) {
+        return !kvmem::cuda_transfer_failure_is_unrecoverable(cause.status(), cause.drain_failed());
+    }
+    catch (...) { return false; }
+}
+
+std::exception_ptr ProgramImplCore::gpu_failure_after_cleanup(std::exception_ptr original) const noexcept {
+    return kvmem_cleanup_failure ? kvmem_cleanup_failure : std::move(original);
 }
 
 qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {
@@ -1337,7 +1485,10 @@ qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view(const SequenceState& sequ
 }
 
 void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
-    CUDA_CHECK(
+    if (tiered && tiered->sparse_capture())
+        kvmem::check_transfer_cuda(cudaMemcpyAsync(tensor.data, &value, sizeof(value),
+            cudaMemcpyHostToDevice, device.stream), "KVMem Program position update");
+    else CUDA_CHECK(
         cudaMemcpyAsync(tensor.data, &value, sizeof(value), cudaMemcpyHostToDevice, device.stream));
 }
 
@@ -1383,8 +1534,14 @@ void ProgramImplCore::retain_sequence(SequenceState& sequence) {
 }
 
 void ProgramImplCore::ordered_reset(SequenceState& sequence) {
+    const bool sparse = tiered && tiered->sparse_capture();
+    if (sparse) {
+        prepare_sparse_reset(sequence);
+        commit_sparse_reset(sequence);
+        return;
+    }
     sequence.resume = {};
-    if(mtp_window) mtp_window->reset(device.stream);
+    if (mtp_window) mtp_window->reset(device.stream);
     decoder->linear_attention.zero_slot(
         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), device.stream);
     work.reset();
@@ -1395,6 +1552,52 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
+}
+
+void ProgramImplCore::prepare_sparse_reset(SequenceState& sequence) {
+    if (mtp_window) mtp_window->prepare_reset(device.stream);
+    const auto slot = LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+    for (std::uint32_t layer = 0; layer < decoder->linear_attention.layer_count(); ++layer) {
+        const auto conv = decoder->linear_attention.conv_slot(layer, slot);
+        const auto recurrent = decoder->linear_attention.recurrent_slot(layer, slot);
+        kvmem::check_transfer_cuda(cudaMemsetAsync(conv.data, 0, conv.bytes(), device.stream),
+            "KVMem Program GDN conv reset");
+        kvmem::check_transfer_cuda(cudaMemsetAsync(recurrent.data, 0, recurrent.bytes(), device.stream),
+            "KVMem Program GDN recurrent reset");
+    }
+    set_device_i32(io.pos, 0);
+    set_device_i32(io.rope_pos, 0);
+    set_device_i32(io.rope_delta, 0);
+    if (io.mtp) set_device_i32(io.mtp->position, 0);
+    synchronize_execution();
+}
+void ProgramImplCore::commit_sparse_reset(SequenceState& sequence) {
+    if (mtp_window) mtp_window->commit_reset();
+    sequence.resume = {};
+    work.reset();
+    sequence.text_kv_valid = 0;
+    sequence.mtp_kv_valid = 0;
+    sequence.dflash_context_frontier = 0;
+}
+
+void ProgramImplCore::check_kvmem_compute_drain(cudaError_t status) {
+    if (!tiered || !tiered->sparse_capture())
+        throw std::logic_error("checked compute drain requires a KVMem Program");
+    if (kvmem_cleanup_failure) std::rethrow_exception(kvmem_cleanup_failure);
+    try {
+        tiered->sparse_capture()->throw_if_unrecoverable();
+        kvmem::check_transfer_cuda(status, "KVMem Program compute drain", true);
+    } catch (...) {
+        kvmem::prefer_unrecoverable_exception(kvmem_cleanup_failure, std::current_exception());
+        throw;
+    }
+}
+
+void ProgramImplCore::synchronize_execution() {
+    if (tiered && tiered->sparse_capture()) {
+        check_kvmem_compute_drain(cudaSuccess); // historical cause before another CUDA call
+        check_kvmem_compute_drain(cudaStreamSynchronize(device.stream));
+    } else device.synchronize();
 }
 
 void ProgramImplCore::prepare_graphs() {
@@ -2007,6 +2210,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                                     1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
         } else {
             mark_workspace_usage(workspace_plan.ordinary_round);
+            // Exact-hit reuse evaluates no inner block, so it must explicitly
+            // establish the same exact scoring phase as a Prefill begin_block.
+            if (staged.sparse_query) (void)tiered->prepare_exact_prefill();
             if (!sequence.tail_hidden_valid) {
                 throw std::logic_error("zero-suffix reuse has no target tail hidden");
             }
@@ -2038,8 +2244,15 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                                        staged.initial_mtp_extent * sizeof(TokenId),
                                        cudaMemcpyDeviceToHost, device.stream));
         }
-        device.synchronize();
+        synchronize_execution();
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
+        if (staged.sparse_query) {
+            auto input = qwen3_6::detail::sparse_turn_input(staged.prompt, *staged.sparse_query,
+                staged.elapsed_seconds * 1000.0);
+            const auto selected = tiered->select_and_publish(input);
+            qwen3_6::detail::log_sparse_turn(std::clog, selected, input);
+            sequence.original_query = staged.sparse_query;
+        }
         const double vision_seconds = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
         const std::optional<std::uint32_t> turn_checkpoint_capture_frontier =
             staged.turn_checkpoint_capture_frontier;
@@ -2111,10 +2324,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             .host_input_consumed     = host_input_consumed,
         };
     } catch (...) {
-        try {
-            device.synchronize();
-        } catch (...) {}
+        if (!tiered || !tiered->sparse_capture()) {
+            try { device.synchronize(); } catch (...) {}
+        }
         clear_lane(sequence, request);
+        if (kvmem_cleanup_failure) std::rethrow_exception(kvmem_cleanup_failure);
         throw;
     }
 }
@@ -2190,7 +2404,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.ordinary_round);
         schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                         envelope, executable);
-        device.synchronize();
+        synchronize_execution();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -2216,12 +2430,13 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             .tokens = std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(),
                                                lanes.size())};
     } catch (...) {
-        try {
-            device.synchronize();
-        } catch (...) {}
+        if (!tiered || !tiered->sparse_capture()) {
+            try { device.synchronize(); } catch (...) {}
+        }
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
         }
+        if (kvmem_cleanup_failure) std::rethrow_exception(kvmem_cleanup_failure);
         throw;
     }
 }
@@ -2336,7 +2551,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                    draft_window, envelopes, executable);
-        device.synchronize();
+        synchronize_execution();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -2389,12 +2604,13 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                         lanes.size()),
             .row_stride = width};
     } catch (...) {
-        try {
-            device.synchronize();
-        } catch (...) {}
+        if (!tiered || !tiered->sparse_capture()) {
+            try { device.synchronize(); } catch (...) {}
+        }
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
         }
+        if (kvmem_cleanup_failure) std::rethrow_exception(kvmem_cleanup_failure);
         throw;
     }
 }
@@ -2500,7 +2716,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.dflash_round);
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                       draft_window, envelopes, target_envelope, executable);
-        device.synchronize();
+        synchronize_execution();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -2552,12 +2768,13 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                         lanes.size()),
             .row_stride = width};
     } catch (...) {
-        try {
-            device.synchronize();
-        } catch (...) {}
+        if (!tiered || !tiered->sparse_capture()) {
+            try { device.synchronize(); } catch (...) {}
+        }
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
         }
+        if (kvmem_cleanup_failure) std::rethrow_exception(kvmem_cleanup_failure);
         throw;
     }
 }
@@ -2591,6 +2808,7 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
         sequence.ledger_frontier    = request.pending.prompt_tokens + 1;
         break;
     case PendingKind::Ordinary:
+        if (tiered && tiered->sparse_capture()) tiered->flush_accepted_frontier(accepted_tokens);
         sequence.execution_frontier = request.pending.base_E + request.pending.produced;
         if (tiered) sequence.previous_rope_position.fill(
             checked_i32(sequence.execution_frontier - 1, "committed previous position") + sequence.rope_delta);

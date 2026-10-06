@@ -1,5 +1,6 @@
 #pragma once
 #include "core/arena.h"
+#include "targets/qwen3_6/impl/runtime/sparse_capture_resources.h"
 #include "core/kvmem/host_meank_index.h"
 #include "core/kvmem/query_capture.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
@@ -7,15 +8,6 @@
 #include <optional>
 #include <cuda_runtime_api.h>
 namespace ninfer::targets::qwen3_6::detail {
-struct SparseCaptureResources {
-    kvmem::MeanKResources mean;
-    kvmem::QueryCaptureResources query;
-    std::size_t device_bytes{}, pinned_bytes{}, pageable_query_bytes{};
-    bool operator==(const SparseCaptureResources&) const = default;
-};
-[[nodiscard]] SparseCaptureResources plan_sparse_capture_resources(std::uint32_t max_context,
-                                                                   std::uint32_t max_chunk,
-                                                                   std::uint32_t query_tokens = 16);
 // Source prefix includes IDs, all position axes, modality, image identity/groups.
 // It ends at last Q+1, and therefore remains stable as tool/assistant suffixes grow.
 [[nodiscard]] kvmem::QueryProvenance
@@ -56,6 +48,10 @@ class SparseCaptureOwner {
     [[nodiscard]] const kvmem::HostMeanKIndex& index() const noexcept;
     [[nodiscard]] const kvmem::QueryCaptureHandle& query() const noexcept;
     [[nodiscard]] bool transaction_pending() const noexcept;
+    [[nodiscard]] bool poisoned() const noexcept;
+    [[nodiscard]] bool unrecoverable() const noexcept;
+    // Pure validation retains the first fatal/failed-drain exception across later drains.
+    void throw_if_unrecoverable() const;
     void begin_query(kvmem::QueryProvenance); // drains borrowers, releases active before replacing
     void use_query(const kvmem::QueryCaptureHandle&, const kvmem::QueryProvenance&,
                    std::uint32_t restored_frontier);
@@ -65,9 +61,12 @@ class SparseCaptureOwner {
     void flush_accepted_frontier(std::uint32_t accepted_count);
     void discard_transaction();
     [[nodiscard]] SparseDerivedSnapshot capture_snapshot();
+    [[nodiscard]] bool snapshot_valid(const SparseDerivedSnapshot&) const noexcept;
     void restore_snapshot(const SparseDerivedSnapshot&);
     void trim(std::uint32_t frontier);
     void reset();
+    void prepare_reset(); // checked hardware clear; accepted host metadata remains intact on failure
+    void commit_reset(); // only after whole-bundle hardware cleanup has completed
     void drain();
     [[nodiscard]] QueryIndexBinding bind_query(const kvmem::QueryProvenance&,
                                                std::uint32_t frontier) const;

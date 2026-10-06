@@ -195,6 +195,10 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
 struct GenerationRequest {
     std::string model;
     std::vector<ChatTurn> messages;
+    // First normalized message belonging to this input event, before any user
+    // event expands into tool results and text/image messages.
+    std::optional<std::size_t> current_input_message;
+    bool current_input_empty = false;
     std::vector<ToolDefinition> tools;
     std::size_t tool_name_max_length = 64;
     ToolChoice tool_choice;

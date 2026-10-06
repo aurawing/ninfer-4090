@@ -29,7 +29,9 @@ class MtpWindow {
     // remain in a guard INSIDE the configured physical budget until trim.
     void begin_transaction(std::uint32_t base, std::uint32_t extent, cudaStream_t);
     void trim(std::uint32_t frontier, cudaStream_t);
-    void reset(cudaStream_t);
+    void reset(cudaStream_t, bool checked = false);
+    void prepare_reset(cudaStream_t);
+    void commit_reset();
     [[nodiscard]] MtpWindowSnapshot capture(std::uint32_t frontier, cudaStream_t);
     void restore(const MtpWindowSnapshot&, std::uint32_t frontier, cudaStream_t);
     [[nodiscard]] Tensor page_tags() const { return plan_.page_tags.bind(backing_); }

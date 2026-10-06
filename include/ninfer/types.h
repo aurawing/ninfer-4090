@@ -39,6 +39,9 @@ struct TieredKVOptions {
     std::uint32_t view_tokens = 131072;
     std::uint32_t sink_tokens = 256;
     std::uint32_t mtp_window_tokens = 32768;
+    std::uint32_t recent_tokens = 8192;
+    std::uint32_t gen_reserve_tokens = 6144;
+    std::uint32_t query_tokens = 16;
     HostKVArchiveMode host_archive = HostKVArchiveMode::Auto;
     std::size_t staging_capacity_bytes = 0;
     std::size_t partial_budget_bytes = 100ULL * 1024 * 1024;

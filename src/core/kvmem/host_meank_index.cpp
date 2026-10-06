@@ -1,5 +1,6 @@
 #include "core/kvmem/host_meank_index.h"
 #include "core/arena.h"
+#include "core/kvmem/checked_buffers.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -79,7 +80,7 @@ class MeanKSnapshot {
 };
 struct HostMeanKIndex::Impl {
     MeanKResources plan;
-    std::unique_ptr<PinnedHostBuffer> pin;
+    std::unique_ptr<CheckedPinnedHostBuffer> pin;
     std::vector<std::uint16_t> storage, patches;
     std::vector<float> sums, base_sums, patch_sums;
     std::vector<bool> completed;
@@ -118,7 +119,7 @@ HostMeanKIndex::HostMeanKIndex(MeanKResources p, bool pinned) : impl_(std::make_
     impl_->plan = verified;
     auto& state = *impl_;
     if (pinned)
-        state.pin = std::make_unique<PinnedHostBuffer>(verified.index_bytes);
+        state.pin = std::make_unique<CheckedPinnedHostBuffer>(verified.index_bytes);
     else
         state.storage.resize(verified.index_bytes / 2);
     state.patches.resize(verified.means_bytes / 2);

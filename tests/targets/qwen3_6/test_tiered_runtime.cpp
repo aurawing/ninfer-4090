@@ -3,9 +3,11 @@
 #include <ninfer/ops/gqa_attention.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -19,6 +21,81 @@ using namespace ninfer::targets::qwen3_6::detail;
 namespace {
 void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
+}
+
+// Source storage stays alive until the caller synchronizes this consumer stream.
+void upload_on_stream(DeviceBuffer& buffer, const void* source, std::size_t bytes,
+                      cudaStream_t stream) {
+    CUDA_CHECK(cudaMemcpyAsync(buffer.p, source, bytes, cudaMemcpyHostToDevice, stream));
+}
+
+// A reusable input must retain the preceding consumer's bytes and publish its
+// replacement before the following consumer. Pinned storage keeps the controlled
+// upload asynchronous so incidental pageable staging cannot hide either edge.
+void exercise_ordered_input_uploads() {
+    DeviceContext device;
+    constexpr std::size_t count = 64 * 4 * 256;
+    constexpr auto bytes = count * sizeof(std::uint16_t);
+    constexpr std::uint16_t previous = 0x3ef0; // BF16 .46875
+    constexpr std::uint16_t replacement = 0x3f00; // BF16 .5
+    DeviceBuffer input(bytes), keys(bytes), cache_keys(2 * bytes), snapshots(2 * bytes),
+        positions_memory(128 * sizeof(std::int32_t)), table_memory(2 * sizeof(std::int32_t));
+    PinnedHostBuffer source(2 * bytes);
+    auto* data = static_cast<std::uint16_t*>(source.data());
+    std::fill_n(data, count, previous);
+    std::fill_n(data + count, count, replacement);
+    std::vector<std::int32_t> positions(128);
+    for (int token = 0; token < 128; ++token) positions[token] = token;
+    const std::int32_t physical_pages[] = {0, 1};
+    upload_on_stream(input, data, bytes, device.stream);
+    upload_on_stream(positions_memory, positions.data(), positions.size() * sizeof(std::int32_t),
+                     device.stream);
+    upload_on_stream(table_memory, physical_pages, sizeof(physical_pages), device.stream);
+    CUDA_CHECK(cudaMemsetAsync(keys.p, 0, bytes, device.stream));
+    Tensor k(keys.p, DType::BF16, {256, 4, 64});
+    Tensor v(input.p, DType::BF16, {256, 4, 64});
+    Tensor first_positions(positions_memory.p, DType::I32, {64});
+    Tensor next_positions(static_cast<std::int32_t*>(positions_memory.p) + 64, DType::I32, {64});
+    const PagedKVLayerView cache{
+        .k_pages = Tensor(cache_keys.p, DType::BF16, {256, 64, 4, 2}),
+        .v_pages = Tensor(snapshots.p, DType::BF16, {256, 64, 4, 2}),
+        .block_table = Tensor(table_memory.p, DType::I32, {2}),
+        .head_dim = 256,
+        .num_kv_heads = 4};
+    // Warm the launch before the gate so lazy module initialization cannot drain it.
+    ops::gqa_kv_append(k, v, first_positions, cache, device.stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    struct Gate {
+        std::atomic<bool> release{false};
+        std::atomic<bool> timed_out{false};
+        ~Gate() { release.store(true); }
+    } gate;
+    // Allocate every CUDA resource before holding the producer/consumer stream.
+    CUDA_CHECK(cudaLaunchHostFunc(device.stream, [](void* pointer) {
+        auto& state = *static_cast<Gate*>(pointer);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!state.release.load()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                state.timed_out.store(true);
+                return;
+            }
+            std::this_thread::yield();
+        }
+    }, &gate));
+    ops::gqa_kv_append(k, v, first_positions, cache, device.stream);
+    upload_on_stream(input, data + count, bytes, device.stream);
+    ops::gqa_kv_append(k, v, next_positions, cache, device.stream);
+    gate.release.store(true);
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    std::vector<std::uint16_t> observed(2 * count);
+    snapshots.copy_to_host(observed.data(), 2 * bytes);
+    require(!gate.timed_out.load(), "ordered input upload gate must not time out");
+    require(std::all_of(observed.begin(), observed.begin() + count,
+                        [](auto bits) { return bits == previous; }),
+            "input upload must preserve the preceding consumer's source bytes");
+    require(std::all_of(observed.begin() + count, observed.end(),
+                        [](auto bits) { return bits == replacement; }),
+            "input upload must publish replacement bytes to the following consumer");
 }
 
 std::uint16_t bf16(float x) {
@@ -124,7 +201,7 @@ void exercise(bool shadow, DType dtype, HostKVArchiveMode mode = HostKVArchiveMo
         const auto width = !shadow && count == 1 ? 4U : count;
         std::vector<std::int32_t> positions(width, 0);
         for (std::uint32_t t = 0; t < count; ++t) positions[t] = base + t;
-        pos_memory.copy_from_host(positions.data(), positions.size() * 4);
+        upload_on_stream(pos_memory, positions.data(), positions.size() * 4, device.stream);
         owner.begin_block(base, count, device.stream);
         Tensor q(q_memory.p, DType::BF16, {256, 24, int(width)});
         Tensor k(k_memory.p, DType::BF16, {256, 4, int(width)});
@@ -137,7 +214,7 @@ void exercise(bool shadow, DType dtype, HostKVArchiveMode mode = HostKVArchiveMo
                 std::fill_n(input.begin() + t * 1024, 1024, bf16(value(base + t, layer)));
             // Previous layer's append owns these source bytes until its producer has run.
             CUDA_CHECK(cudaStreamSynchronize(device.stream));
-            v_memory.copy_from_host(input.data(), input.size() * 2);
+            upload_on_stream(v_memory, input.data(), input.size() * 2, device.stream);
             if (shadow) {
                 ops::gqa_kv_append(k, v, pos, cache.execution_view(lease).layer_view(layer),
                                    device.stream);
@@ -145,7 +222,7 @@ void exercise(bool shadow, DType dtype, HostKVArchiveMode mode = HostKVArchiveMo
                 for (std::uint32_t t = 0; t < count; ++t)
                     std::fill_n(expected.begin() + t * 6144, 6144,
                                 bf16(float(oracle(base + t, layer))));
-                out_memory.copy_from_host(expected.data(), expected.size() * 2);
+                upload_on_stream(out_memory, expected.data(), expected.size() * 2, device.stream);
                 owner.shadow_attention(layer, q, pos, 0.0625f, out, device.stream);
                 std::vector<std::uint16_t> actual(expected.size());
                 out_memory.copy_to_host(actual.data(), actual.size() * 2);
@@ -301,8 +378,8 @@ void exercise_queued_writeback_fences() {
         std::vector<std::uint16_t> values(256 * 4 * 64, bf16(float(base / 64) * 0.25f));
         std::vector<std::int32_t> positions(64);
         for (int t = 0; t < 64; ++t) positions[t] = base + t;
-        v_memory.copy_from_host(values.data(), values.size() * 2);
-        positions_memory.copy_from_host(positions.data(), positions.size() * 4);
+        upload_on_stream(v_memory, values.data(), values.size() * 2, device.stream);
+        upload_on_stream(positions_memory, positions.data(), positions.size() * 4, device.stream);
         owner.begin_block(base, 64, device.stream);
         Tensor q(q_memory.p, DType::BF16, {256, 24, 64});
         Tensor k(k_memory.p, DType::BF16, {256, 4, 64});
@@ -317,8 +394,8 @@ void exercise_queued_writeback_fences() {
     }
     std::vector<std::uint16_t> fixed_values(256 * 4, bf16(1.0f));
     const std::int32_t position = 256;
-    v_memory.copy_from_host(fixed_values.data(), fixed_values.size() * 2);
-    positions_memory.copy_from_host(&position, sizeof(position));
+    upload_on_stream(v_memory, fixed_values.data(), fixed_values.size() * 2, device.stream);
+    upload_on_stream(positions_memory, &position, sizeof(position), device.stream);
     Tensor q(q_memory.p, DType::BF16, {256, 24, 1});
     Tensor k(k_memory.p, DType::BF16, {256, 4, 1});
     Tensor v(v_memory.p, DType::BF16, {256, 4, 1});
@@ -344,13 +421,15 @@ void exercise_queued_writeback_fences() {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
         std::cout << "SKIP: CUDA device unavailable\n";
         return 77;
     }
     try {
+        exercise_ordered_input_uploads();
+        if (argc == 2 && std::strcmp(argv[1], "--input-upload-only") == 0) return 0;
         exercise(false, DType::BF16);
         exercise(false, DType::I8);
         exercise(false, DType::I8, HostKVArchiveMode::Pinned);

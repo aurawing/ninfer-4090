@@ -68,6 +68,9 @@ void validate_snapshot(const KVViewSnapshot& snapshot, std::uint32_t slots) {
 
 void all_layers_gate_eviction() {
     KVViewTable table(512, 2, 0);
+    const auto empty = table.snapshot();
+    table.preflight_append(0, 128);
+    equal_snapshot(empty, table.snapshot());
     const auto writes = table.begin_append(0, 128);
     require(writes.size() == 2, "append must return each written page");
     for (std::uint32_t layer = 0; layer < 15; ++layer) {
@@ -76,6 +79,7 @@ void all_layers_gate_eviction() {
     require(table.page(0)->state == KVViewState::DeviceOnly, "15 layers cannot publish Both");
     const auto before = table.snapshot();
     rejects([&] { (void)table.plan_restore(128); }, "restore cannot publish unarchived DeviceOnly pages");
+    rejects([&] { table.preflight_append(128, 64); }, "preflight rejects DeviceOnly victim without mutation");
     rejects([&] { (void)table.begin_append(128, 64); }, "DeviceOnly page must not be evicted");
     equal_snapshot(before, table.snapshot());
     require(table.complete_writeback(15, 0, writes[0].epoch), "last layer completion");
@@ -345,6 +349,95 @@ void partial_admission_failure_preserves_all_descriptors() {
             "even completed sink cannot be evicted");
     equal_snapshot(sink_snapshot, sinks_only.snapshot());
 }
+
+void arbitrary_selection_and_recovery_preserve_logical_ownership() {
+    KVViewTable table(2048, 4, 1, 1);
+    for (std::uint32_t p = 0; p < 8; ++p)
+        complete(table, table.begin_append(p * 64, p == 7 ? 13 : 64)[0], 1);
+    const auto before = table.snapshot();
+    const std::vector<std::uint32_t> chosen{0, 2, 5, 7};
+    auto plan = table.plan_selection(before.frontier, chosen);
+    equal_snapshot(before, table.snapshot());
+    require(plan.hydration_pages == std::vector<std::uint32_t>({2}),
+            "arbitrary plan hydrates only missing intersection pages");
+    for (auto p : {0U, 5U, 7U}) require(plan.blocktable[p] == before.blocktable[p],
+                                      "intersection must retain current slot");
+    auto forged = plan;
+    forged.hydration_pages.clear();
+    rejects([&] { table.install_selection(forged); }, "forged selection must be rejected");
+    equal_snapshot(before, table.snapshot());
+    table.install_selection(plan);
+    validate_snapshot(table.snapshot(), 4);
+    rejects([&] { table.install_selection(plan); }, "old selection generation rejected");
+    rejects([&] { (void)table.plan_selection(461, std::vector<std::uint32_t>{0, 2, 2}); },
+            "duplicate logical selection rejected");
+    rejects([&] { (void)table.plan_selection(461, std::vector<std::uint32_t>{2, 0}); },
+            "unsorted logical selection rejected");
+    rejects([&] { (void)table.plan_selection(461, std::vector<std::uint32_t>{0, 8}); },
+            "selection beyond partial frontier rejected");
+    rejects([&] { (void)table.plan_selection(461, std::vector<std::uint32_t>{2, 5, 7}); },
+            "sink cannot be removed by selection");
+    const auto prior_ids = chosen; // A rollback remembers logical IDs, never old slots.
+    table.invalidate_device_ownership();
+    const auto recovery = table.plan_selection(461, prior_ids);
+    require(recovery.hydration_pages == chosen,
+            "victim overwrite recovery must hydrate the complete prior logical view");
+    table.install_selection(recovery);
+    const auto exact = table.plan_restore(451);
+    require(exact.resident.size() == 4 && exact.host_only == std::vector<std::uint32_t>({1,2,3,4}),
+            "next exact prefill plan handles arbitrary sparse history and partial prefix");
+    table.install_restore(exact);
+    const auto writes = table.begin_append(451, 1);
+    require(!writes[0].restore_from_host && writes[0].logical_page == 7,
+            "exact prefill continues from original partial logical tail");
+}
+
+void retrieval_entry_age_and_generation_protection() {
+    KVViewTable table(2048, 4, 0, 1);
+    for (std::uint32_t p = 0; p < 6; ++p)
+        complete(table, table.begin_append(p * 64, 64)[0], 1);
+    // Current 2..5 precede re-retrieved logical page 0 in entry age.
+    table.install_selection(table.plan_selection(384, std::vector<std::uint32_t>{0, 2, 4, 5}));
+    table.set_generation_protection(std::vector<std::uint32_t>{4}, 64);
+    complete(table, table.begin_append(384, 64)[0], 1);
+    require(table.page(2)->state == KVViewState::HostOnly && table.page(0)->state == KVViewState::Both,
+            "reserve eviction follows retrieval entry age rather than oldest logical ID");
+    require(table.page(4)->state == KVViewState::Both && table.page(5)->state == KVViewState::Both,
+            "hard and moving recent pages survive generation eviction");
+    const auto before = table.snapshot();
+    rejects([&] { (void)table.plan_selection(448, std::vector<std::uint32_t>{0, 5, 6}); },
+            "selection may not remove protected hard pages");
+    equal_snapshot(before, table.snapshot());
+    table.set_generation_protection(std::vector<std::uint32_t>{0, 4, 5}, 64);
+    rejects([&] { (void)table.begin_append(448, 64); }, "protected and recent view has no safe victim");
+    equal_snapshot(before, table.snapshot());
+    table.set_generation_protection({}, 0);
+    auto provisional = table.begin_append(448, 64);
+    rejects([&] { (void)table.plan_selection(512, std::vector<std::uint32_t>{0, 4, 5}); },
+            "DeviceOnly provisional page cannot be dropped");
+    table.trim(448);
+    require(!table.complete_writeback(0, 7, provisional[0].epoch),
+            "trim cancels provisional old generation completion");
+}
+
+void selection_plan_binds_source_frontier_and_exact_extension() {
+    KVViewTable table(2048, 4, 0, 1);
+    for (std::uint32_t p=0;p<6;++p)
+        complete(table,table.begin_append(p*64,64)[0],1);
+    table.install_selection(table.plan_selection(384,std::vector<std::uint32_t>{2,5}));
+    table.set_generation_protection(std::vector<std::uint32_t>{2},64);
+    const auto selected=table.snapshot();
+    const auto extension=table.plan_selection(384,std::vector<std::uint32_t>{0,2,4,5});
+    require(extension.blocktable[2]==selected.blocktable[2] &&
+            extension.blocktable[5]==selected.blocktable[5] &&
+            extension.hydration_pages==std::vector<std::uint32_t>({0,4}),
+            "exact mode can fill free slots while retaining protected arbitrary intersection");
+    complete(table,table.begin_append(384,64)[0],1);
+    const auto after_append=table.snapshot();
+    rejects([&] { table.install_selection(extension); },
+            "selection plan must bind source frontier even when all selected revisions survive append");
+    equal_snapshot(after_append,table.snapshot());
+}
 } // namespace
 
 int main() {
@@ -360,7 +453,10 @@ int main() {
         restore_preserves_surviving_slots_and_hydrates_only_missing_pages();
         reset_and_invalid_inputs();
         partial_admission_failure_preserves_all_descriptors();
-        std::cout << "PASS: CPU KV view table (11 cases)\n";
+        arbitrary_selection_and_recovery_preserve_logical_ownership();
+        retrieval_entry_age_and_generation_protection();
+        selection_plan_binds_source_frontier_and_exact_extension();
+        std::cout << "PASS: CPU KV view table (14 cases)\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

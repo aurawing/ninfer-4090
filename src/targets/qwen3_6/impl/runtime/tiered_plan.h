@@ -2,6 +2,9 @@
 
 #include "core/kvmem/host_kv_transfer.h"
 #include "core/kvmem/planning_error.h"
+#include "core/kvmem/scoring_resources.h"
+#include "targets/qwen3_6/impl/runtime/sparse_capture_resources.h"
+#include <optional>
 #include <ninfer/ops/gqa_attention_partial.h>
 #include <ninfer/types.h>
 
@@ -20,21 +23,31 @@ struct TieredPageLimits {
 
 inline TieredPageLimits tiered_page_limits(std::uint32_t logical_tokens,
                                            std::uint32_t prefill_chunk,
-                                           const TieredKVOptions& options) {
+                                           const TieredKVOptions& options,
+                                           KvMode mode = KvMode::TieredExact) {
     if (!logical_tokens || !prefill_chunk || !options.view_tokens) {
         throw std::invalid_argument("tiered context, prefill and view must be positive");
     }
     const auto pages     = [](std::uint32_t tokens) { return tokens / 64U + (tokens % 64U != 0); };
     const auto logical   = pages(logical_tokens);
-    const auto minimum64 = std::uint64_t(pages(options.sink_tokens)) +
-                           pages(std::min(prefill_chunk, logical_tokens)) + 1;
-    const auto minimum   = static_cast<std::uint32_t>(std::min<std::uint64_t>(logical, minimum64));
+    auto minimum64 = std::min<std::uint64_t>(logical,
+        std::uint64_t(pages(options.sink_tokens)) + pages(std::min(prefill_chunk, logical_tokens)) + 1);
+    if (mode == KvMode::KVMem) {
+        if (!options.query_tokens || options.query_tokens > 16 || options.recent_tokens % 64 ||
+            options.gen_reserve_tokens % 64)
+            throw std::invalid_argument("KVMem query/recent/reserve loading policy");
+        // Arbitrary original Q ordinals may occupy one distinct page each.
+        // The recent band may straddle both ends; actual D9 union is checked per request.
+        const auto recent = options.recent_tokens ? std::uint64_t(options.recent_tokens / 64) + 1 : 0;
+        minimum64 = std::max(minimum64, std::uint64_t(pages(options.sink_tokens)) + recent +
+            options.query_tokens + options.gen_reserve_tokens / 64 + 2);
+    }
     const auto maximum   = std::min(logical, pages(options.view_tokens));
-    if (minimum > maximum) {
+    if (minimum64 > maximum) {
         throw kvmem::TieredPrefillCapacityError(
             "tiered view cannot fit sink, prefill chunk and replacement page");
     }
-    return {minimum, maximum};
+    return {static_cast<std::uint32_t>(minimum64), maximum};
 }
 
 struct TieredRuntimePlan {
@@ -60,7 +73,41 @@ struct TieredRuntimePlan {
     std::vector<LayoutRegion> staging_plane_regions;
     std::uint32_t maximum_stream_pages = 0;
     std::size_t bytes                  = 0;
+    std::size_t owned_device_bytes     = 0; // subordinate capture, no duplicate arena backing
+    std::uint32_t recent_tokens{}, reserve_pages{}, guard_pages{}, scoring_query_tokens{};
+    std::optional<SparseCaptureResources> sparse_capture;
+    kvmem::ScoringResources scoring{};
+    std::size_t host_score_bytes{};
 };
+
+inline kvmem::HostArchiveMode sparse_first_loading_mode(kvmem::HostArchiveMode requested, bool lock_archive) {
+    if (lock_archive && requested == kvmem::HostArchiveMode::Pinned)
+        throw std::invalid_argument("VirtualLock cannot apply to pinned KVMem archive");
+    return lock_archive || requested == kvmem::HostArchiveMode::Pageable ?
+        kvmem::HostArchiveMode::Pageable : kvmem::HostArchiveMode::Pinned;
+}
+
+// Payload only; caller charges physical 4 GiB headroom exactly once.
+inline std::size_t sparse_host_payload_bytes(const TieredRuntimePlan& p, bool pageable) {
+    std::size_t total = p.archive.bytes;
+    const auto add = [&](std::size_t bytes) {
+        if (bytes > std::numeric_limits<std::size_t>::max() - total)
+            throw std::overflow_error("combined KVMem host admission overflow");
+        total += bytes;
+    };
+    if (p.sparse_capture) {
+        const auto& c = *p.sparse_capture;
+        add(c.mean.index_bytes);
+        add(c.mean.snapshot_bytes);
+        add(c.mean.host_continuation_bytes);
+        add(c.mean.host_patch_bytes); // index pending patches, distinct from capture bounce
+        add(c.pinned_bytes);
+        add(c.pageable_query_bytes);
+        add(p.host_score_bytes);
+    }
+    if (pageable) add(4 * kvmem::kHostKVTransferTileBytes);
+    return total;
+}
 
 // The 262K RK4 shadow run only collects dense/tiered differences. Its verdict
 // requires the separately captured full-block CPU FP64 reference, not exit 0.
@@ -114,7 +161,8 @@ inline TieredRuntimePlan plan_tiered_runtime(const PagedKVPoolLayout& main_pool,
                                              std::uint32_t logical_tokens, std::uint32_t view_pages,
                                              std::uint32_t max_query_tokens,
                                              const TieredKVOptions& options, bool shadow_validate,
-                                             bool measure_transfer_waits) {
+                                             bool measure_transfer_waits,
+                                             KvMode mode = KvMode::TieredExact) {
     if (!view_pages || !max_query_tokens ||
         (main_pool.planes.size() != 32 && main_pool.planes.size() != 64) ||
         main_pool.spec.plane_order != PagedKVPlaneOrder::PageMajor) {
@@ -135,6 +183,24 @@ inline TieredRuntimePlan plan_tiered_runtime(const PagedKVPoolLayout& main_pool,
         }
     }
     TieredRuntimePlan out;
+    out.mode = mode;
+    if (mode == KvMode::KVMem) {
+        if (shadow_validate || !options.query_tokens || options.query_tokens > 16 ||
+            options.recent_tokens % 64 || options.gen_reserve_tokens % 64)
+            throw std::invalid_argument("KVMem owner policy requires eager mode and page-granular reserves");
+        const auto limits = tiered_page_limits(logical_tokens, max_query_tokens, options, mode);
+        if (view_pages < limits.minimum)
+            throw kvmem::TieredPrefillCapacityError("KVMem actual physical view below sink/recent/query/reserve/guard loading floor");
+        out.recent_tokens = options.recent_tokens;
+        out.reserve_pages = options.gen_reserve_tokens / 64;
+        out.guard_pages = (16 + 126) / 64; // actual Main speculative width <=16, partial boundary guard
+        out.scoring_query_tokens = options.query_tokens;
+        if (std::uint64_t(out.reserve_pages) + out.guard_pages >= view_pages)
+            throw kvmem::TieredPrefillCapacityError("KVMem physical view cannot fit generation reserve and guards");
+        out.sparse_capture = plan_sparse_capture_resources(logical_tokens, max_query_tokens, options.query_tokens);
+        out.owned_device_bytes = out.sparse_capture->device_bytes;
+        out.host_score_bytes = std::size_t((logical_tokens + 63U) / 64U) * sizeof(float) + sizeof(std::int32_t);
+    }
     out.shadow_validate        = shadow_validate;
     out.measure_transfer_waits = measure_transfer_waits;
     out.logical_tokens         = logical_tokens;
@@ -195,7 +261,9 @@ inline TieredRuntimePlan plan_tiered_runtime(const PagedKVPoolLayout& main_pool,
     const auto plane = [&](std::uint64_t tokens, std::uint64_t rows, const char* label) {
         return builder.add_tensor(DType::FP32, {dimension(tokens * rows)}, 256, label);
     };
-    out.scratch_o = plane(scratch_tokens, 256 * 24, "tiered scratch O");
+    const auto score_elements = mode == KvMode::KVMem ?
+        std::uint64_t(out.archive.logical_pages) * 24 * options.query_tokens : 0;
+    out.scratch_o = plane(1, std::max(scratch_tokens * 256 * 24, score_elements), "tiered scratch O");
     out.scratch_m = plane(scratch_tokens, 24, "tiered scratch M");
     out.scratch_l = plane(scratch_tokens, 24, "tiered scratch L");
     out.state_o   = plane(state_tokens, 256 * 24, "tiered state O");
@@ -213,6 +281,16 @@ inline TieredRuntimePlan plan_tiered_runtime(const PagedKVPoolLayout& main_pool,
         plane_offset += bytes;
     }
     out.bytes = builder.finish(256, "tiered runtime backing");
+    if (mode == KvMode::KVMem) {
+        out.partial.bytes = out.scratch_o.region.bytes + out.scratch_m.region.bytes +
+            out.scratch_l.region.bytes + out.state_o.region.bytes + out.state_m.region.bytes +
+            out.state_l.region.bytes;
+        if (out.partial.bytes > options.partial_budget_bytes)
+            throw kvmem::TieredPrefillCapacityError("KVMem score aliases exceed loading partial budget");
+        out.scoring = kvmem::plan_scoring_resources(out.archive.logical_pages, 256, 24, 4,
+            options.query_tokens, out.staging.capacity_bytes, out.scratch_o.region.bytes,
+            out.state_o.region.bytes);
+    }
     return out;
 }
 

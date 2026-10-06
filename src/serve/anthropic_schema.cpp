@@ -359,6 +359,7 @@ void parse_messages(const Json& body, GenerationRequest& out, std::string& syste
             bad_request("message " + std::to_string(i) + " must have content", "messages");
         }
         const Json& content = item.at("content");
+        if (role == "user") { out.current_input_message = out.messages.size(); }
         if (role == "system") {
             // Clients inject reminders as system-role messages inside the messages array, and
             // their text changes every turn. Only a leading one may merge into the system block;
@@ -504,6 +505,7 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
         turn.role = "system";
         turn.content.push_back(ContentPart{ContentKind::Text, std::move(system_text), "text"});
         out.messages.insert(out.messages.begin(), std::move(turn));
+        if (out.current_input_message) { ++*out.current_input_message; }
     }
     parse_stop_sequences(body, out);
     parse_sampling(body, out);

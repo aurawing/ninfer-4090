@@ -122,8 +122,9 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     artifact::Binder binder(reader);
     auto load_plan        = Target::plan_load(binder, options, weights_profile);
     const char* shadow_env = std::getenv("NINFER_KVMEM_SHADOW");
-    const bool normal_tiered = options.kv_mode == KvMode::TieredExact &&
-                               !(shadow_env && std::string_view(shadow_env) == "1");
+    const bool normal_tiered = options.kv_mode == KvMode::KVMem ||
+        (options.kv_mode == KvMode::TieredExact &&
+         !(shadow_env && std::string_view(shadow_env) == "1"));
     const KvCapacityPolicy effective_kv_policy = runtime::execution_kv_capacity_policy(
         options.kv_mode, options.kv_capacity, !normal_tiered);
     if (normal_tiered) {

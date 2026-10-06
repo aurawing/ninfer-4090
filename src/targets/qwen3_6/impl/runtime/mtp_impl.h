@@ -95,6 +95,10 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             state.execution.mtp_window->begin_transaction(base,extent,state.execution.device.stream);
         }
         if (state.execution.tiered) {
+            const auto valid = static_cast<std::uint32_t>(state.host_ingress.current_extents[0]) + 1;
+            card.set_tiered_valid_columns(valid);
+            if (state.execution.tiered->sparse_capture())
+                state.execution.tiered->prepare_main_transaction(kvmem::MeanKTransactionKind::SpeculativeMain, valid);
             state.execution.tiered->begin_block(
                 static_cast<std::uint32_t>(state.host_ingress.base_frontiers[0]),
                 static_cast<std::uint32_t>(state.host_ingress.current_extents[0]) + 1,

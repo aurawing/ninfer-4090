@@ -5,14 +5,15 @@
 #include <stdexcept>
 #include <string>
 namespace ninfer::kvmem {
-SelectionPlan select_pages(const SelectionInput& in) {
-    if (!in.frontier || !in.binding_generation || in.binding_generation != in.score_generation ||
+namespace {
+SelectionPlan selection_impl(const SelectionInput& in, bool preflight) {
+    if (!in.frontier || !in.binding_generation || (!preflight && in.binding_generation != in.score_generation) ||
         in.query_spans.empty())
         throw std::invalid_argument("selection requires committed frontier, current binding "
                                     "generation and scoring query capture");
     auto n = std::uint32_t((std::uint64_t(in.frontier) + 63) / 64);
-    if (in.scores.size() != n ||
-        std::any_of(in.scores.begin(), in.scores.end(), [](float x) { return !std::isfinite(x); }))
+    if (!preflight && (in.scores.size() != n ||
+        std::any_of(in.scores.begin(), in.scores.end(), [](float x) { return !std::isfinite(x); })))
         throw std::invalid_argument("selection scores missing or nonfinite");
     if (std::uint64_t(in.future_reserve) + in.provisional_guards > in.physical_pages)
         throw std::invalid_argument("selection reserves exceed physical pages");
@@ -95,6 +96,9 @@ SelectionPlan select_pages(const SelectionInput& in) {
             " H=" + std::to_string(in.provisional_guards) + " C=" + std::to_string(out.capacity) +
             " current=" + std::to_string(out.current_input_pages) +
             " image=" + std::to_string(out.image_pages));
+    for (std::uint32_t p = 0; p < n; ++p)
+        if (hard[p]) out.hard_logical_ids.push_back(p);
+    if (preflight) return out;
     struct Candidate {
         std::vector<std::uint32_t> pages;
         float score{};
@@ -144,4 +148,7 @@ SelectionPlan select_pages(const SelectionInput& in) {
     }
     return out;
 }
+} // namespace
+SelectionPlan preflight_selection(const SelectionInput& in) { return selection_impl(in, true); }
+SelectionPlan select_pages(const SelectionInput& in) { return selection_impl(in, false); }
 } // namespace ninfer::kvmem

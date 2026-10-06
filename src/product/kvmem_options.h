@@ -9,7 +9,7 @@ namespace ninfer::product {
 inline KvMode parse_kv_mode(std::string_view value) {
     if (value == "dense") return KvMode::Dense;
     if (value == "tiered-exact") return KvMode::TieredExact;
-    if (value == "kvmem") throw std::invalid_argument("--kv-mode kvmem requires stage 4 sparse decode (Mean-K scoring and page selection); use tiered-exact for exact validation");
+    if (value == "kvmem") return KvMode::KVMem;
     throw std::invalid_argument("invalid kv-mode: " + std::string(value));
 }
 inline void validate_kvmem_prefill(std::string_view value) {
@@ -17,12 +17,13 @@ inline void validate_kvmem_prefill(std::string_view value) {
 }
 inline void validate_kvmem_options(KvMode mode, const TieredKVOptions& options,
                                  std::uint32_t concurrency) {
-    if (mode == KvMode::KVMem)
-        throw std::invalid_argument("--kv-mode kvmem requires stage 4 sparse decode; use tiered-exact");
-    if (mode == KvMode::TieredExact && concurrency != 1)
-        throw std::invalid_argument("tiered-exact requires --max-concurrency 1 (C=1)");
-    if (options.lock_archive && (mode != KvMode::TieredExact || options.host_archive == HostKVArchiveMode::Pinned))
-        throw std::invalid_argument("--kvmem-lock-archive requires tiered-exact with auto/pageable archive; CUDA pinned archive already has residency protection");
+    if (mode != KvMode::Dense && concurrency != 1)
+        throw std::invalid_argument("tiered-exact/kvmem requires --max-concurrency 1 (C=1)");
+    if (mode == KvMode::KVMem && (!options.query_tokens || options.query_tokens > 16 ||
+        options.recent_tokens % 64 || options.gen_reserve_tokens % 64))
+        throw std::invalid_argument("kvmem requires query-tokens 1..16 and 64-aligned recent/gen-reserve tokens");
+    if (options.lock_archive && (mode == KvMode::Dense || options.host_archive == HostKVArchiveMode::Pinned))
+        throw std::invalid_argument("--kvmem-lock-archive requires tiered-exact/kvmem with auto/pageable archive; CUDA pinned archive already has residency protection");
 }
 
 inline HostKVArchiveMode parse_host_archive_mode(std::string_view value) {

@@ -177,6 +177,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                                     const ResolvedPromptSemantics& semantics,
                                     const MediaAcquirer& acquire_media) {
     ninfer::PromptInput input;
+    input.current_input_message = request.current_input_message;
     input.messages.reserve(request.messages.size());
     for (const ChatTurn& turn : request.messages) {
         ninfer::ChatMessage message;

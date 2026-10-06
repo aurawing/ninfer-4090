@@ -43,7 +43,21 @@ bool rejects(const std::vector<std::string>& flags) {
 
 int main() {
     int failures = 0;
-    failures += check(rejects({"--kv-mode", "kvmem"}), "sparse decode must remain unavailable before stage 4");
+    failures += check(parse({"--kv-mode", "kvmem"}).kv_mode == ninfer::KvMode::KVMem,
+                      "CLI KVMem eager route missing");
+    const auto sparse = parse({"--kv-mode", "kvmem", "--kvmem-recent-tokens", "4096",
+        "--kvmem-gen-reserve-tokens", "2048", "--kvmem-query-tokens", "8"});
+    failures += check(sparse.kvmem.recent_tokens == 4096 && sparse.kvmem.gen_reserve_tokens == 2048 &&
+        sparse.kvmem.query_tokens == 8, "CLI sparse parameters lost");
+    failures += check(parse({"--kv-mode", "kvmem", "--kvmem-gen-reserve", "6144"}).kvmem.gen_reserve_tokens == 6144,
+        "approved CLI generation reserve spelling missing");
+    for (const auto flag : {"--kvmem-recent-tokens", "--kvmem-gen-reserve", "--kvmem-gen-reserve-tokens"})
+        for (const auto bad : {"63", "65"})
+            failures += check(rejects({"--kv-mode", "kvmem", flag, bad}), "invalid sparse page policy accepted");
+    failures += check(accepts({"--kv-mode", "kvmem", "--kvmem-recent-tokens", "0",
+        "--kvmem-gen-reserve-tokens", "0"}).has_value(), "approved zero recent/reserve policy rejected");
+    for (const auto bad : {"0", "17"})
+        failures += check(rejects({"--kv-mode", "kvmem", "--kvmem-query-tokens", bad}), "invalid query width accepted");
     failures += check(accepts({"--kv-mode", "tiered-exact", "--kvmem-prefill", "exact"}).has_value(), "exact prefill missing");
     failures += check(rejects({"--kvmem-prefill", "window"}) && rejects({"--kvmem-prefill", "invalid"}), "inexact prefill accepted");
     failures += check(accepts({"--kv-mode", "tiered-exact", "--kvmem-host-archive", "pageable", "--kvmem-lock-archive"}).has_value(), "pageable VirtualLock missing");

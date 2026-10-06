@@ -1,6 +1,8 @@
 #include "targets/qwen3_6/impl/runtime/sparse_capture_owner.h"
 #include "targets/qwen3_6/impl/frontend/digest.h"
 #include "core/device.h"
+#include "core/kvmem/checked_buffers.h"
+#define CAPTURE_CHECK(call) checked((call), #call)
 #include <ninfer/ops/meank_accumulate.h>
 #include <algorithm>
 #include <atomic>
@@ -15,16 +17,6 @@ std::uint32_t patches(std::uint32_t first, std::uint32_t count) {
     return (first % 64 + count + 63) / 64;
 }
 } // namespace
-SparseCaptureResources plan_sparse_capture_resources(std::uint32_t context, std::uint32_t chunk,
-                                                     std::uint32_t queries) {
-    SparseCaptureResources out;
-    out.mean = kvmem::plan_meank_resources(context, 16, 256, 4, chunk);
-    out.query = kvmem::plan_query_capture_resources(queries);
-    out.device_bytes = out.mean.device_bytes + out.query.device_bytes;
-    out.pinned_bytes = out.mean.host_patch_bytes + out.query.pinned_bytes;
-    out.pageable_query_bytes = out.query.pageable_bytes;
-    return out;
-}
 static kvmem::QueryProvenance query_provenance_impl(const PreparedPromptData& prompt,
                                                     std::uint64_t bundle, std::uint64_t lineage,
                                                     std::uint64_t epoch, std::uint32_t last_n,
@@ -139,8 +131,8 @@ kvmem::QueryProvenance query_provenance_for_ordinals(const PreparedPromptData& p
 struct SparseCaptureOwner::Impl {
     SparseCaptureResources plan;
     cudaStream_t compute;
-    DeviceBuffer device;
-    PinnedHostBuffer bounce;
+    kvmem::CheckedDeviceBuffer device;
+    kvmem::CheckedPinnedHostBuffer bounce;
     kvmem::HostMeanKIndex index;
     kvmem::QueryCapturePool captures;
     kvmem::QueryCaptureHandle active;
@@ -150,7 +142,9 @@ struct SparseCaptureOwner::Impl {
     std::array<std::uint16_t, 16> query_rows{};
     std::uint64_t owner = next_owner.fetch_add(1), epoch = 1;
     cudaEvent_t completion{};
-    bool poisoned = false;
+    bool poisoned = false, unrecoverable = false;
+    bool reset_prepared = false;
+    std::exception_ptr unrecoverable_cause;
     Impl(SparseCaptureResources p, bool pinned, cudaStream_t stream)
         : plan(p), compute(stream), device(p.device_bytes), bounce(p.pinned_bytes),
           index(p.mean, pinned), captures(p.query) {
@@ -158,12 +152,12 @@ struct SparseCaptureOwner::Impl {
                                                p.query.capacity) ||
             !stream)
             throw std::invalid_argument("Main capture loading plan or stream");
-        CUDA_CHECK(cudaEventCreateWithFlags(&completion, cudaEventDisableTiming));
+        CAPTURE_CHECK(cudaEventCreateWithFlags(&completion, cudaEventDisableTiming));
         try {
             // DeviceBuffer/other loading resources may be initialized on default stream.
-            CUDA_CHECK(cudaDeviceSynchronize());
-            CUDA_CHECK(cudaMemsetAsync(device.p, 0, device.bytes, compute));
-            CUDA_CHECK(cudaStreamSynchronize(compute));
+            CAPTURE_CHECK(cudaDeviceSynchronize());
+            CAPTURE_CHECK(cudaMemsetAsync(device.p, 0, device.bytes, compute));
+            CAPTURE_CHECK(cudaStreamSynchronize(compute));
         } catch (...) {
             cudaEventDestroy(completion);
             throw;
@@ -177,17 +171,41 @@ struct SparseCaptureOwner::Impl {
         }
         cudaEventDestroy(completion);
     }
+    void checked(cudaError_t status, const char* operation, bool drain_failed = false) {
+        if (status == cudaSuccess) return;
+        poisoned = true;
+        const bool fatal = kvmem::cuda_transfer_failure_is_unrecoverable(status, drain_failed);
+        unrecoverable |= fatal;
+        try { kvmem::check_transfer_cuda(status, operation, drain_failed); }
+        catch (...) {
+            if (fatal) kvmem::prefer_unrecoverable_exception(unrecoverable_cause, std::current_exception());
+            throw;
+        }
+    }
+    void throw_if_unrecoverable() const {
+        if (unrecoverable_cause) std::rethrow_exception(unrecoverable_cause);
+        if (unrecoverable) throw std::runtime_error("Main capture fatal/failed drain cannot reset CUDA resources");
+    }
     void healthy() const {
         if (poisoned)
             throw std::logic_error("Main capture owner poisoned");
     }
     void drain() {
         // Even failure must not skip draining borrowed DMA/device addresses.
-        captures.drain_borrows();
-        const auto status = cudaStreamSynchronize(compute);
-        if (status != cudaSuccess)
-            poisoned = true;
-        CUDA_CHECK(status);
+        std::exception_ptr first;
+        try { captures.drain_borrows(); }
+        catch (...) {
+            poisoned = unrecoverable = true;
+            first = std::current_exception();
+            kvmem::prefer_unrecoverable_exception(unrecoverable_cause, first);
+        }
+        try { checked(cudaStreamSynchronize(compute), "capture borrower stream drain", true); }
+        catch (...) { kvmem::prefer_unrecoverable_exception(first, std::current_exception()); }
+        if (first) {
+            kvmem::prefer_unrecoverable_exception(unrecoverable_cause, first);
+            first = unrecoverable_cause;
+        }
+        if (first) std::rethrow_exception(first);
     }
     void* ptr(std::size_t offset) { return static_cast<std::byte*>(device.p) + offset; }
     void* host(std::size_t offset) { return static_cast<std::byte*>(bounce.data()) + offset; }
@@ -207,7 +225,7 @@ struct SparseCaptureOwner::Impl {
             const auto sum = base ? index.base_sum(l) : index.prefix_sum(l);
             std::copy(sum.begin(), sum.end(), saved + l * row());
         }
-        CUDA_CHECK(cudaMemcpyAsync(ptr(plan.mean.seed_sum_offset), saved, plan.mean.sum_bytes,
+        CAPTURE_CHECK(cudaMemcpyAsync(ptr(plan.mean.seed_sum_offset), saved, plan.mean.sum_bytes,
                                    cudaMemcpyHostToDevice, compute));
     }
     void accumulate(std::uint32_t layer, const Tensor& k, std::uint32_t first, std::uint32_t count,
@@ -224,14 +242,14 @@ struct SparseCaptureOwner::Impl {
             ops::meank_retain_tail(k, first, count, k_tail(layer), compute);
         const auto bytes = std::size_t(patches(first, count)) * row() * 2;
         if (bytes)
-            CUDA_CHECK(cudaMemcpyAsync(host(layer * row() * r.patch_pages * 2), output.means.data,
+            CAPTURE_CHECK(cudaMemcpyAsync(host(layer * row() * r.patch_pages * 2), output.means.data,
                                        bytes, cudaMemcpyDeviceToHost, compute));
-        CUDA_CHECK(cudaMemcpyAsync(host(r.means_bytes + layer * row() * 4), output.sum.data,
+        CAPTURE_CHECK(cudaMemcpyAsync(host(r.means_bytes + layer * row() * 4), output.sum.data,
                                    row() * 4, cudaMemcpyDeviceToHost, compute));
     }
     void publish_index() {
-        CUDA_CHECK(cudaEventRecord(completion, compute));
-        CUDA_CHECK(cudaEventSynchronize(completion)); // never publish merely queued patches
+        CAPTURE_CHECK(cudaEventRecord(completion, compute));
+        checked(cudaEventSynchronize(completion), "Main exact capture publication drain", true);
         const auto ticket = *transaction;
         const auto pages = patches(ticket.first, ticket.count);
         for (std::uint32_t layer = 0; layer < 16; ++layer) {
@@ -254,10 +272,10 @@ struct SparseCaptureOwner::Impl {
                          [&](auto rows) { return rows == expected; }))
             return;
         const auto row_count = count * 256 * 24;
-        CUDA_CHECK(cudaMemcpyAsync(host(plan.mean.host_patch_bytes), ptr(plan.mean.device_bytes),
+        CAPTURE_CHECK(cudaMemcpyAsync(host(plan.mean.host_patch_bytes), ptr(plan.mean.device_bytes),
                                    row_count * 16 * 2, cudaMemcpyDeviceToHost, compute));
-        CUDA_CHECK(cudaEventRecord(completion, compute));
-        CUDA_CHECK(cudaEventSynchronize(completion));
+        CAPTURE_CHECK(cudaEventRecord(completion, compute));
+        checked(cudaEventSynchronize(completion), "Main query capture publication drain", true);
         const auto* q = static_cast<const std::uint16_t*>(host(plan.mean.host_patch_bytes));
         for (std::uint32_t l = 0; l < 16; ++l)
             captures.complete_layer(l, {q + l * row_count, row_count});
@@ -278,6 +296,9 @@ const kvmem::HostMeanKIndex& SparseCaptureOwner::index() const noexcept { return
 const kvmem::QueryCaptureHandle& SparseCaptureOwner::query() const noexcept {
     return impl_->active;
 }
+bool SparseCaptureOwner::poisoned() const noexcept { return impl_->poisoned; }
+bool SparseCaptureOwner::unrecoverable() const noexcept { return impl_->unrecoverable; }
+void SparseCaptureOwner::throw_if_unrecoverable() const { impl_->throw_if_unrecoverable(); }
 bool SparseCaptureOwner::transaction_pending() const noexcept {
     return impl_->transaction.has_value();
 }
@@ -288,7 +309,8 @@ void SparseCaptureOwner::begin_query(kvmem::QueryProvenance p) {
     i.drain();
     if (i.transaction)
         throw std::logic_error("replace Q during Main transaction");
-    if (p.covered_frontier > i.plan.mean.max_context)
+    if (p.ordinals.empty() || p.ordinals.front() < i.index.frontier() ||
+        p.covered_frontier > i.plan.mean.max_context)
         throw std::invalid_argument("query capture beyond admitted Main context");
     i.captures.discard();
     i.collecting.reset();
@@ -314,7 +336,7 @@ void SparseCaptureOwner::prepare_transaction(kvmem::MeanKTransactionKind kind, s
     i.healthy();
     if (i.transaction || first != i.index.frontier())
         throw std::invalid_argument("Main capture accepted frontier");
-    i.captures.drain_borrows();
+    i.drain();
     i.transaction = i.index.begin(kind, count);
     i.layers.fill(false);
     i.seeds();
@@ -342,7 +364,7 @@ void SparseCaptureOwner::capture_pre_rope(std::uint32_t layer, const Tensor& qn,
                 if (i.query_rows[layer] & (1U << q))
                     throw std::logic_error("Q ordinal captured twice");
                 const auto bytes = 256ULL * 24 * 2;
-                CUDA_CHECK(cudaMemcpyAsync(
+                i.CAPTURE_CHECK(cudaMemcpyAsync(
                     i.ptr(i.plan.mean.device_bytes + (layer * ordinals.size() + q) * bytes),
                     static_cast<const std::byte*>(qn.data) + (ordinal - ticket.first) * bytes,
                     bytes, cudaMemcpyDeviceToDevice, stream));
@@ -405,6 +427,13 @@ SparseDerivedSnapshot SparseCaptureOwner::capture_snapshot() {
         throw std::logic_error("snapshot before accepted Main publication");
     return {i.index.capture(), i.active, i.index.frontier(), i.owner, i.epoch};
 }
+bool SparseCaptureOwner::snapshot_valid(const SparseDerivedSnapshot& snapshot) const noexcept {
+    const auto& i = *impl_;
+    return !i.poisoned && snapshot.owner == i.owner && snapshot.epoch == i.epoch && snapshot.mean &&
+        i.index.snapshot_matches(snapshot.mean, snapshot.frontier) &&
+        (!snapshot.query || (i.captures.owns(snapshot.query) &&
+                            snapshot.query->provenance().covered_frontier <= snapshot.frontier));
+}
 void SparseCaptureOwner::restore_snapshot(const SparseDerivedSnapshot& snapshot) {
     auto& i = *impl_;
     i.healthy();
@@ -423,7 +452,7 @@ void SparseCaptureOwner::restore_snapshot(const SparseDerivedSnapshot& snapshot)
     i.query_rows.fill(0);
     i.active = snapshot.query;
     i.seeds();
-    CUDA_CHECK(
+    i.CAPTURE_CHECK(
         cudaMemsetAsync(i.ptr(i.plan.mean.tail_offset), 0, i.plan.mean.tail_bytes, i.compute));
     for (std::uint32_t l = 0; l < 16; ++l)
         i.accumulate(l, i.provisional(l), snapshot.frontier, 0);
@@ -454,17 +483,33 @@ void SparseCaptureOwner::trim(std::uint32_t frontier) {
     }
 }
 void SparseCaptureOwner::reset() {
+    prepare_reset();
+    commit_reset();
+}
+void SparseCaptureOwner::prepare_reset() {
     auto& i = *impl_;
+    i.reset_prepared = false;
     i.drain();
+    i.throw_if_unrecoverable();
+    i.poisoned = true;
+    i.CAPTURE_CHECK(cudaMemsetAsync(i.device.p, 0, i.device.bytes, i.compute));
+    i.checked(cudaStreamSynchronize(i.compute), "Main capture reset drain", true);
+    i.reset_prepared = true;
+}
+void SparseCaptureOwner::commit_reset() {
+    auto& i = *impl_;
+    i.throw_if_unrecoverable();
+    if (!i.reset_prepared) throw std::logic_error("Main capture reset was not prepared");
+    // prepare_reset already drained every borrower before issuing the clears.
+    i.captures.reset();
     i.index.reset();
     i.transaction.reset();
-    i.captures.reset();
     i.active.reset();
     i.collecting.reset();
     ++i.epoch;
     i.query_rows.fill(0);
-    CUDA_CHECK(cudaMemsetAsync(i.device.p, 0, i.device.bytes, i.compute));
-    CUDA_CHECK(cudaStreamSynchronize(i.compute));
+    i.reset_prepared = false;
+    i.poisoned = false;
 }
 QueryIndexBinding SparseCaptureOwner::bind_query(const kvmem::QueryProvenance& p,
                                                  std::uint32_t frontier) const {
@@ -500,7 +545,7 @@ Tensor SparseCaptureOwner::upload_query() {
         const auto q = i.active->layer(l);
         std::copy(q.begin(), q.end(), pinned + l * rows);
     }
-    CUDA_CHECK(cudaMemcpyAsync(i.ptr(i.plan.mean.device_bytes), pinned, rows * 16 * 2,
+    i.CAPTURE_CHECK(cudaMemcpyAsync(i.ptr(i.plan.mean.device_bytes), pinned, rows * 16 * 2,
                                cudaMemcpyHostToDevice, i.compute));
     return Tensor(i.ptr(i.plan.mean.device_bytes), DType::BF16, {256, 24, int(count), 16});
 }

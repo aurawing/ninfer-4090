@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/mtp_window.h"
 #include "core/device.h"
+#include "core/kvmem/cuda_status.h"
 #include <ninfer/ops/gqa_kv_append_masked.h>
 #include <ninfer/ops/gqa_attention.h>
 #include <ninfer/ops/gqa_attention_partial.h>
@@ -260,13 +261,31 @@ void MtpWindow::restore(const MtpWindowSnapshot& saved, std::uint32_t frontier, 
                   << " missing_snapshot_pages=" << missing
                   << " draft_history=reduced acceptance_may_decline=1 replay=0\n";
 }
-void MtpWindow::reset(cudaStream_t stream) {
+void MtpWindow::reset(cudaStream_t stream, bool checked) {
+    if (checked) {
+        prepare_reset(stream);
+        commit_reset();
+        return;
+    }
     for (const auto& weak : captures_)
         if (auto capture = weak.lock()) capture->valid = false;
     captures_.clear();
     bundle_identity_ = next_mtp_bundle_identity.fetch_add(1);
     ++generation_;
     CUDA_CHECK(cudaMemsetAsync(page_tags().data, 0xff, page_tags().bytes(), stream));
+    backup_live_ = false;
+}
+void MtpWindow::prepare_reset(cudaStream_t stream) {
+    kvmem::check_transfer_cuda(cudaMemsetAsync(page_tags().data, 0xff, page_tags().bytes(), stream),
+        "KVMem MTP reset tags");
+    kvmem::check_transfer_cuda(cudaStreamSynchronize(stream), "KVMem MTP reset drain", true);
+}
+void MtpWindow::commit_reset() {
+    for (const auto& weak : captures_)
+        if (auto capture = weak.lock()) capture->valid = false;
+    captures_.clear();
+    bundle_identity_ = next_mtp_bundle_identity.fetch_add(1);
+    ++generation_;
     backup_live_ = false;
 }
 } // namespace ninfer::targets::qwen3_6::detail

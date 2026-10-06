@@ -105,7 +105,11 @@ std::string usage_text(const char* argv0) {
            "  --no-cuda-graph             Disable CUDA Graph capture/replay (executes via standard CUDA streams)\n"
            "  --wddm-evictable-budget     Allow aggressive WDDM memory budgeting against total VRAM on dedicated GPUs (Windows only)\n\n"
            "Quantization & Storage Layouts:\n"
-           "  --kv-mode <mode>            dense (default), tiered-exact (C=1); kvmem requires stage 4 sparse decode\n"
+           "  --kv-mode <mode>            dense (default), tiered-exact or kvmem (C=1 eager, CUDA Graph off)\n"
+           "  --kvmem-recent-tokens <N>   Hard recent band (default 8192, multiple of 64; zero allowed)\n"
+           "  --kvmem-gen-reserve <N>     Generation reserve (default 6144, multiple of 64; zero allowed)\n"
+           "                              Alias: --kvmem-gen-reserve-tokens\n"
+           "  --kvmem-query-tokens <N>    Last original user text tokens (default 16, range 1..16)\n"
            "  --kvmem-view-tokens <N>    Resident view ceiling (default 131072; budget may reduce)\n"
            "                              Alias: --kvmem-view; tiered replaces dense --kv-capacity\n"
            "  --kvmem-sink-tokens <N>    Always-resident prefix (default 256; alias --kvmem-sink)\n"
@@ -202,6 +206,12 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kvmem-mtp-window") {
             options.kvmem.mtp_window_tokens = parse_u32(value(arg), "kvmem-mtp-window");
             if (!options.kvmem.mtp_window_tokens) throw std::invalid_argument("kvmem-mtp-window must be positive");
+        } else if (arg == "--kvmem-recent-tokens") {
+            options.kvmem.recent_tokens = parse_u32(value(arg), "kvmem-recent-tokens", true);
+        } else if (arg == "--kvmem-gen-reserve" || arg == "--kvmem-gen-reserve-tokens") {
+            options.kvmem.gen_reserve_tokens = parse_u32(value(arg), "kvmem-gen-reserve-tokens", true);
+        } else if (arg == "--kvmem-query-tokens") {
+            options.kvmem.query_tokens = parse_u32(value(arg), "kvmem-query-tokens");
         } else if (arg == "--kvmem-host-archive") {
             options.kvmem.host_archive = product::parse_host_archive_mode(value(arg));
         } else if (arg == "--kvmem-prefill") {
