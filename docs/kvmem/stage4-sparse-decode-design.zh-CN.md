@@ -1,5 +1,7 @@
 # 阶段 4：Mean-K 检索与稀疏 decode 设计
 
+> 2026-10-06 状态补记：4.4 已审阅通过并实现 eager；4.5 合成质量部分完成、提前终止；4.6 CUDA Graph 推迟。发布 `kvmem-v0.1-experimental` 后停止本轮开发。下文设计与旧计划保留为历史说明，未实施部分不代表发布功能，详见 [实验版说明](release-v0.1-experimental.zh-CN.md)。
+
 本文件是阶段 3 收尾后的阶段 4 设计，按 2026-10-02 用户批准的 D8/D9 修订，并保留评分 mask 与首版图像范围的设计审阅意见。阶段 3 第 8 步及三项 dense 组合回归门禁均已完成；证据见 [progress](progress.zh-CN.md)。本文只有设计，不表示阶段 4 代码已编写、构建或验收。先完成本轮全部文档，再按 [实施清单](stage4-sparse-implementation-plan.zh-CN.md) 顺序推进 4.1–4.4；4.4 后停下审阅，Graph 与 ordinary/MTP capture 性能门禁留到下一轮。
 
 当前文档修订基线：`ninfer-4090@a78b533a3080a7d2284a65aae234e5f748474e29`，分支 `feat/kvmem`；实现接口核对基线为 `c4f145e565eab32fb20a0cac38265e2c37211a30`，早期研究基线为 `db8e9641`。约束以 `AGENTS.md`、[README](README.zh-CN.md) 的 D1–D15、设计文档 5.6/5.10.6，以及 `stage3-view-design.zh-CN.md` 为准。后续接口变动时须重新核对，不把提案名当作已经存在的 API。
@@ -141,6 +143,8 @@ exact prefill 可使用完整物理 view，post-prefill selection 才让出空 r
 提案 core 接口职责：`MeanKIndex::commit/trim/restore/publish()`；`PageScorer::score()`；`SparseSelector::plan()`；`KVViewTable::plan_selection/install_selection()`。target owner 接口职责：设置请求 query/span 元数据、捕获 pre-RoPE、prefill 完成选择、sparse block prepare、accepted frontier 提交、snapshot 派生状态。名字是设计建议，不是已有 API。
 
 ## 7. 单列表 sparse eager decode 与后续 CUDA Graph
+
+2026-10-06：4.4 已审阅通过，用户授权先完成 4.5 合成质量、再实施本节 CUDA Graph 契约与 4.6 性能门禁。矩阵、限时预算及验证流程见 [本轮实施计划](stage4-quality-graph-plan.zh-CN.md)。下面“后续”与“下一轮”描述保留 4.4 的历史边界，不再表示本轮禁止实施 Graph。
 
 复用现有 `AttentionPageAccess{logical_page,physical_page}` 与部分 attention/LSE 数学：一张 logical_page 升序列表，一遍 resident attention，完整页及 frontier 末页有效长度通过 prefix 描述。不能将紧凑列表 ordinal 当原 key 位置；causal 掩码使用原逻辑号×64加页内 offset。
 

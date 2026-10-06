@@ -1,5 +1,7 @@
 # NInfer-4090
 
+The `feat/kvmem` release `kvmem-v0.1-experimental` adds **experimental** host-archived `tiered-exact` and sparse **eager** `kvmem`. The default remains `--kv-mode dense`. Synthetic quality evaluation was stopped early by user decision; sparse CUDA Graphs, full quality gates and real tool replay are unfinished. See the [experimental release guide](docs/kvmem/release-v0.1-experimental.zh-CN.md).
+
 NInfer-4090 is a specialized, high-performance C++20/CUDA inference engine for **Qwen3.8-27B** on a single 24 GB **NVIDIA GeForce RTX 4090** (`sm_89`).
 
 The engine loads the official groupwise `.ninfer` artifact, serves OpenAI- and Anthropic-compatible HTTP APIs, and features native Ada Lovelace MMA tensor core execution, asynchronous double-buffered DMA memory staging, paged KV caching with 2-bit and 4-bit lattice/cylinder quantization, direct L1 block table lookups up to 1M tokens, D3D12 kernel residency management for Windows memory eviction, compatible-prefix reuse, CUDA Graphs, and ReplaySSM linear attention state transactions.

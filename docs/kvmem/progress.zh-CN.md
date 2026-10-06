@@ -456,6 +456,7 @@ rk4v4-e8 的 32K/8K 视图影子第一次运行在首全注意力层、frontier=
 | 2026-10-02 | D9 | hard为sink/recent完整页/query span及图像闭包，另计reserve/guard；全部current闭包union若fits `V-G-H`则全部hard，否则较早非hard current页与历史同域评分竞争、图像原子；记录`current_input_softened_pages`，hard溢出拒绝并报告各项页数 | 用户批准容量规则修订，既有单条长input needle现在可合法软化，结构化历史/短query fixture为额外测试；不以文档修订冒充质量实测 | 是，用户明确同意，批准日期2026-10-02；仅文档已修订，实现未验收 |
 | 2026-10-02 | D1，阶段 3 dense 退出标准 | 首轮 8/9 匹配后，改为三项组合验收：同一确定性临时补丁下旧版/终版九例各两次完整 logits 逐位一致；dense 加载计划一致；生产算法分歧步通过既有门禁 B 的并列/包络规则。以后各阶段沿用 | **在看到 needle-262k-10 第 9 token 271→198 的失败之后作出的事后修订**。首次失败没有 logits，四次后续匹配不证明根因，原失败和严格汇总断言失败保留，不替换原金标准 | 用户已明确批准；三项都通过才提交第 8 步，诊断差异则定位并停下；dense 永久代码不修改 |
 | 2026-10-06 | sanitizer 门禁，D1–D15 不变 | racecheck 改为仅内核级小 shape；owner/e2e 仅完整 synccheck/initcheck，增加实际 kernel/config → 单元测试 racecheck 覆盖对照，有缺口补小 shape | **在完整 owner 插桩约26小时后作出的事后修订**：13 fixture 完成、日志未报告 hazard、停在 fragmented_next_exact，无最终summary，原中止/超时保留；e2e 规模插桩成本不可接受；同一 owner sync/init 已完整0error | 是，2026-10-06 用户明确批准；小 shape 数值与0 hazard判据不放宽 |
+| 2026-10-06 | dense 组合门禁第三项，D1 不变 | **审阅决定、措辞澄清，在 4.5 本次结果之后作出**：只判断本轮旧版/终版各三次的九配对，完整词表相对 L2 不超过固定旧版包络；实际输出分歧须满足原门禁 B 的并列规则。后续阶段不重新证明阶段 3 首轮历史换行翻转 | 4.5 六次输出全同，最大相对 L2 `0.4037602120<0.8199316780`；确定性九例已逐位证明数值未变。Q5 求和顺序决定能否观察历史翻转，要求每轮复现会使门禁随机通过或失败；历史翻转在阶段 3 和 4.4 已两次判为并列。原失败凭据原样保留，另存本轮范围判定，无模型重跑 | 是，2026-10-06 用户明确要求；不放宽包络、实际分歧并列规则或其他两项门禁 |
 
 ## 阶段 3 第 5、6 步：已完成，停在审阅点（2026-10-02）
 
@@ -912,3 +913,49 @@ before 字节按旧版“全部驻留页×全部层/plane”的实际规划及�
 - 两提交已成功push到 `origin/feat/kvmem`；首次push后独立 `ls-remote` 核对远端HEAD为 `fb0d12bac0f924b5e89053ae1e9b4992f4703b6b`，本地HEAD与tracking一致、工作区干净。原始发布凭据 `4.4-publication-first-push-20261006.json` SHA `9ecc12b722e91f9c219e0d76bc1630ad062ec7d307384ffaacf54dfcde61d523`。本段仅补记已完成的实际发布元数据，并随同分支提交；最终HEAD及再推送核对见仓库历史和仓库外 `4.4-final-publication-checkpoint-20261006.json`。
 - 终版文档收尾再次通过独立SPEC→QUALITY；报告 `4.4-final-docdelta-spec-20261006.md` SHA `57bde4e7cfc4291a4ea27b7022acfd093a789b5357d5b96f617ec36e26556b95`、`4.4-final-docdelta-quality-20261006.md` SHA `61a92d0aa15d452cf8e17bbaef3b1b667c4c784c3e4a1e29a1a5371f1bffbeb0`。发布过程未改变已测的生产源码、原313个ops或受保护二进制。
 - **4.4已完成并停审**。未开始4.5；CUDA Graph/capture性能与真实多文件/工具回放质量仍未验收。完整owner racecheck保留为约26小时的用户中止诊断，不作为完整PASS。
+
+### 4.5 / 4.6 启动（2026-10-06）
+
+- 4.4 用户审阅通过；授权顺序为合成质量 4.5、Graph 及性能 4.6，两步完成后停审，见 [本轮计划](stage4-quality-graph-plan.zh-CN.md)。
+- 4.5 每类每档目标 10 case（5 seed × 两种输入形态），冻结完整输入及 truth/SHA；GPU 预算约 24 小时，按耗时从低优先级削减，保留跳过清单。
+- 用户补充决定：信息性 rk4 档请求与 INT8 相同的 32K / 128K token 视图，记录实际分配值；不使用同显存预算的双倍请求。
+- 本轮中间记录及证据统一放仓库外 `D:/deeplearning/NInfer/logs/kvmem-stage4-5-6`。当前是准备阶段，没有模型质量或性能结论，未修改默认分母、dense 内核或分派。
+
+### 4.5 终版门禁结果（2026-10-06，未验收）
+
+- 工具实现通过独立 SPEC v3 / QUALITY v2；120 份主矩阵输入及 3 份不重叠成本试跑输入已完成实际 tokenizer 长度校验，尚未生成主矩阵答案。
+- 全量构建/CTest：117 项，113 通过、4 项其他模型缺失跳过、0 失败；三个小 shape 内核 racecheck 均 0 hazard，完整 owner synccheck/initcheck 均 0 error。证据分别见外部 `4-5-final-v5-full-ctest/completed.json` 与 `4-5-final-v5-sanitizers-v2/summary.json`。
+- dense 确定性诊断：9 用例每版两次，共 36 次；自身重复与旧版/终版的完整词表 logits 全部逐位相同，0 不同有效元素。10 对生产加载计划相同，dense 默认 chunk 与分派保持不变。
+- 生产算法旧版/终版各 3 次，所有 64 个输出 ID 相同；九配对最大相对 L2 为 `0.4037602120`，小于固定旧版包络 `0.8199316780`，本轮实际配对的包络与分歧检查通过。
+- **历史换行分歧的并列证据未通过**：`needle-262k-10` 第 9 步六次都选双换行 ID 271，未选单换行 ID 198；两候选为 top-2，差距均为 `0.125`，旧版三次观察到的差距波动为 `0`，不能据此证明历史分歧属于并列。因此组合门禁总结果为失败；不将“本轮输出一致”替代用户批准的三项组合判据，不追加抽样直到通过，不放宽判据。
+- 串行流水线已在该门禁停止；合成成本试跑、成本裁剪、正式质量矩阵及 4.6 尚未开始，4.5 未提交/push。此前 4.4 的通过记录保留，本轮失败不覆盖它。
+- 临时诊断已撤回：1091 文件 SHA 核对全部恢复、临时头文件不存在，生产 CLI/serve 清理重建完成。所有原始运行与失败结果保留在外部 `dense-composite-gate-4.5/`；正式判定为 `production-gate-b-summary.json`，总状态为 `gate-session.json`，停止记录为 `final-v5-pipeline-v2/dense-composite-completed.json`。
+
+### 4.5 dense 范围澄清与恢复（2026-10-06，审阅决定）
+
+- 本段追加于上述失败之后，原失败与全部原始日志不改写。审阅明确第三项只判本轮九配对，不再要求重现/证明阶段 3 首轮的历史翻转，README 和偏差表已同步；数值阈值、实际分歧规则及前两项门禁不变。
+- 不重跑模型，按已完成的旧版/终版各三次数据核对：六次 64 ID 全同，九配对完整词表最大相对 L2 `0.4037602120<0.8199316780`，本轮没有需要并列判定的实际分歧。按澄清后的范围，第三项及整个 dense 组合门禁通过。
+- `needle-262k-10` 第 9 步：旧版三次的 `(ID271, ID198)` logits 为 `(23.75,23.625)`、`(23.875,23.75)`、`(23.625,23.5)`；终版三次均为 `(23.875,23.75)`。全部在 `[16,32)`，BF16 该区间 ulp=`2^(4-7)=0.125`，差距恰为 1 ulp；这是补充说明，不替代本轮包络与分歧规则。
+- 新判定另存仓库外 `review-clarification-20261006/` 与 `dense-composite-clarified-receipt-20261006.json`，绑定原失败/诊断/计划/六次实际运行及恢复的 SHA；恢复队列只执行冻结、成本试跑、成本裁剪、质量主矩阵，不重跑 CTest、sanitizer 或 dense 测量。合成质量与 4.6 结果仍待后续执行，尚未提交/push。
+
+### 实验版收口（2026-10-06，用户一小时时限决定）
+
+- 本决定覆盖之前未完成的 4.5/4.6 指令；发布后停止开发，不继续矩阵、Graph 或长 GPU 验证。
+- 正式矩阵已停止，受控 GPU 子进程排空；原因是用户时间与噪音约束，原日志、答案、冻结输入和 SHA 不变。
+- 4.5 状态：**部分完成**。指定主汇总 **合成 8/240、提前终止、不构成质量验收**，冻结严格校验 4/8 通过、4/8 失败。
+- 停止时实际已完成 12 次，额外 4 次单列保留，严格校验均失败；计划余下 228 次未运行，不丢弃任何已完成数据。
+- 所有完成项仅为 262K/32K/INT8/all-committed/seed0；完整配对、参考、多 seed、128K 上下文/视图、rk4 信息档、摘要质量矩阵未完成。
+- 默认分母未修改，部分答案不能给出参考质量差距；真实多文件与工具回放仍未测。
+- 4.6 状态：**推迟**。本版 KVMem 仅 eager；Graph descriptor、ordinary/MTP capture 和性能门禁未实施/未验收。
+- `kvmem` 与 `tiered-exact` 均标为**实验性**，默认 `--kv-mode dense`；C=1，稀疏 Graph/disk cache 关闭。
+- 推荐 262K INT8 请求 32K/128K 视图；4.4 合成 64-token eager 实测分别 118.10–135.14 / 107.59–122.90 tok/s，128K 请求实际115840。
+- 门禁源码 8 路径与生产树 SHA 均与 4.5 终版相同；生产 SHA `9fe2fea7abefa2b9447adf30676fbd7943eef1dc9f1bd43571326921a04168a2`。
+- CLI/serve Release 与冻结产品 SHA 一致，复用原构建、不重新编译；117 CTest（113通过/4其他模型缺失跳过/0失败）和 dense 三项组合门禁继续有效。
+- 收口仅新增文档与独立打包启动脚本，未改生产源码、dense 内核/分派或已测质量工具；启动脚本 PowerShell 语法检查通过。
+- 不重跑全量 CTest、sanitizer 或 dense 门禁；原失败 gate-session 等继续保留，原历史失败不改写为通过。
+- 包内依赖隔离路径冒烟仅两次：dense短生成 **13.25 s / OK**；KVMem262K/32K/INT8/MTP-3短生成 **14.813 s / OK**，均180秒硬超时。
+- KVMem冒烟日志确认实际view32768、Graph=off、pinned归档约8.25GiB；仅验证配置容量与短生成，并未填满262K上下文。
+- 已测质量工具提交 `faccb40f`；发布tag：`kvmem-v0.1-experimental`，分支 `feat/kvmem`；发布提交号与远端核对见 Git/tag 和外部发布凭据。
+- 包路径：`D:/deeplearning/NInfer/releases/ninfer-rtx4090-kvmem-v0.1-experimental.zip`；SHA256见包旁 `.zip.sha256`，避免包内自引用校验值。
+- 证据索引：`D:/deeplearning/NInfer/logs/kvmem-stage4-5-6/release-experimental-20261006/` 的 equivalence、partial、stop、smoke、release-receipt JSON。
+- 文档：[发布用法](release-v0.1-experimental.zh-CN.md)、[部分合成结果](stage4.5-partial-synthetic-results.zh-CN.md)；模型、API KEY、原始语料及日志不入仓库或包。

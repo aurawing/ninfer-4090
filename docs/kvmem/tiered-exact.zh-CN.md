@@ -1,6 +1,6 @@
 # 使用 tiered-exact
 
-`tiered-exact` 把 Qwen3.8/3.6-27B 的完整 Main KV 历史归档到主机，在 GPU 上保留 sink 和最近页。注意力仍访问全部历史，非驻留页由归档流式送入，因此可以在 RTX 4090 上验证 262K INT8 上下文。它是精确质量基准，**decode 只用于验证**，满窗 decode 的 PCIe 开销较大；阶段 4.4 开发工作区已接入 `--kv-mode kvmem` 的稀疏 eager 路线，当前仍在最终验收中；仅限 C=1，自动关闭 CUDA Graph。真实多文件和工具回放质量、Graph 捕获及性能门禁均未验收。
+`tiered-exact` 把 Qwen3.8/3.6-27B 的完整 Main KV 历史归档到主机，在 GPU 上保留 sink 和最近页。注意力仍访问全部历史，非驻留页由归档流式送入，因此可以在 RTX 4090 上验证 262K INT8 上下文。它是精确质量基准，**decode 只用于验证**，满窗 decode 的 PCIe 开销较大。`kvmem-v0.1-experimental` 中 `tiered-exact` 与稀疏 eager `kvmem` 均为**实验性**，默认仍为 dense；4.4 已审阅通过，4.5 合成质量只完成部分并提前终止，4.6 Graph 推迟。仅限 C=1，自动关闭 CUDA Graph；真实多文件和工具回放、完整质量与 Graph 性能门禁未验收。见 [发布说明](release-v0.1-experimental.zh-CN.md)。
 
 CLI 与 serve 共用下列参数语义：
 
