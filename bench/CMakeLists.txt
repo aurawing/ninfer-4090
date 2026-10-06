@@ -76,6 +76,25 @@ target_include_directories(ninfer_bench PRIVATE
 target_compile_definitions(ninfer_bench PRIVATE NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_link_libraries(ninfer_bench PRIVATE ninfer_engine ${NINFER_CUDART_TARGET})
 
+# Frozen local synthetic quality measurements use only the installed public Engine surface.
+add_executable(ninfer_kvmem_quality_bench kvmem_quality_bench.cpp)
+target_include_directories(ninfer_kvmem_quality_bench PRIVATE
+  ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_kvmem_quality_bench PRIVATE ninfer_engine)
+if(WIN32 AND DSTORAGE_DLLS)
+  add_custom_command(TARGET ninfer_kvmem_quality_bench POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DSTORAGE_DLLS}
+            $<TARGET_FILE_DIR:ninfer_kvmem_quality_bench>)
+endif()
+if(BUILD_TESTING)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME ninfer_kvmem_quality_render_test
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test_kvmem_quality_render.py
+            $<TARGET_FILE:ninfer_kvmem_quality_bench>)
+  set_tests_properties(ninfer_kvmem_quality_render_test PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${CUDAToolkit_BIN_DIR}")
+endif()
+
 # Native target-private MTP proposal/verification microbenchmark. It enters through the target
 # Program facade and executes the production round schedule over a real .ninfer artifact.
 add_executable(ninfer_qwen3_6_27b_mtp_round_bench

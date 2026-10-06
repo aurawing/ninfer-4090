@@ -1,5 +1,8 @@
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+add_test(NAME ninfer_kvmem_quality_contract_test
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_kvmem_quality.py)
+
 # This target deliberately receives no src/, CUDA, artifact, kernel, or target
 # include root. It proves that the installed product headers stand alone.
 add_executable(ninfer_public_api_test test_public_api.cpp)
