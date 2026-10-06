@@ -239,7 +239,7 @@ GPU scoring、CPU selection、hydrate、列表上传与回写完成管理在 gra
 | selector/view/plan | hard溢出原子拒绝及各项页数、current全部fit/较早页soften且同域竞争、recent/query完整、历史图像原子候选/本轮图像D9、共享图像闭包、整图不足跳过、稳定tie、intersection复用、OnlyBoth驱逐、reserve/guard、中途DMA失败poison/恢复 |
 | resume/checkpoint | 前缀sum在尾页封存/驱逐后仍恢复；无snapshot不得trim到base之前；当前有效槽保留且只hydrate_missing；capture三槽账本/借用生命周期与prefixidentity；合法旧capture配新indexepoch；恢复早于query/branch改写时拒绝；旧score/ticket拒绝；重复restore、追加只算新token |
 | sparseattention | selected-subset FP64oracle，远逻辑号、空洞、末页、因果、有效列、rk4旋转输出边界；不能用全历史dense作稀疏数值oracle |
-| 4.4 eager | arbitrary resident集合后下一轮完整历史exact prefill、单列表decode/verify、有效列/原位置/跨页/reserve淘汰、restore与DMA中途失败poison恢复；新增GPU owner/kernel终版跑Compute Sanitizer 13.0.85的racecheck、synccheck、initcheck三项，memcheck可额外补充但不能替代 |
+| 4.4 eager | arbitrary resident集合后下一轮完整历史exact prefill、单列表decode/verify、有效列/原位置/跨页/reserve淘汰、restore与DMA中途失败poison恢复；2026-10-06用户批准策略修订：owner/e2e完整跑13.0.85 synccheck/initcheck；racecheck仅跑内核级小shape，提供owner实际kernel/config对照并补齐部分页尾/碎片列表/T与split/BF16/INT8/rk4 plane缺口，要求0 hazard/0 error。完整owner约26h后中止日志保留、不可称PASS；可选owner子集限1h、非门禁；memcheck不能替代必需检查 |
 | 后续 graph | 同图动态列表/prefix终点、append有效列/物理页/cache与RoPE位置、frontier/validcols、padding无写入、ordinary/MTP capture、跨页/restore/reserveeviction及对应性能门禁；本轮未实施/未验收 |
 | 回归 | 授权后新增相应 CTest 并跑当时全量清单；dense 沿用 README 三项组合门禁：两版相同临时补丁下完整词表逐位比较、加载计划一致、生产算法分歧步按门禁 B 的并列与包络判定，三项都必须通过。原金标准和失败记录保留；不得依据旧 AGENTS 的84项忽略新增测试 |
 

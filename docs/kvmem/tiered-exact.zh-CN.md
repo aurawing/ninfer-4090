@@ -1,6 +1,6 @@
 # 使用 tiered-exact
 
-`tiered-exact` 把 Qwen3.8/3.6-27B 的完整 Main KV 历史归档到主机，在 GPU 上保留 sink 和最近页。注意力仍访问全部历史，非驻留页由归档流式送入，因此可以在 RTX 4090 上验证 262K INT8 上下文。它是精确质量基准，**decode 只用于验证**，满窗 decode 的 PCIe 开销较大；日常稀疏 decode 的 `--kv-mode kvmem` 在阶段 4 完成前明确拒绝。
+`tiered-exact` 把 Qwen3.8/3.6-27B 的完整 Main KV 历史归档到主机，在 GPU 上保留 sink 和最近页。注意力仍访问全部历史，非驻留页由归档流式送入，因此可以在 RTX 4090 上验证 262K INT8 上下文。它是精确质量基准，**decode 只用于验证**，满窗 decode 的 PCIe 开销较大；阶段 4.4 开发工作区已接入 `--kv-mode kvmem` 的稀疏 eager 路线，当前仍在最终验收中；仅限 C=1，自动关闭 CUDA Graph。真实多文件和工具回放质量、Graph 捕获及性能门禁均未验收。
 
 CLI 与 serve 共用下列参数语义：
 
@@ -38,3 +38,18 @@ CLI 使用同一组选项，另加 `--prompt` 或 `--messages`。CPU 视觉可�
 - `NINFER_KVMEM_TRANSFER_TIMING=1` 开启逐层 ready 等待，prefill/decode 分开累计；默认关闭。影子验证环境变量仅用于开发，不用于服务性能测量。
 
 当前门禁与实测见 [progress.zh-CN.md](progress.zh-CN.md)。
+
+
+## 稀疏 eager 开发版本
+
+`--kv-mode kvmem` 先执行完整 exact prefill，再用原始用户 query 的 pre-RoPE Q 与每页 Mean-K 在 GPU 上打分，CPU 选页，仅对选中的原始逻辑页执行 decode。sink、近期页、query、reserve 与 guard 必选；长本轮输入放不下时，较早的页按 D9 与历史页一起竞争。图像跨度作为完整原子组处理。该模式的合成测试结果不能替代真实会话质量验收。
+
+| 参数 | 含义 |
+| --- | --- |
+| `--kvmem-query-tokens 16` | 捕获原始用户文本末尾最多 16 个 token；可设 1–16 |
+| `--kvmem-recent-tokens 8192` | 硬必选近期带；64 对齐，可为 0 |
+| `--kvmem-gen-reserve 6144` | 生成页 reserve；别名 `--kvmem-gen-reserve-tokens`，64 对齐，可为 0 |
+
+Main 完整历史仍归档到主机，下一轮 exact prefill 可以从任意已选驻留集合开始。MTP 继续保留 sink 加近期窗口，不归档历史。retained resume 和 turn checkpoint 可复用；磁盘状态缓存关闭。硬必选页超预算或 reserve 没有安全可驱逐页时明确报错，不会缩小近期带或丢弃硬必选页。
+
+启动时检查 `kvmem CUDA Graph=off (eager), disk prompt cache=off` 与 `[kvmem-plan]` / `[kvmem-loading]`；实际视图会随显存预算降低，`--kvmem-view-tokens` 是上限。`[kvmem-turn]` 记录本轮软化、选中/保留/新增/移除页数、hydrate 字节和 TTFT 分段；`capture_wait_ms` 已包含在 prefill 内，不能重复相加。逐层 ready 等待需显式开启 `NINFER_KVMEM_TRANSFER_TIMING=1`，prefill 与 decode 分开累计。最终验收状态和限制见 [progress.zh-CN.md](progress.zh-CN.md)。

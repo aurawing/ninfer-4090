@@ -241,6 +241,15 @@ ninfer-serve qwen3_8_27b.ninfer --max-context 262144 --kv-mode kvmem --kv-dtype 
 
 阶段4按 [稀疏设计](stage4-sparse-decode-design.zh-CN.md) 和 [4.1–4.4实施清单](stage4-sparse-implementation-plan.zh-CN.md) 顺序执行。全部文档修订先于实现，每步新增CTest、全量CTest、更新证据，由主任务分别commit/push，4.4后停审。4.4范围为C=1、Graph=off的sparse eager；Graph及ordinary/MTP capture性能门禁下一轮。
 
+4.4 eager终版门禁证据（2026-10-06）：完整构建/CTest **115项、111通过、4个其他模型制品缺失跳过、0失败**；dense三项组合回归、72次合成needle与12次参考、12份复用/回滚通过。owner完整synccheck/initcheck各0error；三个完整小shape单元racecheck各0hazard/0error/0warning，覆盖与身份见下表链接。实现仍为C=1、Graph=off，真实多文件/工具质量与Graph/capture性能**未验收**。实际资源与24组合实测见 [合成报告](stage4.4-synthetic-eager-results.zh-CN.md)，完整来源和提交状态见 [progress](progress.zh-CN.md)。
+
+#### Sanitizer 门禁（2026-10-06 审阅批准修订）
+
+- `racecheck` 仅在内核级的小 shape 单元测试上运行，要求完整结束、0 hazard、0 error；owner 与端到端测试仅运行完整 `synccheck`、`initcheck`，均要求 0 error。
+- 对 owner 实际启动的每个内核和配置，提供「owner 配置 → 已通过 racecheck 的单元测试」对照表；逐项核对部分页尾、碎片化访问列表、T/split 组合与 BF16/INT8/rk4 各 plane 格式。存在缺口时补小 shape 用例并运行 racecheck，不能以同名内核或旧配置笼统代替证据。
+- 可选的 owner `--only-*` 或去掉 `fragmented_next_exact` 的小 fixture 子集 racecheck 最多运行 1 小时，只作补充诊断，不作为门禁。
+- 此修订是在完整终版 owner racecheck 运行约 26 小时、完成前 13 个 fixture、停在 `fragmented_next_exact` 后由用户批准。原因是端到端规模的插桩成本不可接受；保留部分日志，日志当时未报告 hazard，**无最终汇总，不能记为完整 racecheck 通过**。同一终版 owner 的 synccheck/initcheck 已完整通过，历史超时与中止记录不覆盖。覆盖对照表、来源 SHA 和补缺结果见 [阶段 4.4 内核级覆盖](stage4.4-kernel-racecheck-coverage.zh-CN.md)及 [progress](progress.zh-CN.md)。
+
 评分mask与首版图像范围只见阶段4设计：默认仅在超预算且中间非空时排除sink/recent两段，其他hard页仍参与denominator；`NINFER_KVMEM_SCORE_ALL_PAGES=1`作为全部已提交页对照。首版无历史图像引用检测，历史图像作为原子候选，本轮图像按D9；协议识别后续实现。这两项审阅意见不另立D表。
 
 合成矩阵为128K/262K contexts × 128K/32K views × 至少3位置 × 2 denominators × 3次独立运行，记录页统计、TTFT分解、Mean-K/Q H2D与GPU compute、hydrate字节、decode及MTP；128K视图对dense rk4，32K视图对tiered-exact INT8。既有单条长输入needle依D9合法软化，另加结构化历史/短query fixture。needle与多needle可由脚本生成，覆盖10%–90%。**真实多文件/工具矩阵未验收**，真实agent语料仍由用户提供；合成通过不表示阶段4全部验收。
