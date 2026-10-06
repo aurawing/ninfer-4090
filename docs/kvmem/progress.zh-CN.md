@@ -4,7 +4,7 @@
 
 ## 待用户决定的问题
 
-第 5、6 步（`4da637a4`、`db8e9641`）已由用户审阅通过；第 7 步已提交发布 `685cae7c`，第 8 步已提交发布 **`c4f145e5`**。dense 组合验收三项全部通过，阶段 3 的退出标准已逐条关闭。首轮严格金标准 **8/9** 的失败、后续四次匹配和用户在失败后批准的修订均保留，原金标准不替换。36 次确定性诊断的完整词表逐位差异为 0；生产计划一致、dense 默认1024；两版生产算法各三次的换行分歧和相对 L2 包络按原门禁 B 通过。阶段4设计已按2026-10-02用户批准的D8/D9修订，新增顺序4.1–4.4实施清单；文档与4.1–4.3基础已分别完成门禁并commit/push，4.4 eager接线的规格与质量审阅、终版dense三项组合、72个合成needle与12个参考、12份复用/回滚及最终全量CTest已完成；完整owner synccheck/initcheck各0error。用户于2026-10-06批准停止约26小时的完整owner racecheck并改用内核级小shape门禁，内核级覆盖补缺、独立规格/质量复审和终版115项全量CTest现已完成；4.4进入单独提交/push收尾，完成后停审。Graph/capture性能门禁及真实多文件/工具矩阵仍未验收，详情见本文末尾。
+第 5、6 步（`4da637a4`、`db8e9641`）已由用户审阅通过；第 7 步已提交发布 `685cae7c`，第 8 步已提交发布 **`c4f145e5`**。dense 组合验收三项全部通过，阶段 3 的退出标准已逐条关闭。首轮严格金标准 **8/9** 的失败、后续四次匹配和用户在失败后批准的修订均保留，原金标准不替换。36 次确定性诊断的完整词表逐位差异为 0；生产计划一致、dense 默认1024；两版生产算法各三次的换行分歧和相对 L2 包络按原门禁 B 通过。阶段4设计已按2026-10-02用户批准的D8/D9修订，新增顺序4.1–4.4实施清单；文档与4.1–4.3基础已分别完成门禁并commit/push，4.4 eager接线的规格与质量审阅、终版dense三项组合、72个合成needle与12个参考、12份复用/回滚及最终全量CTest已完成；完整owner synccheck/initcheck各0error。用户于2026-10-06批准停止约26小时的完整owner racecheck并改用内核级小shape门禁，内核级覆盖补缺、独立规格/质量复审和终版115项全量CTest现已完成；4.4实现/测试与验收文档已提交并push至origin/feat/kvmem，当前停在4.4审阅点。Graph/capture性能门禁及真实多文件/工具矩阵仍未验收，详情见本文末尾。
 
 ## 阶段 0′：基线
 
@@ -441,7 +441,7 @@ rk4v4-e8 的 32K/8K 视图影子第一次运行在首全注意力层、frontier=
 
 ## 阶段 4：稀疏 decode
 
-- 状态：4.1–4.3 已完成并分别提交；4.4 eager 全部门禁已完成，实现/测试已提交 `9404c865`，正在收尾文档与 push；4.5/Graph与真实质量矩阵未开始。
+- 状态：4.1–4.3 已完成并分别提交；4.4 eager 全部门禁已完成，实现/测试 `9404c865` 与验收文档 `fb0d12ba` 已push，停在4.4审阅点；4.5/Graph与真实质量矩阵未开始。
 
 ## 与设计的偏差
 
@@ -893,7 +893,7 @@ before 字节按旧版“全部驻留页×全部层/plane”的实际规划及�
 
 - 全部 24 组合的页数／字节、TTFT 每段、decode／MTP、prefill/decode ready wait，以及12份复用fixture详细数据已整理到 [合成 eager 实测](stage4.4-synthetic-eager-results.zh-CN.md)；仅为合成初步结果，不作为真实质量矩阵验收。
 
-## 阶段4.4终版验收（2026-10-06，等待提交记录）
+## 阶段4.4终版验收（2026-10-06，已提交发布）
 
 - 当前终版保持 v9 生产源码、CLI、serve 与 owner 二进制身份不变；新增覆盖只修改4个测试/CMake文件。最终68路径冻结清单 `4.4-root-revised-kernel-test-freeze-v2-20261006.json` SHA `572d8ee3f4c42d0500e88b8019c55c77c9a901dbfc991d542c6a9a4bbb9cd17a`；原313个ops文件逐字节不变。没有提交临时确定性补丁、外部owner标记副本、测量脚本、模型或日志。
 - 完整实现此前已通过v9规格及质量审阅；本轮测试增量再次通过独立SPEC→QUALITY，报告 `4.4-revised-kernel-test-spec-20261006.md` SHA `d4115871fbe08920730e7b5422c2fbee1c1e0391534d3d3c5c3eb849e6ae5de8`、`4.4-revised-kernel-test-quality-20261006.md` SHA `4a49eba06912525d1e1af536e6ae674dc02b603f55bd3a5fc5f9d57354a6af63`。首次SPEC发现测试尾缓冲在默认流填充后交给非阻塞流，已改为同流checked memset并重跑完整Mean单测；这是源码确认的测试排序缺陷，不伪称racecheck发现hazard。旧候选证据保留。
@@ -904,3 +904,11 @@ before 字节按旧版“全部驻留页×全部层/plane”的实际规划及�
 - 合成矩阵72/72 needle正确、12/12独立参考正确；12/12结构化复用fixture正确，追加只prefill51 token、回滚只prefill4 token，rollback/cold全部64 ID相同。完整24组合页数/diff/hydrate、TTFT各段、decode/MTP、prefill/decode ready wait及实际资源账本见 [合成eager实测](stage4.4-synthetic-eager-results.zh-CN.md)。合成短输出不代表真实多文件/工具质量或长生成性能。
 - 根验收索引 `4.4-root-revised-policy-final-gates-20261006.json` SHA `41e5fc0d886a3b4df30dcd553f6341889dc4d1eb36ecd028351cdbb5133eb490` 绑定最终冻结、审阅、CTest、三项dense、模型与复用、完整owner sync/init、停止诊断及三个小unit racecheck原始身份；证据均在仓库外目录 `D:/deeplearning/NInfer/logs/kvmem-stage4-sparse`。
 - 边界：仅C=1、eager、Graph=off，exact prefill后发布Main sparse selection；retained resume/checkpoint继续可用，磁盘缓存关闭。CUDA Graph descriptor、ordinary/MTP capture及性能门禁**未实施/未验收**，真实多文件/工具回放完整质量矩阵**未验收**；没有开始4.5，没有新的D1–D15冲突需决定。提交/push完成后在4.4停审。
+
+### 4.4提交与推送结果（2026-10-06）
+
+- 实现及测试：`9404c865ee32bed9d4cdd731245f5034c3101cc6` — `feat(kvmem): connect sparse eager execution and recovery`，68个源码/测试文件。
+- 用户说明、验收实测、内核覆盖与进度：`fb0d12bac0f924b5e89053ae1e9b4992f4703b6b` — `docs(kvmem): record sparse eager gates and sanitizer policy`，8份文档。
+- 两提交已成功push到 `origin/feat/kvmem`；首次push后独立 `ls-remote` 核对远端HEAD为 `fb0d12bac0f924b5e89053ae1e9b4992f4703b6b`，本地HEAD与tracking一致、工作区干净。原始发布凭据 `4.4-publication-first-push-20261006.json` SHA `9ecc12b722e91f9c219e0d76bc1630ad062ec7d307384ffaacf54dfcde61d523`。本段仅补记已完成的实际发布元数据，并随同分支提交；最终HEAD及再推送核对见仓库历史和仓库外 `4.4-final-publication-checkpoint-20261006.json`。
+- 终版文档收尾再次通过独立SPEC→QUALITY；报告 `4.4-final-docdelta-spec-20261006.md` SHA `57bde4e7cfc4291a4ea27b7022acfd093a789b5357d5b96f617ec36e26556b95`、`4.4-final-docdelta-quality-20261006.md` SHA `61a92d0aa15d452cf8e17bbaef3b1b667c4c784c3e4a1e29a1a5371f1bffbeb0`。发布过程未改变已测的生产源码、原313个ops或受保护二进制。
+- **4.4已完成并停审**。未开始4.5；CUDA Graph/capture性能与真实多文件/工具回放质量仍未验收。完整owner racecheck保留为约26小时的用户中止诊断，不作为完整PASS。

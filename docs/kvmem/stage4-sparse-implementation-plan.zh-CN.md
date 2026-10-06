@@ -51,7 +51,7 @@
 - [x] 在终版保持README三项dense组合门禁：两版同一临时确定性补丁下完整词表逐位比较、加载计划一致、生产算法分歧步按既定门禁B并列/包络。三项都通过；dense kernel/dispatch不修改，金标准和原失败不覆盖。
 - [x] 合成验收冻结矩阵：`128K/262K contexts × 128K/32K views × 至少3位置 × 2 denominators × 3次独立运行`。既有单条长input needle依D9合法soften；另加结构化历史+短query fixture。每case核验实际token数/输入hash/模板/命令，128K view对dense rk4v4-e8，32K view对tiered-exact INT8，相同sampling/输出预算，不挑有利运行。
 - [x] 每case记录hard/current/image/softened/selected/retained/add/remove/reserve/guard页统计、denominator与mask范围、TTFT的prefill/capturewait/H2D/compute/D2H/selection/hydrate/publish分解、hydrate bytes、decode tok/s、MTP draft/accepted；保留失败和桌面负载。MTP/复用门禁按README已有规则。合成needle不能冒充真实多文件/工具通过率。
-- [ ] 全部证据/progress更新，审阅差异及未验收清单；主任务为4.4独立commit/push，记录结果，**停止实施并交付审阅**。
+- [x] 全部证据/progress更新，审阅差异及未验收清单；主任务为4.4独立commit/push，记录结果，**停止实施并交付审阅**。
 
 ## 4.4之后的停审清单
 
@@ -62,3 +62,5 @@
 参考源码只使用本地 `D:/deeplearning/NInfer/logs/kvmem-stage7-8/kvmem-qw3-reference`，HEAD `1cf3b2f83bfc071ada9c57491a7d121723051ac0`；mask核对 `src/qwen_executor.cpp` 约23750，评分数学 `src/kernels_cuda.cu` 约5340。源码移植适用[设计§9.1](stage4-sparse-decode-design.zh-CN.md)的来源与Apache许可要求。
 
 2026-10-06终版4.4门禁已通过：115项CTest为111通过、4个既有其他模型制品跳过、0失败；owner完整synccheck/initcheck及三个内核级完整racecheck通过，dense组合/72合成+12参考/12复用全部通过。4.1的真实K hook/统一准入及4.2实际score DMA/scratch借用延迟接线项现由4.4模型及owner证据关闭。完整owner racecheck中止不作为PASS。逐项来源和未验收边界见progress与新覆盖/合成报告；最后提交/push项仅在实际发布完成后勾选。
+
+已验证实际发布：实现/测试 `9404c865` 与验收文档 `fb0d12ba` 已push到 `origin/feat/kvmem`，最后提交/push项现已完成并勾选。元数据记录与远端核对见progress；本任务停在4.4审阅点，不开始4.5。
