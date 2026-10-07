@@ -976,3 +976,4 @@ before 字节按旧版“全部驻留页×全部层/plane”的实际规划及�
 - 根目录 start-kvmem-256k-128k-gpu-vision.ps1 更新到新包，单张8192/累计32768；旧脚本备份在证据目录，原发布包未覆盖。
 - 证据：D:/deeplearning/NInfer/logs/vision-multi-image-fix-20261007/（build-final、ctest、validation、smoke-results、package-receipt）。
 - 用法：[多图视觉预算](../vision-multi-image-budget.zh-CN.md)。KVMem实验性、4.5未验收与4.6推迟状态保持原发布结论。
+- 提交 3b609516；包源码与该提交逐文件一致，二进制未重编。
