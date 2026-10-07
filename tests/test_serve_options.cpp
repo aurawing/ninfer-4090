@@ -136,6 +136,17 @@ int main() {
                           "existing Vision flags did not preserve the CUDA default");
     }
 
+    const ServeOptions request_budget =
+        parse({"ninfer-serve", "model.ninfer", "--vision-request-max-tokens", "65536"});
+    failures += check(defaults.vision_request_max_tokens == 32768 &&
+                          request_budget.vision_request_max_tokens == 65536 &&
+                          request_budget.vision_max_tokens == 8192,
+                      "server aggregate and per-item vision budgets are coupled");
+    for (const char* bad : {"0", "-1", "4294967296", "x", "+1", " 1"})
+        failures += check(rejects_vision_options({"--vision-request-max-tokens", bad}), "invalid server request budget accepted");
+    failures += check(rejects_vision_options({"--vision-request-max-tokens"}) &&
+                          serve_usage_text("ninfer-serve").find("--vision-request-max-tokens") != std::string::npos,
+                      "server request budget help or missing-value validation absent");
     const ServeOptions vision_shortcut =
         parse({"ninfer-serve", "model.ninfer", "--vision-mmproj", "mmproj-BF16.gguf"});
     failures += check(vision_shortcut.enable_vision &&

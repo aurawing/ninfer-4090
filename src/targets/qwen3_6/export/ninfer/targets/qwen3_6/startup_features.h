@@ -9,6 +9,7 @@ struct StartupFeatures {
     bool vision                    = false;
     bool kvmem_input_spans = false;
     std::uint32_t vision_max_tokens = 8192;
+    std::uint32_t vision_request_max_tokens = 32768;
     VisionDevice vision_device      = VisionDevice::Cuda;
     std::filesystem::path vision_mmproj_path;
     std::uint32_t vision_cpu_threads = 6;
@@ -46,6 +47,9 @@ struct StartupFeatures {
 };
 
 [[nodiscard]] inline StartupFeatures startup_features(const EngineOptions& options) {
+    if (options.vision_request_max_tokens == 0) {
+        throw std::invalid_argument("vision_request_max_tokens must be positive");
+    }
     switch (options.vision_device) {
     case VisionDevice::Cuda:
         if (options.vision_cpu_threads != 6 || options.vision_cpu_memory_mib != 4096 ||
@@ -72,6 +76,7 @@ struct StartupFeatures {
         .vision            = options.enable_vision,
         .kvmem_input_spans = options.kv_mode == KvMode::KVMem,
         .vision_max_tokens = options.vision_max_tokens > 0 ? options.vision_max_tokens : 8192,
+        .vision_request_max_tokens = options.vision_request_max_tokens,
         .vision_device = options.vision_device,
         .vision_mmproj_path = options.vision_mmproj_path,
         .vision_cpu_threads = options.vision_cpu_threads,

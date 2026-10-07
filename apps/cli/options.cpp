@@ -147,7 +147,8 @@ std::string usage_text(const char* argv0) {
            "  --vision-cpu-memory-mib <N> CPU Vision host memory budget in MiB (positive integer; default: 4096)\n"
            "  --vision-cpu-cache-mib <N>  CPU image cache within host budget (default: 128; 0 disables)\n"
            "                              CPU options require CPU Vision; cannot combine with explicit cuda\n"
-           "  --vision-max-tokens <N>     Vision scratchpad token capacity (default: 8192)\n\n"
+           "  --vision-max-tokens <N>     Per-item vision token/scratch capacity (default: 8192)\n"
+           "  --vision-request-max-tokens <N>  Total vision tokens across request/history (default: 32768)\n\n"
            "Reasoning & Output Control:\n"
            "  --no-thinking               Disable deep reasoning/thinking mode (applies non-thinking defaults)\n"
            "  --reasoning-effort <effort> Set thinking depth budget preset (low | medium | xhigh)\n"
@@ -276,6 +277,9 @@ Options parse_options(int argc, char** argv) {
             vision_cpu_tuning_explicit = true;
         } else if (arg == "--vision-max-tokens" || arg == "--vision-limit") {
             options.vision_max_tokens = parse_u32(value(arg), "vision-max-tokens", false);
+            options.enable_vision = true;
+        } else if (arg == "--vision-request-max-tokens") {
+            options.vision_request_max_tokens = parse_u32(value(arg), "vision-request-max-tokens", false);
             options.enable_vision     = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;

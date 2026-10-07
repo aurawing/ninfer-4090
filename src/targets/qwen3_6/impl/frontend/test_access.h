@@ -11,7 +11,8 @@ public:
     [[nodiscard]] static Frontend create_component(const FrontendResources& resources,
                                                    bool vision_enabled            = true,
                                                    std::uint32_t vision_max_tokens = 8192,
-                                                   bool collect_input_spans = false);
+                                                   bool collect_input_spans = false,
+                                                   std::uint32_t vision_request_max_tokens = 32768);
     [[nodiscard]] static const PreparedPromptData& inspect(const PreparedPrompt& prompt);
 };
 

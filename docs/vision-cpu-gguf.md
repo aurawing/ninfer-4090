@@ -63,7 +63,7 @@ Existing API authentication and serving controls apply unchanged. Both `ninfer` 
 | `--vision-cpu-memory-mib` | `4096` | Host-memory admission budget for CPU vision resources. |
 | `--vision-cpu-cache-mib` | `128` | Image embedding cache cap within that budget; `0` disables caching. |
 
-CPU settings explicitly combined with CUDA mode are rejected. The existing `--vision-max-tokens` defaults to 8192 and retains its whole-request media budget/scratch semantics; this change does not add a separate per-image token upper limit.
+CPU settings explicitly combined with CUDA mode are rejected. `--vision-max-tokens` defaults to 8192 and limits each encoding item (native CUDA scratch is sized from it). Since the 2026-10-07 multi-image fix, `--vision-request-max-tokens` independently limits the total across request/history (default 32768). See [multi-image budgets](vision-multi-image-budget.zh-CN.md).
 
 ## Memory, caching, and cancellation
 

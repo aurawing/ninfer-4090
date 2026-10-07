@@ -163,7 +163,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --vision-cpu-memory-mib <N> CPU Vision host memory budget in MiB (positive integer; default: 4096)\n"
            "  --vision-cpu-cache-mib <N>  CPU image cache within host budget (default: 128; 0 disables)\n"
            "                              CPU options require CPU Vision; cannot combine with explicit cuda\n"
-           "  --vision-max-tokens <N>     Vision scratchpad token capacity (default: 8192)\n\n"
+           "  --vision-max-tokens <N>     Per-item vision token/scratch capacity (default: 8192)\n"
+           "  --vision-request-max-tokens <N>  Total vision tokens across request/history (default: 32768)\n\n"
            "Reasoning & Generation Defaults:\n"
            "  --default-max-tokens <N>    Default maximum output tokens when omitted in client request (default: " + default_max_toks + ")\n"
            "  --no-thinking               Disable reasoning/thinking mode globally by default\n"
@@ -348,6 +349,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.vision_max_tokens = static_cast<std::uint32_t>(val);
             options.enable_vision     = true;
+        } else if (arg == "--vision-request-max-tokens") {
+            options.vision_request_max_tokens =
+                parse_positive_u32(require_value(arg.c_str()), "vision-request-max-tokens");
+            options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {

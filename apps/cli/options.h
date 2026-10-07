@@ -30,6 +30,7 @@ struct Options {
     SpeculativeOptions speculative;
     bool enable_vision                 = false;
     std::uint32_t vision_max_tokens    = 8192;
+    std::uint32_t vision_request_max_tokens = 32768;
     VisionDevice vision_device         = VisionDevice::Cuda;
     std::filesystem::path vision_mmproj_path;
     std::uint32_t vision_cpu_threads    = 6;

@@ -959,3 +959,20 @@ before 字节按旧版“全部驻留页×全部层/plane”的实际规划及�
 - 包路径：`D:/deeplearning/NInfer/releases/ninfer-rtx4090-kvmem-v0.1-experimental.zip`；SHA256见包旁 `.zip.sha256`，避免包内自引用校验值。
 - 证据索引：`D:/deeplearning/NInfer/logs/kvmem-stage4-5-6/release-experimental-20261006/` 的 equivalence、partial、stop、smoke、release-receipt JSON。
 - 文档：[发布用法](release-v0.1-experimental.zh-CN.md)、[部分合成结果](stage4.5-partial-synthetic-results.zh-CN.md)；模型、API KEY、原始语料及日志不入仓库或包。
+
+## 2026-10-07：多图请求预算修复与本地重打包
+
+- 用户授权修改和重新编译打包；基于 feat/kvmem 的 79808d9e，本轮未提交、未 push、未新建 tag。
+- 将单个编码项容量与请求累计预算分开：`--vision-max-tokens 8192`；新增 CLI/serve 一致的 `--vision-request-max-tokens 32768`，包括历史图片。
+- 保留媒体项数、解码像素、总上下文限制及单项检查；单图按原容量缩放，累计超限仍拒绝并指出对应参数。
+- GPU 编码按项复用原工作区；未改 dense/视觉内核、dense 分派、MTP、Main/MTP pool 或 KVMem 选择算法。
+- Release 重新编译；6 个相关 CTest 全通过、0 失败，合计 63.20 秒。未扩大到全量 GPU CTest、sanitizer 或 dense 组合门禁。
+- 大图 CPU fixture：两张 4096×2048，每张 8192 token、累计 16384、raw patches 65536，最终 FP32 patch 缓冲 402653184 字节。
+- GPU 冒烟使用用户的 Uncensored 模型、256K/INT8、请求128K视图、内嵌CUDA视觉、MTP-3；实际视图仍101248，预算未随累计上限增加。
+- 两轮均回答正确：红图后带历史再发蓝图；第二轮 prompt16445、cached8223、reuse=append_frontier，说明历史 KV 正常复用。
+- 本次大图 HTTP 耗时123.765/99.406秒；整组239.109秒。属于功能冒烟，未做性能门禁，处理时间波动不作性能结论。
+- 首次冒烟漏用启动配置的600秒准备超时、返回503；原失败保留。补齐配置后上述两轮通过，不改写失败日志。
+- 新包目录：D:/deeplearning/NInfer/releases/ninfer-rtx4090-kvmem-v0.1-experimental-multiimage-20261007；ZIP及SHA256旁置。
+- 根目录 start-kvmem-256k-128k-gpu-vision.ps1 更新到新包，单张8192/累计32768；旧脚本备份在证据目录，原发布包未覆盖。
+- 证据：D:/deeplearning/NInfer/logs/vision-multi-image-fix-20261007/（build-final、ctest、validation、smoke-results、package-receipt）。
+- 用法：[多图视觉预算](../vision-multi-image-budget.zh-CN.md)。KVMem实验性、4.5未验收与4.6推迟状态保持原发布结论。

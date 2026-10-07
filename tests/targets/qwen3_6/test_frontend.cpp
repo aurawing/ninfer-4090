@@ -1296,6 +1296,113 @@ int test_high_resolution_image_resizing_and_budget() {
     return failures;
 }
 
+int test_large_multi_image_budget() {
+    const Frontend frontend = FrontendFactory::create_component(resources(), true, 8192, false, 32768);
+    ninfer::PromptInput input;
+    for (int i = 0; i < 2; ++i) {
+        ninfer::ChatMessage user;
+        user.role = "user";
+        ninfer::MessagePart image;
+        image.kind = ninfer::MessagePartKind::Media;
+        image.media.kind = ninfer::MediaKind::Image;
+        image.media.media_type = "image/x-portable-pixmap";
+        const std::string header = "P6\n4096 2048\n255\n";
+        image.media.bytes.assign(header.begin(), header.end());
+        image.media.bytes.resize(image.media.bytes.size() + 4096 * 2048 * 3, 128);
+        user.parts.push_back(std::move(image));
+        user.parts.push_back({.kind = ninfer::MessagePartKind::Text, .text = "x"});
+        input.messages.push_back(std::move(user));
+        if (i == 0) {
+            ninfer::ChatMessage assistant;
+            assistant.role = "assistant";
+            assistant.parts.push_back({.kind = ninfer::MessagePartKind::Text, .text = "x"});
+            input.messages.push_back(std::move(assistant));
+        }
+    }
+    const auto prepared = frontend.prepare(std::move(input));
+    const auto& data = FrontendFactory::inspect(prepared);
+    int failures = check(data.vision_items.size() == 2 && data.prepare.vision_tokens == 16384 &&
+                             data.prepare.raw_patches == 65536,
+                         "two 8192-token images including history were rejected or downscaled by total budget");
+    for (const auto& item : data.vision_items)
+        failures += check(item.patch_count == 32768, "large image exceeded per-item capacity");
+    std::cout << "images=2 per_item_tokens=8192 total_vision_tokens=" << data.prepare.vision_tokens
+              << " patch_bytes=" << data.patches.size() * sizeof(float) << '\n';
+    return failures;
+}
+
+int test_multi_image_budget() {
+    // Four tokens per 64x64 image; scratch is per item, not their sum.
+    auto input = [](int count, bool history) {
+        ninfer::PromptInput prompt;
+        ninfer::ChatMessage user;
+        user.role = "user";
+        for (int i = 0; i < count; ++i) {
+            ninfer::MessagePart image;
+            image.kind = ninfer::MessagePartKind::Media;
+            image.media.kind = ninfer::MediaKind::Image;
+            image.media.bytes = gradient_ppm();
+            image.media.media_type = "image/x-portable-pixmap";
+            user.parts.push_back(std::move(image));
+            if (history && i == 0) {
+                prompt.messages.push_back(std::move(user));
+                ninfer::ChatMessage assistant;
+                assistant.role = "assistant";
+                assistant.parts.push_back({.kind = ninfer::MessagePartKind::Text, .text = "x"});
+                prompt.messages.push_back(std::move(assistant));
+                user = {};
+                user.role = "user";
+            }
+        }
+        user.parts.push_back({.kind = ninfer::MessagePartKind::Text, .text = "x"});
+        prompt.messages.push_back(std::move(user));
+        return prompt;
+    };
+    const Frontend bounded = FrontendFactory::create_component(resources(), true, 4, false, 8);
+    int failures = 0;
+    for (bool history : {false, true}) {
+        auto prepared = bounded.prepare(input(2, history));
+        const auto& data = FrontendFactory::inspect(prepared);
+        failures += check(data.vision_items.size() == 2 && data.prepare.vision_tokens == 8 &&
+                              data.prepare.raw_patches == 32,
+                          "per-item scratch incorrectly capped total/history image tokens");
+        for (const auto& item : data.vision_items)
+            failures += check(item.patch_count == 16, "image exceeds per-item scratch envelope");
+        failures += check(bounded.count_tokens(input(2, history)) == data.token_ids.size(),
+                          "multi-image prepare and count disagree");
+        failures += check(data.identity.reusable, "multi-image prefix identity lost");
+    }
+    auto rejected = [&](const Frontend& frontend, int count, bool history, bool count_only) {
+        try {
+            if (count_only) (void)frontend.count_tokens(input(count, history));
+            else (void)frontend.prepare(input(count, history));
+        } catch (const ninfer::RequestError& error) {
+            return error.kind() == ninfer::RequestErrorKind::MediaBudgetExceeded &&
+                   std::string(error.what()).find("--vision-request-max-tokens") != std::string::npos;
+        }
+        return false;
+    };
+    for (bool count_only : {false, true}) {
+        failures += check(rejected(bounded, 3, true, count_only),
+                          "history images bypassed cumulative request budget");
+        const Frontend lower = FrontendFactory::create_component(resources(), true, 4, false, 3);
+        failures += check(rejected(lower, 1, false, count_only),
+                          "request budget smaller than item capacity was ignored");
+    }
+    ninfer::PromptInput large = input(1, false);
+    auto& bytes = large.messages.front().parts.front().media.bytes;
+    const std::string header = "P6\n128 128\n255\n";
+    bytes.assign(header.begin(), header.end());
+    bytes.resize(bytes.size() + 128 * 128 * 3, 128);
+    auto resized = bounded.prepare(std::move(large));
+    failures += check(FrontendFactory::inspect(resized).prepare.vision_tokens == 4,
+                      "aggregate budget expanded per-image resolution/scratch");
+    failures += check(throws_invalid_argument([&] {
+        (void)FrontendFactory::create_component(resources(), true, 4, false, 0);
+    }), "zero request budget accepted");
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1304,6 +1411,10 @@ int main(int argc, char** argv) {
         const Frontend frontend       = FrontendFactory::create_component(owned);
         if (argc > 1 && std::string_view(argv[1]) == "--query-provenance")
             return test_query_provenance(frontend) ? 1 : 0;
+        if (argc > 1 && std::string_view(argv[1]) == "--multi-image-budget")
+            return test_multi_image_budget() ? 1 : 0;
+        if (argc > 1 && std::string_view(argv[1]) == "--multi-image-budget-large")
+            return test_large_multi_image_budget() ? 1 : 0;
         int failures                  = 0;
         failures += test_query_provenance(frontend);
         failures += test_official_tokenizer_merge();
@@ -1314,6 +1425,7 @@ int main(int argc, char** argv) {
         failures += test_official_resource_guards();
         failures += test_text_and_image_prepare(frontend);
         failures += test_high_resolution_image_resizing_and_budget();
+        failures += test_multi_image_budget();
         failures += test_video_prepare(frontend);
         failures += test_cross_round_stop(frontend);
         failures += test_same_token_stop_priority(frontend);

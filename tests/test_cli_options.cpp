@@ -130,6 +130,15 @@ int main() {
                           parse({"--vision-limit", "1024"}).vision_max_tokens == 1024,
                       "CLI Vision token limit or alias was lost");
     const auto shortcut = parse({"--vision-mmproj", "mmproj-BF16.gguf"});
+    failures += check(defaults.vision_request_max_tokens == 32768 &&
+                          parse({"--vision-request-max-tokens", "65536"}).vision_request_max_tokens == 65536 &&
+                          parse({"--vision-request-max-tokens", "65536"}).vision_max_tokens == 8192,
+                      "CLI aggregate and per-item vision budgets are coupled");
+    for (const char* bad : {"0", "-1", "4294967296", "x", "+1", " 1"})
+        failures += check(rejects({"--vision-request-max-tokens", bad}), "invalid request budget accepted");
+    failures += check(rejects({"--vision-request-max-tokens"}) &&
+                          ninfer::cli::usage_text("ninfer").find("--vision-request-max-tokens") != std::string::npos,
+                      "CLI request budget help or missing-value validation absent");
     failures += check(shortcut.enable_vision && shortcut.vision_device == ninfer::VisionDevice::Cpu &&
                           shortcut.vision_mmproj_path == "mmproj-BF16.gguf",
                       "CLI --vision-mmproj did not enable CPU Vision");

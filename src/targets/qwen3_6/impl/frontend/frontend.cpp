@@ -615,7 +615,8 @@ DecoderState terminal_state(DecoderState state) {
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, bool registered_checkpoint, bool vision_enabled_,
-         std::uint32_t vision_max_tokens_, bool collect_input_spans_)
+         std::uint32_t vision_max_tokens_, bool collect_input_spans_,
+         std::uint32_t vision_request_max_tokens_)
         : chat_template(compile_chat_template(resources)),
           tokenizer(std::make_shared<const fi::Tokenizer>(
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
@@ -623,19 +624,26 @@ public:
                                      .generation_config_json = resources.generation_config_json})),
           processor(processor_options(resources)), vision_enabled(vision_enabled_),
           collect_input_spans(collect_input_spans_) {
-        // The vision encode workspace is sized to vision_max_tokens; keep the processor
-        // budget in lockstep so oversized media fails as MediaBudgetExceeded before it
-        // reaches the encoder, and smart_resize_image downscales high-res media within
-        // the allocated vision token budget.
-        if (vision_max_tokens_ > 0) {
-            processor.max_vision_tokens   = vision_max_tokens_;
-            processor.max_raw_patches     = static_cast<std::uint64_t>(vision_max_tokens_) * (fi::kMerge * fi::kMerge);
+        if (vision_request_max_tokens_ == 0) {
+            throw std::invalid_argument("vision request token budget must be positive");
+        }
+        // Runtime encodes items sequentially into shared scratch. Bound each item by
+        // that envelope, but bound all request/history patch buffers independently.
+        const std::uint64_t item_tokens = vision_max_tokens_ > 0 ? vision_max_tokens_ : 8192;
+        {
+            processor.max_item_vision_tokens = item_tokens;
+            processor.max_vision_tokens   = vision_request_max_tokens_;
+            processor.max_raw_patches     = static_cast<std::uint64_t>(vision_request_max_tokens_) * (fi::kMerge * fi::kMerge);
             const std::uint64_t budget_pixels =
-                static_cast<std::uint64_t>(vision_max_tokens_) * (fi::kFactor * fi::kFactor);
+                item_tokens * (fi::kFactor * fi::kFactor);
             processor.image_max_pixels    = std::min(processor.image_max_pixels, budget_pixels);
             processor.video_max_pixels    = std::min(processor.video_max_pixels, budget_pixels);
-            const std::uint64_t max_spatial = processor.max_raw_patches;
-            processor.max_attention_pairs = std::max(processor.max_attention_pairs, max_spatial * max_spatial);
+            const std::uint64_t item_patches = std::min(item_tokens * (fi::kMerge * fi::kMerge),
+                                                       processor.max_raw_patches);
+            const auto u64_max = std::numeric_limits<std::uint64_t>::max();
+            const std::uint64_t pairs = item_patches > u64_max / processor.max_raw_patches
+                                           ? u64_max : item_patches * processor.max_raw_patches;
+            processor.max_attention_pairs = std::max(processor.max_attention_pairs, pairs);
         }
         if (registered_checkpoint) { validate_registered_tokenizer(*tokenizer); }
         for (const int token : tokenizer->default_stop_token_ids()) {
@@ -912,17 +920,20 @@ Frontend& Frontend::operator=(Frontend&&) noexcept = default;
 Frontend::~Frontend()                              = default;
 
 Frontend make_frontend(const FrontendResources& resources, bool vision_enabled,
-                       std::uint32_t vision_max_tokens, bool collect_input_spans) {
+                       std::uint32_t vision_max_tokens, bool collect_input_spans,
+                       std::uint32_t vision_request_max_tokens) {
     return Frontend(
         std::make_shared<const Frontend::Impl>(resources, true, vision_enabled, vision_max_tokens,
-                                               collect_input_spans));
+                                               collect_input_spans, vision_request_max_tokens));
 }
 
 Frontend FrontendTestAccess::create_component(const FrontendResources& resources,
                                               bool vision_enabled,
-                                              std::uint32_t vision_max_tokens, bool collect_input_spans) {
+                                              std::uint32_t vision_max_tokens, bool collect_input_spans,
+                                              std::uint32_t vision_request_max_tokens) {
     return Frontend(std::make_shared<const Frontend::Impl>(resources, false, vision_enabled,
-                                                           vision_max_tokens, collect_input_spans));
+                                                           vision_max_tokens, collect_input_spans,
+                                                           vision_request_max_tokens));
 }
 
 const PreparedPromptData& PreparedPromptAccess::view(const PreparedPrompt& prompt) {

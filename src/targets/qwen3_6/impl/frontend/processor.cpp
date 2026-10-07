@@ -219,6 +219,15 @@ void append_patch(const std::vector<const media::decode::Image*>& frames, int gr
 void add_budget(PreprocessStats& stats, const VisionItem& item);
 void enforce_budget(const PreprocessStats& stats, const ProcessorOptions& options);
 
+void enforce_item_budget(const VisionItem& item, const ProcessorOptions& options) {
+    PreprocessStats stats;
+    add_budget(stats, item);
+    if (stats.vision_tokens > options.max_item_vision_tokens) {
+        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                             "vision item tokens exceed per-item budget (--vision-max-tokens)");
+    }
+}
+
 Prepared prepare_image(const ChatPart& part, const ProcessorOptions& options,
                        const media::decode::Policy& policy, PreprocessStats& stats) {
     media::decode::Image image = media::decode::decode_image(part.media.bytes, policy);
@@ -229,6 +238,7 @@ Prepared prepare_image(const ChatPart& part, const ProcessorOptions& options,
     Prepared out;
     out.item.modality = Modality::Image;
     out.item.grid     = {1, gh, gw};
+    enforce_item_budget(out.item, options);
     add_budget(stats, out.item);
     enforce_budget(stats, options);
     image = resize_bicubic(image, size);
@@ -262,6 +272,7 @@ Prepared prepare_video(const ChatPart& part, const ProcessorOptions& options,
     Prepared out;
     out.item.modality = Modality::Video;
     out.item.grid     = {gt, gh, gw};
+    enforce_item_budget(out.item, options);
     add_budget(stats, out.item);
     enforce_budget(stats, options);
     for (media::decode::Image& frame : video.frames) { frame = resize_bicubic(frame, size); }
@@ -412,11 +423,11 @@ void enforce_budget(const PreprocessStats& stats, const ProcessorOptions& option
     }
     if (stats.raw_patches > options.max_raw_patches) {
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "vision raw patches exceed processor budget");
+                              "vision raw patches exceed request budget (--vision-request-max-tokens; includes history)");
     }
     if (stats.vision_tokens > options.max_vision_tokens) {
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "vision tokens exceed processor budget");
+                              "vision tokens exceed request budget (--vision-request-max-tokens; includes history)");
     }
     if (stats.attention_pairs > options.max_attention_pairs) {
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
@@ -585,6 +596,7 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
                      ProcessorOptions options)
     : tokenizer_(tokenizer), chat_template_(chat_template), options_(std::move(options)) {
     if (options_.max_media_items == 0 || options_.max_prompt_tokens == 0 ||
+        options_.max_item_vision_tokens == 0 ||
         options_.max_media_bytes == 0 || options_.max_decoded_pixels == 0 ||
         options_.max_decoded_video_pixels == 0 || options_.image_min_pixels == 0 ||
         options_.image_max_pixels < options_.image_min_pixels || options_.video_min_pixels == 0 ||

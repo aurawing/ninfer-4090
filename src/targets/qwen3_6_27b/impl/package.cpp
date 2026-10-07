@@ -141,7 +141,8 @@ Package::Frontend Package::make_frontend(const LoadedModel& model) {
     return qwen3_6::make_frontend(model.impl_->data.frontend,
                                   model.impl_->data.runtime.features.vision,
                                   model.impl_->data.runtime.features.vision_max_tokens,
-                                  model.impl_->data.runtime.features.kvmem_input_spans);
+                                  model.impl_->data.runtime.features.kvmem_input_spans,
+                                  model.impl_->data.runtime.features.vision_request_max_tokens);
 }
 
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,

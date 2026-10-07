@@ -288,6 +288,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.kv_cache             = options_.kv_cache;
     engine_options.enable_vision        = options_.enable_vision;
     engine_options.vision_max_tokens    = options_.vision_max_tokens;
+    engine_options.vision_request_max_tokens = options_.vision_request_max_tokens;
     engine_options.vision_device         = options_.vision_device;
     engine_options.vision_mmproj_path    = options_.vision_mmproj_path;
     engine_options.vision_cpu_threads    = options_.vision_cpu_threads;

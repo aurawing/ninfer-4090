@@ -295,6 +295,7 @@ int main(int argc, char** argv) {
         engine_options.speculative            = cli.speculative;
         engine_options.enable_vision          = cli.enable_vision;
         engine_options.vision_max_tokens      = cli.vision_max_tokens;
+        engine_options.vision_request_max_tokens = cli.vision_request_max_tokens;
         engine_options.vision_device          = cli.vision_device;
         engine_options.vision_mmproj_path     = cli.vision_mmproj_path;
         engine_options.vision_cpu_threads     = cli.vision_cpu_threads;

@@ -4,6 +4,7 @@
 #include <ninfer/targets/qwen3_6/mtp_alignment.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/vision_control.h>
+#include <ninfer/targets/qwen3_6/startup_features.h>
 
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/yarn.h"
@@ -343,6 +344,18 @@ void test_yarn_scaling() {
 } // namespace
 
 int main() {
+    ninfer::EngineOptions vision;
+    vision.enable_vision = true;
+    vision.vision_max_tokens = 8192;
+    vision.vision_request_max_tokens = 65536;
+    const auto features = q36::startup_features(vision);
+    expect(features.vision_max_tokens == 8192 && features.vision_request_max_tokens == 65536,
+           "host request budget changed per-item GPU scratch capacity");
+    vision.vision_request_max_tokens = 0;
+    bool zero_rejected = false;
+    try { (void)q36::startup_features(vision); }
+    catch (const std::invalid_argument&) { zero_rejected = true; }
+    expect(zero_rejected, "EngineOptions accepted zero request vision budget");
     test_topology();
     test_decoder_layout();
     test_tiered_main_layout_guard();
